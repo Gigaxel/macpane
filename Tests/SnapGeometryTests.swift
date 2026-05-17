@@ -7,6 +7,7 @@ struct SnapGeometryTests {
         testTreeInsertionSplitsFocusedTile()
         testRemovalPromotesSibling()
         testDirectionalNeighborAndSwap()
+        testResizeMovesContainingSplitFromEitherSideOnBothAxes()
         testResizeIsLocalToContainingSplit()
         testExplicitDropPlacement()
         testToggleOrientation()
@@ -69,6 +70,68 @@ struct SnapGeometryTests {
         let slots = tree.slots()
         expectEqual(slots["B"]!, TileSlot(x: 0, y: 0, width: 0.5, height: 1), "neighbor moved into first tile")
         expectEqual(slots["A"]!, TileSlot(x: 0.5, y: 0, width: 0.5, height: 1), "focused moved into second tile")
+    }
+    private static func testResizeMovesContainingSplitFromEitherSideOnBothAxes() {
+        var firstTree = BSPTree<String>()
+        firstTree.insert("A", near: nil)
+        firstTree.insert("B", near: "A")
+        guard firstTree.resize(focusedID: "A", direction: .left) else {
+            fail("left key should move the containing horizontal split left from the first child")
+        }
+        var slots = firstTree.slots()
+        expectEqual(slots["A"]!, TileSlot(x: 0, y: 0, width: 0.445, height: 1), "first child shrinks when divider moves left")
+        expectEqual(slots["B"]!, TileSlot(x: 0.445, y: 0, width: 0.555, height: 1), "second child grows when divider moves left")
+        guard firstTree.resize(focusedID: "A", direction: .right) else {
+            fail("right key should move the containing horizontal split right from the first child")
+        }
+        slots = firstTree.slots()
+        expectEqual(slots["A"]!, TileSlot(x: 0, y: 0, width: 0.5, height: 1), "first child returns to even split")
+        expectEqual(slots["B"]!, TileSlot(x: 0.5, y: 0, width: 0.5, height: 1), "second child returns to even split")
+        var secondTree = BSPTree<String>()
+        secondTree.insert("A", near: nil)
+        secondTree.insert("B", near: "A")
+        guard secondTree.resize(focusedID: "B", direction: .right) else {
+            fail("right key should move the containing horizontal split right from the second child")
+        }
+        slots = secondTree.slots()
+        expectEqual(slots["A"]!, TileSlot(x: 0, y: 0, width: 0.555, height: 1), "first child grows when divider moves right")
+        expectEqual(slots["B"]!, TileSlot(x: 0.555, y: 0, width: 0.445, height: 1), "second child shrinks when divider moves right")
+        guard secondTree.resize(focusedID: "B", direction: .left) else {
+            fail("left key should move the containing horizontal split left from the second child")
+        }
+        slots = secondTree.slots()
+        expectEqual(slots["A"]!, TileSlot(x: 0, y: 0, width: 0.5, height: 1), "first child returns to even split")
+        expectEqual(slots["B"]!, TileSlot(x: 0.5, y: 0, width: 0.5, height: 1), "second child returns to even split")
+        var topTree = BSPTree<String>()
+        topTree.insert("A", near: nil)
+        topTree.insert("B", near: "A", placement: .split(.down))
+        guard topTree.resize(focusedID: "A", direction: .up) else {
+            fail("up key should move the containing vertical split up from the first child")
+        }
+        slots = topTree.slots()
+        expectEqual(slots["A"]!, TileSlot(x: 0, y: 0, width: 1, height: 0.445), "top child shrinks when divider moves up")
+        expectEqual(slots["B"]!, TileSlot(x: 0, y: 0.445, width: 1, height: 0.555), "bottom child grows when divider moves up")
+        guard topTree.resize(focusedID: "A", direction: .down) else {
+            fail("down key should move the containing vertical split down from the first child")
+        }
+        slots = topTree.slots()
+        expectEqual(slots["A"]!, TileSlot(x: 0, y: 0, width: 1, height: 0.5), "top child returns to even split")
+        expectEqual(slots["B"]!, TileSlot(x: 0, y: 0.5, width: 1, height: 0.5), "bottom child returns to even split")
+        var bottomTree = BSPTree<String>()
+        bottomTree.insert("A", near: nil)
+        bottomTree.insert("B", near: "A", placement: .split(.down))
+        guard bottomTree.resize(focusedID: "B", direction: .down) else {
+            fail("down key should move the containing vertical split down from the second child")
+        }
+        slots = bottomTree.slots()
+        expectEqual(slots["A"]!, TileSlot(x: 0, y: 0, width: 1, height: 0.555), "top child grows when divider moves down")
+        expectEqual(slots["B"]!, TileSlot(x: 0, y: 0.555, width: 1, height: 0.445), "bottom child shrinks when divider moves down")
+        guard bottomTree.resize(focusedID: "B", direction: .up) else {
+            fail("up key should move the containing vertical split up from the second child")
+        }
+        slots = bottomTree.slots()
+        expectEqual(slots["A"]!, TileSlot(x: 0, y: 0, width: 1, height: 0.5), "top child returns to even split")
+        expectEqual(slots["B"]!, TileSlot(x: 0, y: 0.5, width: 1, height: 0.5), "bottom child returns to even split")
     }
     private static func testResizeIsLocalToContainingSplit() {
         var tree = BSPTree<String>()

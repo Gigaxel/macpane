@@ -455,24 +455,14 @@ private indirect enum BSPNode<ID: Hashable> {
                     self = .split(axis: axis, ratio: ratio, first: first, second: second)
                     return true
                 }
-                if axis == .horizontal && direction == .right {
-                    return updateRatio(&ratio, delta: step, axis: axis, first: first, second: second, minimumRatio: minimumRatio)
-                }
-                if axis == .vertical && direction == .down {
-                    return updateRatio(&ratio, delta: step, axis: axis, first: first, second: second, minimumRatio: minimumRatio)
-                }
+                return updateRatio(&ratio, direction: direction, step: step, axis: axis, first: first, second: second, minimumRatio: minimumRatio)
             }
             if second.contains(focusedID) {
                 if second.resize(focusedID: focusedID, direction: direction, step: step, minimumRatio: minimumRatio) {
                     self = .split(axis: axis, ratio: ratio, first: first, second: second)
                     return true
                 }
-                if axis == .horizontal && direction == .left {
-                    return updateRatio(&ratio, delta: -step, axis: axis, first: first, second: second, minimumRatio: minimumRatio)
-                }
-                if axis == .vertical && direction == .up {
-                    return updateRatio(&ratio, delta: -step, axis: axis, first: first, second: second, minimumRatio: minimumRatio)
-                }
+                return updateRatio(&ratio, direction: direction, step: step, axis: axis, first: first, second: second, minimumRatio: minimumRatio)
             }
             return false
         }
@@ -535,6 +525,24 @@ private indirect enum BSPNode<ID: Hashable> {
                 self = .split(axis: axis.toggled, ratio: ratio, first: first, second: second)
                 return true
             }
+            return false
+        }
+    }
+    private mutating func updateRatio(
+        _ ratio: inout CGFloat,
+        direction: SnapDirection,
+        step: CGFloat,
+        axis: TileAxis,
+        first: BSPNode<ID>,
+        second: BSPNode<ID>,
+        minimumRatio: CGFloat
+    ) -> Bool {
+        switch (axis, direction) {
+        case (.horizontal, .left), (.vertical, .up):
+            return updateRatio(&ratio, delta: -step, axis: axis, first: first, second: second, minimumRatio: minimumRatio)
+        case (.horizontal, .right), (.vertical, .down):
+            return updateRatio(&ratio, delta: step, axis: axis, first: first, second: second, minimumRatio: minimumRatio)
+        default:
             return false
         }
     }

@@ -8,6 +8,10 @@ MacPane is a tiny macOS menu bar window manager. It auto-tiles regular app windo
 
 When MacPane launches, it immediately arranges the windows on each display. It watches for launched apps, closed apps, active Space changes, and Accessibility window-created notifications so new windows snap into the layout as they appear.
 
+## Demo
+
+<img src="docs/macpane_demo.gif" alt="MacPane demo" width="560">
+
 ## Shortcuts
 
 - `Cmd+Option+Arrow`: focus the nearest tiled neighbor in that direction.
