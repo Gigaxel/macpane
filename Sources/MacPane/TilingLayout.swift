@@ -132,11 +132,37 @@ struct BSPTree<ID: Hashable> {
     var firstID: ID? { ids.first }
     var tileCount: Int { ids.count }
     init() {}
+    private init(root: BSPNode<ID>?) {
+        self.root = root
+    }
     init(_ id: ID) {
         root = .leaf(id)
     }
     func contains(_ id: ID) -> Bool {
         root?.contains(id) ?? false
+    }
+    mutating func replaceIDs(_ replacements: [ID: ID]) -> Bool {
+        guard !replacements.isEmpty, let currentRoot = root else { return false }
+        var changed = false
+        let nextRoot = currentRoot.mapIDs { id in
+            let replacement = replacements[id] ?? id
+            if replacement != id {
+                changed = true
+            }
+            return replacement
+        }
+        guard changed else { return false }
+        let nextIDs = nextRoot.ids
+        guard Set(nextIDs).count == nextIDs.count else { return false }
+        root = nextRoot
+        return true
+    }
+    func compactMapIDs<NewID: Hashable>(_ transform: (ID) -> NewID?) -> BSPTree<NewID>? {
+        guard let root else { return BSPTree<NewID>() }
+        guard let nextRoot = root.compactMapIDs(transform) else { return nil }
+        let nextIDs = nextRoot.ids
+        guard Set(nextIDs).count == nextIDs.count else { return nil }
+        return BSPTree<NewID>(root: nextRoot)
     }
     func slot(for id: ID) -> TileSlot? {
         slots()[id]
@@ -443,6 +469,19 @@ private indirect enum BSPNode<ID: Hashable> {
             return .leaf(transform(id))
         case .split(let axis, let ratio, let first, let second):
             return .split(axis: axis, ratio: ratio, first: first.mapIDs(transform), second: second.mapIDs(transform))
+        }
+    }
+    func compactMapIDs<NewID: Hashable>(_ transform: (ID) -> NewID?) -> BSPNode<NewID>? {
+        switch self {
+        case .leaf(let id):
+            guard let nextID = transform(id) else { return nil }
+            return .leaf(nextID)
+        case .split(let axis, let ratio, let first, let second):
+            guard let nextFirst = first.compactMapIDs(transform),
+                  let nextSecond = second.compactMapIDs(transform) else {
+                return nil
+            }
+            return .split(axis: axis, ratio: ratio, first: nextFirst, second: nextSecond)
         }
     }
     mutating func resize(focusedID: ID, direction: SnapDirection, step: CGFloat, minimumRatio: CGFloat) -> Bool {

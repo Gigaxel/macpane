@@ -24,6 +24,7 @@ xcrun swiftc \
   "$ROOT_DIR/Sources/MacPane/TilingLayout.swift" \
   "$ROOT_DIR/Sources/MacPane/Spaces.swift" \
   "$ROOT_DIR/Sources/MacPane/WindowIdentity.swift" \
+  "$ROOT_DIR/Sources/MacPane/WindowLayoutIdentity.swift" \
   "$ROOT_DIR/Sources/MacPane/main.swift" \
   -o "$MACOS_DIR/MacPane"
 cp "$ROOT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"

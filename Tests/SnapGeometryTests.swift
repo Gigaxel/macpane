@@ -7,6 +7,10 @@ struct SnapGeometryTests {
         testTreeInsertionSplitsFocusedTile()
         testRemovalPromotesSibling()
         testDirectionalNeighborAndSwap()
+        testTreeReplaceIDsPreservesSlots()
+        testTreeRejectsIdentityReplacementCollision()
+        testTreeCompactMapIDsPreservesSlots()
+        testTreeCompactMapIDsRejectsMissingLeaf()
         testResizeMovesContainingSplitFromEitherSideOnBothAxes()
         testResizeIsLocalToContainingSplit()
         testExplicitDropPlacement()
@@ -33,6 +37,9 @@ struct SnapGeometryTests {
         testWindowIdentityAvoidsAlreadySeenWindowNumberIdentity()
         testWindowIdentityAvoidsAlreadySeenSignatureIdentity()
         testWindowIdentityCreatesDistinctUnnumberedWindows()
+        testWindowLayoutIdentityMatchesStrongComponentWhenTitleChanges()
+        testWindowLayoutIdentityRejectsDuplicateWeakMatches()
+        testWindowLayoutIdentityRejectsWeakMatchWhenStrongComponentConflicts()
         print("SnapGeometryTests passed")
     }
     private static func testSnapGeometry() {
@@ -70,6 +77,56 @@ struct SnapGeometryTests {
         let slots = tree.slots()
         expectEqual(slots["B"]!, TileSlot(x: 0, y: 0, width: 0.5, height: 1), "neighbor moved into first tile")
         expectEqual(slots["A"]!, TileSlot(x: 0.5, y: 0, width: 0.5, height: 1), "focused moved into second tile")
+    }
+    private static func testTreeReplaceIDsPreservesSlots() {
+        var tree = BSPTree<String>()
+        tree.insert("A", near: nil)
+        tree.insert("B", near: "A")
+        tree.insert("C", near: "B")
+        let before = tree.slots()
+        guard tree.replaceIDs(["B": "B2"]) else {
+            fail("expected identity replacement to report a change")
+        }
+        let after = tree.slots()
+        guard !tree.contains("B"), tree.contains("B2") else {
+            fail("expected old id to be replaced with new id")
+        }
+        expectEqual(after["A"]!, before["A"]!, "unrelated first slot survives identity replacement")
+        expectEqual(after["B2"]!, before["B"]!, "replacement keeps the old tile geometry")
+        expectEqual(after["C"]!, before["C"]!, "unrelated second slot survives identity replacement")
+    }
+    private static func testTreeRejectsIdentityReplacementCollision() {
+        var tree = BSPTree<String>()
+        tree.insert("A", near: nil)
+        tree.insert("B", near: "A")
+        let before = tree.slots()
+        guard !tree.replaceIDs(["A": "B"]) else {
+            fail("identity replacement should reject duplicate leaf ids")
+        }
+        expectEqual(tree.slots()["A"]!, before["A"]!, "collision should leave original first slot untouched")
+        expectEqual(tree.slots()["B"]!, before["B"]!, "collision should leave original second slot untouched")
+    }
+    private static func testTreeCompactMapIDsPreservesSlots() {
+        var tree = BSPTree<String>()
+        tree.insert("A", near: nil)
+        tree.insert("B", near: "A")
+        tree.insert("C", near: "B")
+        let before = tree.slots()
+        guard let mapped = tree.compactMapIDs({ ["A": 10, "B": 20, "C": 30][$0] }) else {
+            fail("expected complete id map to produce a tree")
+        }
+        let after = mapped.slots()
+        expectEqual(after[10]!, before["A"]!, "mapped first slot should be preserved")
+        expectEqual(after[20]!, before["B"]!, "mapped second slot should be preserved")
+        expectEqual(after[30]!, before["C"]!, "mapped third slot should be preserved")
+    }
+    private static func testTreeCompactMapIDsRejectsMissingLeaf() {
+        var tree = BSPTree<String>()
+        tree.insert("A", near: nil)
+        tree.insert("B", near: "A")
+        guard tree.compactMapIDs({ ["A": 10][$0] }) == nil else {
+            fail("incomplete id maps should not silently drop a persisted layout leaf")
+        }
     }
     private static func testResizeMovesContainingSplitFromEitherSideOnBothAxes() {
         var firstTree = BSPTree<String>()
@@ -563,6 +620,38 @@ struct SnapGeometryTests {
             fail("different AX elements without CG window numbers should still become distinct tile identities")
         }
     }
+    private static func testWindowLayoutIdentityMatchesStrongComponentWhenTitleChanges() {
+        let stored = layoutIdentity(document: "file:///tmp/report.txt", title: "Old Title")
+        let visible = layoutIdentity(document: "file:///tmp/report.txt", title: "New Title")
+        let replacements = WindowLayoutIdentityMatcher.replacements(
+            stored: [(id: "old", identity: stored)],
+            visible: [(id: "new", identity: visible)]
+        )
+        guard replacements["old"] == "new" else {
+            fail("layout identity should match by stable document even when a volatile title changes")
+        }
+    }
+    private static func testWindowLayoutIdentityRejectsDuplicateWeakMatches() {
+        let stored = [
+            (id: "old-a", identity: layoutIdentity(title: "Untitled")),
+            (id: "old-b", identity: layoutIdentity(title: "Untitled"))
+        ]
+        let visible = [(id: "new", identity: layoutIdentity(title: "Untitled"))]
+        guard WindowLayoutIdentityMatcher.replacements(stored: stored, visible: visible).isEmpty else {
+            fail("duplicate layout identity keys should not be matched ambiguously")
+        }
+    }
+    private static func testWindowLayoutIdentityRejectsWeakMatchWhenStrongComponentConflicts() {
+        let stored = layoutIdentity(document: "file:///tmp/old.txt", title: "Untitled")
+        let visible = layoutIdentity(document: "file:///tmp/new.txt", title: "Untitled")
+        let replacements = WindowLayoutIdentityMatcher.replacements(
+            stored: [(id: "old", identity: stored)],
+            visible: [(id: "new", identity: visible)]
+        )
+        guard replacements.isEmpty else {
+            fail("layout identity should not fall back to matching weak titles after stable documents conflict")
+        }
+    }
     private static func windowSignature(pid: pid_t, title: String, stateKey: String = "display-a:space:1") -> WindowSignature {
         WindowSignature(
             pid: pid,
@@ -570,6 +659,20 @@ struct SnapGeometryTests {
             bundleIdentifier: "com.local.test",
             axIdentifier: nil,
             document: nil,
+            title: title
+        )
+    }
+    private static func layoutIdentity(
+        pid: pid_t = 42,
+        axIdentifier: String? = nil,
+        document: String? = nil,
+        title: String? = nil
+    ) -> WindowLayoutIdentity {
+        WindowLayoutIdentity(
+            pid: pid,
+            bundleIdentifier: "com.local.test",
+            axIdentifier: axIdentifier,
+            document: document,
             title: title
         )
     }

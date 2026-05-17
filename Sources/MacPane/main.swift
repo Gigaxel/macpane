@@ -317,9 +317,12 @@ final class WindowTiler {
     private var systemUISettleBeganAt: Date?
     private let requiredStableSystemUIWindowSnapshotCount = 2
     private let missingFrozenWindowGraceAfterSystemUI: TimeInterval = 3.0
+    private let maximumLayoutRestoreFrameScore: CGFloat = 48
     private var floatingWindowIDs: Set<WindowIdentity> = []
     private var floatingWindowStateKeys: [WindowIdentity: String] = [:]
     private var identityRegistry = WindowIdentityRegistry()
+    private var layoutIdentityByWindowID: [WindowIdentity: WindowLayoutIdentity] = [:]
+    private var persistedLayoutsByStateKey: [String: PersistedScreenLayout] = [:]
     private let focusBorder = FocusBorderOverlay()
     private var suppressExternalChangesUntil = Date.distantPast
     private var systemUILayoutPausedUntil = Date.distantPast
@@ -378,6 +381,8 @@ final class WindowTiler {
         resetSystemUIWindowSnapshotStability()
         floatingWindowIDs.removeAll()
         floatingWindowStateKeys.removeAll()
+        layoutIdentityByWindowID.removeAll()
+        persistedLayoutsByStateKey.removeAll()
         focusBorder.close()
         isApplyingLayout = false
         isWatching = false
@@ -1021,6 +1026,8 @@ final class WindowTiler {
         }
     }
     private func syncStates(with windows: [ManagedWindow], focusedID: WindowIdentity?) {
+        _ = restoreKnownLayoutIdentities(using: windows)
+        _ = restorePersistedLayouts(using: windows)
         let grouped = Dictionary(grouping: windows, by: { $0.screen.stateKey })
         let idsByScreen = grouped.mapValues { Set($0.map(\.id)) }
         let activeStateKeys = Set(currentScreenInfos().map(\.stateKey))
@@ -1040,6 +1047,9 @@ final class WindowTiler {
             state.sync(windowIDs: ids, focusedID: screenFocusedID)
             screenStates[screenKey] = state
         }
+        rememberLayoutIdentities(using: windows)
+        pruneLayoutIdentityCache(retainingVisibleIDs: Set(windows.map(\.id)))
+        rememberPersistedLayouts(using: windows)
     }
     private func applyLayout(to windows: [ManagedWindow]) {
         guard !isStopping else { return }
@@ -1067,6 +1077,7 @@ final class WindowTiler {
                 set(window: window.element, frame: frame)
             }
         }
+        rememberPersistedLayouts(using: windows)
         DispatchQueue.main.async { [weak self] in
             guard let self, !self.isStopping else { return }
             self.updateFocusBorder(using: windows)
@@ -1136,12 +1147,14 @@ final class WindowTiler {
             return
         }
         let restoredFrozenLayout = restoreFrozenStatesIfWindowSetUnchanged(using: tiled)
+        let restoredIdentityLayout = restoreKnownLayoutIdentities(using: tiled, sourceStates: frozenSystemUIScreenStates)
+        let restoredPersistedLayout = restorePersistedLayouts(using: tiled)
         frozenSystemUIScreenStates = nil
         frozenSystemUIActiveStateKeys = nil
         resetSystemUIWindowSnapshotStability()
         if hasWindowSetChanged(tiled) {
             scheduleReconcile(delay: 0.05)
-        } else if restoredFrozenLayout {
+        } else if restoredFrozenLayout || restoredIdentityLayout || restoredPersistedLayout {
             applyLayout(to: allWindows)
         } else {
             updateFocusBorder(using: allWindows)
@@ -1182,7 +1195,16 @@ final class WindowTiler {
         let frozenIDs = Set(frozenStatesToWaitFor.flatMap(\.windowIDs))
         guard !frozenIDs.isEmpty else { return false }
         let liveIDs = Set(windows.map(\.id))
-        return !frozenIDs.isSubset(of: liveIDs)
+        guard !frozenIDs.isSubset(of: liveIDs) else { return false }
+        let missingIDs = frozenIDs.subtracting(liveIDs)
+        let appearedWindows = windows.filter { !frozenIDs.contains($0.id) }
+        let appearedLayoutIdentities = layoutIdentityItems(forWindows: appearedWindows)
+        let matchedMissingIDs = Set(WindowLayoutIdentityMatcher.replacements(
+            stored: layoutIdentityItems(forStoredIDs: missingIDs),
+            visible: appearedLayoutIdentities
+        ).keys)
+        let stillMissing = missingIDs.subtracting(matchedMissingIDs)
+        return !stillMissing.isEmpty
     }
     private func resetSystemUIWindowSnapshotStability() {
         lastSystemUIWindowSnapshot = nil
@@ -1206,7 +1228,9 @@ final class WindowTiler {
                   }) else {
                 continue
             }
-            screenStates.removeValue(forKey: fallback.key)
+            if !keyHasExplicitSpace(fallback.key) {
+                screenStates.removeValue(forKey: fallback.key)
+            }
             screenStates[key] = fallback.value
             restored = true
         }
@@ -1221,6 +1245,7 @@ final class WindowTiler {
     }
     private func tiledWindows(from windows: [ManagedWindow]) -> [ManagedWindow] {
         guard tilingEnabled else { return [] }
+        restoreFloatingLayoutIdentities(using: windows)
         return windows.filter { !floatingWindowIDs.contains($0.id) }
     }
     private func updateVisibleFloatingWindowStateKeys(using windows: [ManagedWindow]) {
@@ -1254,6 +1279,423 @@ final class WindowTiler {
         }
         identityRegistry.removeAliases(for: ids)
     }
+    @discardableResult
+    private func restoreFloatingLayoutIdentities(using windows: [ManagedWindow]) -> Bool {
+        let visibleIDs = Set(windows.map(\.id))
+        let missingFloatingIDs = floatingWindowIDs.subtracting(visibleIDs)
+        guard !missingFloatingIDs.isEmpty else { return false }
+        var knownTiledIDs = Set(screenStates.values.flatMap(\.windowIDs))
+        if let frozenSystemUIScreenStates {
+            knownTiledIDs.formUnion(frozenSystemUIScreenStates.values.flatMap(\.windowIDs))
+        }
+        let candidateWindows = windows.filter { window in
+            !floatingWindowIDs.contains(window.id) && !knownTiledIDs.contains(window.id)
+        }
+        guard !candidateWindows.isEmpty else { return false }
+        let missingIDsByStateKey = Dictionary(grouping: Array(missingFloatingIDs)) { id in
+            floatingWindowStateKeys[id]
+        }
+        let stateKeys = missingIDsByStateKey.keys.sorted { lhs, rhs in
+            switch (lhs, rhs) {
+            case let (.some(lhs), .some(rhs)):
+                return lhs < rhs
+            case (.some, .none):
+                return true
+            case (.none, .some), (.none, .none):
+                return false
+            }
+        }
+        var replacements: [WindowIdentity: WindowIdentity] = [:]
+        var usedVisibleIDs: Set<WindowIdentity> = []
+        for stateKey in stateKeys {
+            let storedIDs = Set(missingIDsByStateKey[stateKey] ?? [])
+            let visibleWindows = candidateWindows.filter { window in
+                !usedVisibleIDs.contains(window.id) && (stateKey == nil || window.screen.stateKey == stateKey)
+            }
+            let stateReplacements = WindowLayoutIdentityMatcher.replacements(
+                stored: layoutIdentityItems(forStoredIDs: storedIDs),
+                visible: layoutIdentityItems(forWindows: visibleWindows)
+            )
+            replacements.merge(stateReplacements, uniquingKeysWith: { existing, _ in existing })
+            usedVisibleIDs.formUnion(stateReplacements.values)
+        }
+        guard !replacements.isEmpty else { return false }
+        applyLayoutIdentityRemapping(replacements)
+        return true
+    }
+    @discardableResult
+    private func restoreKnownLayoutIdentities(
+        using windows: [ManagedWindow],
+        sourceStates: [String: ScreenTileState]? = nil
+    ) -> Bool {
+        let states = sourceStates ?? screenStates
+        guard !windows.isEmpty, !states.isEmpty else { return false }
+        let grouped = Dictionary(grouping: windows, by: { $0.screen.stateKey })
+        var replacements: [WindowIdentity: WindowIdentity] = [:]
+        var restored = false
+        for (currentKey, screenWindows) in grouped {
+            guard let storedKey = storedStateKeyForLayoutRestore(currentKey: currentKey, windows: screenWindows, states: states),
+                  let state = states[storedKey],
+                  let screen = screenWindows.first?.screen else {
+                continue
+            }
+            if sourceStates != nil || storedKey != currentKey {
+                screenStates[currentKey] = state
+                if storedKey != currentKey, !keyHasExplicitSpace(storedKey) {
+                    screenStates.removeValue(forKey: storedKey)
+                }
+                restored = true
+            }
+            replacements.merge(
+                identityReplacements(for: state, on: screen, currentWindows: screenWindows),
+                uniquingKeysWith: { existing, _ in existing }
+            )
+        }
+        guard !replacements.isEmpty else { return restored }
+        applyLayoutIdentityRemapping(replacements)
+        return true
+    }
+    private func storedStateKeyForLayoutRestore(
+        currentKey: String,
+        windows: [ManagedWindow],
+        states: [String: ScreenTileState]
+    ) -> String? {
+        if states[currentKey] != nil { return currentKey }
+        guard !keyHasExplicitSpace(currentKey) else { return nil }
+        let currentLayoutIdentities = layoutIdentityItems(forWindows: windows)
+        guard !currentLayoutIdentities.isEmpty else { return nil }
+        let currentDisplayKey = displayKeyComponent(of: currentKey)
+        var bestMatch: (key: String, count: Int)?
+        var hasAmbiguousBestMatch = false
+        for (storedKey, state) in states where displayKeyComponent(of: storedKey) == currentDisplayKey {
+            let storedLayoutIdentities = layoutIdentityItems(forStoredIDs: state.windowIDs)
+            let expectedMatches = min(storedLayoutIdentities.count, currentLayoutIdentities.count)
+            guard expectedMatches > 0 else { continue }
+            let matches = WindowLayoutIdentityMatcher.replacements(
+                stored: storedLayoutIdentities,
+                visible: currentLayoutIdentities
+            ).count
+            guard matches == expectedMatches else { continue }
+            if bestMatch == nil || matches > bestMatch!.count {
+                bestMatch = (key: storedKey, count: matches)
+                hasAmbiguousBestMatch = false
+            } else if matches == bestMatch!.count {
+                hasAmbiguousBestMatch = true
+            }
+        }
+        guard !hasAmbiguousBestMatch else { return nil }
+        return bestMatch?.key
+    }
+    private func identityReplacements(
+        for state: ScreenTileState,
+        on screen: ScreenInfo,
+        currentWindows: [ManagedWindow]
+    ) -> [WindowIdentity: WindowIdentity] {
+        let stateIDs = state.windowIDs
+        let currentIDs = Set(currentWindows.map(\.id))
+        var missingStateIDs = stateIDs.subtracting(currentIDs)
+        var appearingWindows = currentWindows.filter { !stateIDs.contains($0.id) }
+        guard !missingStateIDs.isEmpty, !appearingWindows.isEmpty else { return [:] }
+        var replacements: [WindowIdentity: WindowIdentity] = [:]
+        replacements.merge(
+            WindowLayoutIdentityMatcher.replacements(
+                stored: layoutIdentityItems(forStoredIDs: missingStateIDs),
+                visible: layoutIdentityItems(forWindows: appearingWindows)
+            ),
+            uniquingKeysWith: { existing, _ in existing }
+        )
+        missingStateIDs.subtract(Set(replacements.keys))
+        let usedVisibleIDs = Set(replacements.values)
+        appearingWindows.removeAll { usedVisibleIDs.contains($0.id) }
+        replacements.merge(
+            frameBasedIdentityReplacements(
+                forStoredIDs: missingStateIDs,
+                in: state,
+                on: screen,
+                currentWindows: appearingWindows
+            ),
+            uniquingKeysWith: { existing, _ in existing }
+        )
+        return replacements
+    }
+    private func frameBasedIdentityReplacements(
+        forStoredIDs storedIDs: Set<WindowIdentity>,
+        in state: ScreenTileState,
+        on screen: ScreenInfo,
+        currentWindows: [ManagedWindow]
+    ) -> [WindowIdentity: WindowIdentity] {
+        guard !storedIDs.isEmpty, !currentWindows.isEmpty else { return [:] }
+        let slots = state.slots
+        var candidates: [(storedID: WindowIdentity, visibleID: WindowIdentity, score: CGFloat)] = []
+        for storedID in storedIDs {
+            guard let slot = slots[storedID] else { continue }
+            let expectedFrame = slot.frame(in: screen.frame, gap: CGFloat(gapPixels), smartOuterGap: true)
+            for window in currentWindows where window.id.pid == storedID.pid {
+                let score = expectedFrame.frameSimilarityScore(to: window.frame)
+                guard score <= maximumLayoutRestoreFrameScore else { continue }
+                candidates.append((storedID: storedID, visibleID: window.id, score: score))
+            }
+        }
+        candidates.sort { lhs, rhs in
+            if lhs.score != rhs.score { return lhs.score < rhs.score }
+            if lhs.storedID.pid != rhs.storedID.pid { return lhs.storedID.pid < rhs.storedID.pid }
+            if lhs.storedID.serial != rhs.storedID.serial { return lhs.storedID.serial < rhs.storedID.serial }
+            return lhs.visibleID.serial < rhs.visibleID.serial
+        }
+        var replacements: [WindowIdentity: WindowIdentity] = [:]
+        var usedStoredIDs: Set<WindowIdentity> = []
+        var usedVisibleIDs: Set<WindowIdentity> = []
+        for candidate in candidates {
+            guard !usedStoredIDs.contains(candidate.storedID),
+                  !usedVisibleIDs.contains(candidate.visibleID) else {
+                continue
+            }
+            usedStoredIDs.insert(candidate.storedID)
+            usedVisibleIDs.insert(candidate.visibleID)
+            replacements[candidate.storedID] = candidate.visibleID
+        }
+        return replacements
+    }
+    private func layoutIdentityItems(forStoredIDs ids: Set<WindowIdentity>) -> [(id: WindowIdentity, identity: WindowLayoutIdentity)] {
+        ids.compactMap { id in
+            guard let layoutIdentity = layoutIdentityByWindowID[id] else { return nil }
+            return (id: id, identity: layoutIdentity)
+        }
+    }
+    private func layoutIdentityItems(forWindows windows: [ManagedWindow]) -> [(id: WindowIdentity, identity: WindowLayoutIdentity)] {
+        windows.compactMap { window in
+            guard let layoutIdentity = window.layoutIdentity else { return nil }
+            return (id: window.id, identity: layoutIdentity)
+        }
+    }
+    private func applyLayoutIdentityRemapping(_ replacements: [WindowIdentity: WindowIdentity]) {
+        let replacements = replacements.filter { $0.key != $0.value }
+        guard !replacements.isEmpty else { return }
+        for key in Array(screenStates.keys) {
+            guard var state = screenStates[key] else { continue }
+            if state.replaceWindowIDs(replacements) {
+                screenStates[key] = state
+            }
+        }
+        for (storedID, visibleID) in replacements {
+            if floatingWindowIDs.remove(storedID) != nil {
+                floatingWindowIDs.insert(visibleID)
+            }
+            if let stateKey = floatingWindowStateKeys.removeValue(forKey: storedID) {
+                floatingWindowStateKeys[visibleID] = stateKey
+            }
+            if layoutIdentityByWindowID[visibleID] == nil,
+               let layoutIdentity = layoutIdentityByWindowID[storedID] {
+                layoutIdentityByWindowID[visibleID] = layoutIdentity
+            }
+            layoutIdentityByWindowID.removeValue(forKey: storedID)
+        }
+    }
+    private func rememberLayoutIdentities(using windows: [ManagedWindow]) {
+        for window in windows {
+            guard let layoutIdentity = window.layoutIdentity else { continue }
+            layoutIdentityByWindowID[window.id] = layoutIdentity
+        }
+    }
+    private func pruneLayoutIdentityCache(retainingVisibleIDs visibleIDs: Set<WindowIdentity>) {
+        var retainedIDs = visibleIDs
+        retainedIDs.formUnion(screenStates.values.flatMap(\.windowIDs))
+        if let frozenSystemUIScreenStates {
+            retainedIDs.formUnion(frozenSystemUIScreenStates.values.flatMap(\.windowIDs))
+        }
+        retainedIDs.formUnion(floatingWindowIDs)
+        layoutIdentityByWindowID = layoutIdentityByWindowID.filter { retainedIDs.contains($0.key) }
+    }
+    @discardableResult
+    private func restorePersistedLayouts(using windows: [ManagedWindow]) -> Bool {
+        guard !windows.isEmpty, !persistedLayoutsByStateKey.isEmpty else { return false }
+        let grouped = Dictionary(grouping: windows, by: { $0.screen.stateKey })
+        var restored = false
+        for (currentKey, screenWindows) in grouped {
+            guard let screen = screenWindows.first?.screen else { continue }
+            for snapshot in persistedLayoutCandidates(for: currentKey) {
+                guard let state = restoredState(from: snapshot, on: screen, currentWindows: screenWindows) else {
+                    continue
+                }
+                screenStates[currentKey] = state
+                if snapshot.stateKey != currentKey, !keyHasExplicitSpace(snapshot.stateKey) {
+                    screenStates.removeValue(forKey: snapshot.stateKey)
+                }
+                restored = true
+                break
+            }
+        }
+        return restored
+    }
+    private func persistedLayoutCandidates(for currentKey: String) -> [PersistedScreenLayout] {
+        var candidates: [PersistedScreenLayout] = []
+        if let exact = persistedLayoutsByStateKey[currentKey] {
+            candidates.append(exact)
+        }
+        guard !keyHasExplicitSpace(currentKey) else { return candidates }
+        let currentDisplayKey = displayKeyComponent(of: currentKey)
+        let fallbackCandidates = persistedLayoutsByStateKey.values
+            .filter { $0.stateKey != currentKey && $0.displayKey == currentDisplayKey }
+            .sorted { lhs, rhs in
+                if lhs.lastUpdated != rhs.lastUpdated { return lhs.lastUpdated > rhs.lastUpdated }
+                return lhs.stateKey < rhs.stateKey
+            }
+        candidates.append(contentsOf: fallbackCandidates)
+        return candidates
+    }
+    private func restoredState(
+        from snapshot: PersistedScreenLayout,
+        on screen: ScreenInfo,
+        currentWindows: [ManagedWindow]
+    ) -> ScreenTileState? {
+        guard !snapshot.entriesByID.isEmpty, !currentWindows.isEmpty else { return nil }
+        let storedLayoutIdentityItems: [(id: Int, identity: WindowLayoutIdentity)] = snapshot.entriesByID.values.compactMap { entry in
+            guard let layoutIdentity = entry.layoutIdentity else { return nil }
+            return (id: entry.id, identity: layoutIdentity)
+        }
+        var entryIDToWindowID = WindowLayoutIdentityMatcher.replacements(
+            stored: storedLayoutIdentityItems,
+            visible: layoutIdentityItems(forWindows: currentWindows)
+        )
+        let usedWindowIDs = Set(entryIDToWindowID.values)
+        entryIDToWindowID.merge(
+            frameBasedPersistedLayoutReplacements(
+                from: snapshot,
+                on: screen,
+                currentWindows: currentWindows.filter { !usedWindowIDs.contains($0.id) },
+                excludingEntryIDs: Set(entryIDToWindowID.keys)
+            ),
+            uniquingKeysWith: { existing, _ in existing }
+        )
+        let secondPassUsedWindowIDs = Set(entryIDToWindowID.values)
+        entryIDToWindowID.merge(
+            orderBasedPersistedLayoutReplacements(
+                from: snapshot,
+                currentWindows: currentWindows.filter { !secondPassUsedWindowIDs.contains($0.id) },
+                excludingEntryIDs: Set(entryIDToWindowID.keys)
+            ),
+            uniquingKeysWith: { existing, _ in existing }
+        )
+        guard let tree = snapshot.tree.compactMapIDs({ entryIDToWindowID[$0] }) else { return nil }
+        let focusedID = snapshot.lastFocusedEntryID.flatMap { entryIDToWindowID[$0] }
+        return ScreenTileState(tree: tree, lastFocusedID: focusedID)
+    }
+    private func frameBasedPersistedLayoutReplacements(
+        from snapshot: PersistedScreenLayout,
+        on screen: ScreenInfo,
+        currentWindows: [ManagedWindow],
+        excludingEntryIDs excludedEntryIDs: Set<Int>
+    ) -> [Int: WindowIdentity] {
+        guard !currentWindows.isEmpty else { return [:] }
+        let slots = snapshot.tree.slots()
+        var candidates: [(entryID: Int, windowID: WindowIdentity, score: CGFloat)] = []
+        for (entryID, entry) in snapshot.entriesByID where !excludedEntryIDs.contains(entryID) {
+            guard let slot = slots[entryID] else { continue }
+            let expectedFrame = slot.frame(in: screen.frame, gap: CGFloat(gapPixels), smartOuterGap: true)
+            for window in currentWindows where persistedEntry(entry, canFrameMatch: window) {
+                let score = expectedFrame.frameSimilarityScore(to: window.frame)
+                guard score <= maximumLayoutRestoreFrameScore else { continue }
+                candidates.append((entryID: entryID, windowID: window.id, score: score))
+            }
+        }
+        candidates.sort { lhs, rhs in
+            if lhs.score != rhs.score { return lhs.score < rhs.score }
+            if lhs.entryID != rhs.entryID { return lhs.entryID < rhs.entryID }
+            return lhs.windowID.serial < rhs.windowID.serial
+        }
+        var replacements: [Int: WindowIdentity] = [:]
+        var usedEntries: Set<Int> = []
+        var usedWindows: Set<WindowIdentity> = []
+        for candidate in candidates {
+            guard !usedEntries.contains(candidate.entryID),
+                  !usedWindows.contains(candidate.windowID) else {
+                continue
+            }
+            replacements[candidate.entryID] = candidate.windowID
+            usedEntries.insert(candidate.entryID)
+            usedWindows.insert(candidate.windowID)
+        }
+        return replacements
+    }
+    private func orderBasedPersistedLayoutReplacements(
+        from snapshot: PersistedScreenLayout,
+        currentWindows: [ManagedWindow],
+        excludingEntryIDs excludedEntryIDs: Set<Int>
+    ) -> [Int: WindowIdentity] {
+        guard !currentWindows.isEmpty else { return [:] }
+        let remainingEntries = snapshot.entriesByID.values.filter { !excludedEntryIDs.contains($0.id) }
+        let entriesByGroup = Dictionary(grouping: remainingEntries, by: persistedWindowGroupKey)
+        let windowsByGroup = Dictionary(grouping: currentWindows, by: persistedWindowGroupKey)
+        var replacements: [Int: WindowIdentity] = [:]
+        for (groupKey, entries) in entriesByGroup {
+            guard let windows = windowsByGroup[groupKey], entries.count == windows.count else { continue }
+            let sortedEntries = entries.sorted {
+                if $0.orderRank != $1.orderRank { return ($0.orderRank ?? Int.max) < ($1.orderRank ?? Int.max) }
+                if $0.scanIndex != $1.scanIndex { return $0.scanIndex < $1.scanIndex }
+                return $0.id < $1.id
+            }
+            let sortedWindows = windows.sorted {
+                if $0.orderRank != $1.orderRank { return ($0.orderRank ?? Int.max) < ($1.orderRank ?? Int.max) }
+                if $0.scanIndex != $1.scanIndex { return $0.scanIndex < $1.scanIndex }
+                return $0.id.serial < $1.id.serial
+            }
+            for (entry, window) in zip(sortedEntries, sortedWindows) {
+                replacements[entry.id] = window.id
+            }
+        }
+        return replacements
+    }
+    private func persistedEntry(_ entry: PersistedWindowLayoutEntry, canFrameMatch window: ManagedWindow) -> Bool {
+        entry.pid == window.id.pid && (entry.bundleIdentifier == nil || window.bundleIdentifier == nil || entry.bundleIdentifier == window.bundleIdentifier)
+    }
+    private func persistedWindowGroupKey(for entry: PersistedWindowLayoutEntry) -> PersistedWindowGroupKey {
+        PersistedWindowGroupKey(pid: entry.pid, bundleIdentifier: entry.bundleIdentifier)
+    }
+    private func persistedWindowGroupKey(for window: ManagedWindow) -> PersistedWindowGroupKey {
+        PersistedWindowGroupKey(pid: window.id.pid, bundleIdentifier: window.bundleIdentifier)
+    }
+    private func rememberPersistedLayouts(using windows: [ManagedWindow]) {
+        guard !windows.isEmpty else { return }
+        let windowsByID = Dictionary(windows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for (stateKey, state) in screenStates where !state.isEmpty {
+            let slotList = state.slotList
+            guard !slotList.isEmpty else { continue }
+            var entryIDByWindowID: [WindowIdentity: Int] = [:]
+            var entriesByID: [Int: PersistedWindowLayoutEntry] = [:]
+            var nextEntryID = 1
+            var canSnapshot = true
+            for item in slotList {
+                guard let window = windowsByID[item.id] else {
+                    canSnapshot = false
+                    break
+                }
+                let entryID = nextEntryID
+                nextEntryID += 1
+                entryIDByWindowID[item.id] = entryID
+                entriesByID[entryID] = PersistedWindowLayoutEntry(
+                    id: entryID,
+                    pid: window.id.pid,
+                    bundleIdentifier: window.bundleIdentifier,
+                    layoutIdentity: window.layoutIdentity ?? layoutIdentityByWindowID[window.id],
+                    orderRank: window.orderRank,
+                    scanIndex: window.scanIndex
+                )
+            }
+            guard canSnapshot,
+                  let tree = state.compactMapWindowIDs({ entryIDByWindowID[$0] }) else {
+                continue
+            }
+            persistedLayoutsByStateKey[stateKey] = PersistedScreenLayout(
+                stateKey: stateKey,
+                displayKey: displayKeyComponent(of: stateKey),
+                tree: tree,
+                entriesByID: entriesByID,
+                lastFocusedEntryID: state.focusedWindowID.flatMap { entryIDByWindowID[$0] },
+                lastUpdated: Date()
+            )
+        }
+    }
+
     private func retainedOffscreenWindowIDs(activeStateKeys: Set<String>) -> Set<WindowIdentity> {
         var retainedIDs: Set<WindowIdentity> = []
         if let frozenSystemUIScreenStates {
@@ -1304,6 +1746,7 @@ final class WindowTiler {
                         ?? copyInt(window, attribute: "_AXWindowNumber"),
                     elementKey: WindowElementKey(pid: app.processIdentifier, hash: CFHash(window)),
                     signature: windowSignature(for: window, app: app, title: title, stateKey: screen.stateKey),
+                    layoutIdentity: windowLayoutIdentity(for: window, app: app, title: title),
                     element: window,
                     screen: screen,
                     frame: frame,
@@ -1373,6 +1816,7 @@ final class WindowTiler {
                 windowNumber: candidate.windowNumber,
                 element: candidate.element,
                 screen: candidate.screen,
+                layoutIdentity: candidate.layoutIdentity,
                 frame: candidate.frame,
                 bundleIdentifier: candidate.bundleIdentifier,
                 title: candidate.title,
@@ -1381,9 +1825,11 @@ final class WindowTiler {
             ))
         }
         updateVisibleFloatingWindowStateKeys(using: windows)
+        rememberLayoutIdentities(using: windows)
         var retainedIDs = seenIDs
         retainedIDs.formUnion(retainedOffscreenIDs)
         identityRegistry.retainAliases(for: retainedIDs)
+        pruneLayoutIdentityCache(retainingVisibleIDs: seenIDs.union(retainedOffscreenIDs))
         return windows.sorted(by: shouldOrderBefore)
     }
     private func windowSignature(for window: AXUIElement, app: NSRunningApplication, title: String?, stateKey: String) -> WindowSignature? {
@@ -1396,6 +1842,16 @@ final class WindowTiler {
             title: normalizedWindowString(title)
         )
         return signature.hasStableComponent ? signature : nil
+    }
+    private func windowLayoutIdentity(for window: AXUIElement, app: NSRunningApplication, title: String?) -> WindowLayoutIdentity? {
+        let identity = WindowLayoutIdentity(
+            pid: app.processIdentifier,
+            bundleIdentifier: normalizedWindowString(app.bundleIdentifier),
+            axIdentifier: normalizedWindowString(copyString(window, attribute: "AXIdentifier")),
+            document: normalizedWindowString(copyString(window, attribute: kAXDocumentAttribute)),
+            title: normalizedWindowString(title)
+        )
+        return identity.hasStableComponent ? identity : nil
     }
     private func normalizedWindowString(_ value: String?) -> String? {
         guard let value else { return nil }
@@ -1817,7 +2273,6 @@ private struct CGWindowRecord {
     let title: String?
     let rank: Int
 }
-
 private struct OnScreenWindowSnapshot {
     var recordsByPID: [pid_t: [CGWindowRecord]] = [:]
     var visibleNumbersByPID: [pid_t: Set<Int>] = [:]
@@ -1870,6 +2325,7 @@ private struct ManagedWindow {
     let windowNumber: Int?
     let element: AXUIElement
     let screen: ScreenInfo
+    let layoutIdentity: WindowLayoutIdentity?
     let frame: CGRect
     let bundleIdentifier: String?
     let title: String?
@@ -1881,6 +2337,7 @@ private struct ManagedWindowCandidate {
     var windowNumber: Int?
     let elementKey: WindowElementKey
     let signature: WindowSignature?
+    let layoutIdentity: WindowLayoutIdentity?
     let element: AXUIElement
     let screen: ScreenInfo
     let frame: CGRect
@@ -1888,6 +2345,26 @@ private struct ManagedWindowCandidate {
     let title: String?
     var orderRank: Int?
     let scanIndex: Int
+}
+private struct PersistedScreenLayout {
+    let stateKey: String
+    let displayKey: String
+    let tree: BSPTree<Int>
+    let entriesByID: [Int: PersistedWindowLayoutEntry]
+    let lastFocusedEntryID: Int?
+    let lastUpdated: Date
+}
+private struct PersistedWindowLayoutEntry {
+    let id: Int
+    let pid: pid_t
+    let bundleIdentifier: String?
+    let layoutIdentity: WindowLayoutIdentity?
+    let orderRank: Int?
+    let scanIndex: Int
+}
+private struct PersistedWindowGroupKey: Hashable {
+    let pid: pid_t
+    let bundleIdentifier: String?
 }
 private struct SystemUIWindowSnapshot: Equatable {
     let idsByStateKey: [String: Set<WindowIdentity>]
@@ -1922,15 +2399,34 @@ private final class AppObserverRegistration {
 private struct ScreenTileState {
     private var tree = BSPTree<WindowIdentity>()
     private var lastFocusedID: WindowIdentity?
+    init() {}
+    init(tree: BSPTree<WindowIdentity>, lastFocusedID: WindowIdentity? = nil) {
+        self.tree = tree
+        self.lastFocusedID = lastFocusedID.flatMap { tree.contains($0) ? $0 : nil }
+    }
     var isEmpty: Bool { tree.isEmpty }
     var slots: [WindowIdentity: TileSlot] { tree.slots() }
+    var slotList: [(id: WindowIdentity, slot: TileSlot)] { tree.slotList() }
     var tileCount: Int { tree.tileCount }
     var windowIDs: Set<WindowIdentity> { Set(tree.ids) }
+    var focusedWindowID: WindowIdentity? {
+        lastFocusedID.flatMap { tree.contains($0) ? $0 : nil }
+    }
     var lastFocusedOrLargestID: WindowIdentity? {
         lastFocusedID.flatMap { tree.contains($0) ? $0 : nil } ?? tree.largestLeafID() ?? tree.firstID
     }
     func contains(_ id: WindowIdentity) -> Bool {
         tree.contains(id)
+    }
+    mutating func replaceWindowIDs(_ replacements: [WindowIdentity: WindowIdentity]) -> Bool {
+        guard tree.replaceIDs(replacements) else { return false }
+        if let lastFocusedID, let replacement = replacements[lastFocusedID] {
+            self.lastFocusedID = replacement
+        }
+        return true
+    }
+    func compactMapWindowIDs<NewID: Hashable>(_ transform: (WindowIdentity) -> NewID?) -> BSPTree<NewID>? {
+        tree.compactMapIDs(transform)
     }
     mutating func sync(windowIDs: [WindowIdentity], focusedID: WindowIdentity?) {
         let liveIDs = Set(windowIDs)
