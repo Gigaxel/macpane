@@ -26,6 +26,10 @@ New windows split the currently focused tile, similar to Pop Shell and i3-style 
 
 Use the menu bar item to increase, decrease, or reset the configurable gap around and between tiled windows. The current gap is stored in `UserDefaults`; the default is `8 px`.
 
+## Focus Border
+
+Use the menu bar item to turn the focused-window border on or off, choose a preset border color, or open the macOS color panel for a custom color. The border visibility and color are stored in `UserDefaults`; the border is on by default and uses orange by default.
+
 ## Build
 
 ```bash

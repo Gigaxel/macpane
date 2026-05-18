@@ -6,6 +6,7 @@ private let appBundleIdentifier = Bundle.main.bundleIdentifier ?? "com.gigaxel.m
 final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling {
     private static let sharedDelegate = MacPaneApp()
     private var statusItem: NSStatusItem?
+    private var borderColorPanelObserver: NSObjectProtocol?
     private let tiler = WindowTiler()
     private var isPreparingToTerminate = false
     static func main() {
@@ -89,6 +90,26 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling {
         resetGapItem.target = self
         menu.addItem(resetGapItem)
         menu.addItem(NSMenuItem.separator())
+        let borderItem = NSMenuItem(title: "Show Focus Border", action: #selector(toggleBorder), keyEquivalent: "")
+        borderItem.target = self
+        borderItem.state = tiler.borderEnabled ? .on : .off
+        menu.addItem(borderItem)
+        let borderColorItem = NSMenuItem(title: "Border Color: \(tiler.borderColorName)", action: nil, keyEquivalent: "")
+        let borderColorMenu = NSMenu()
+        for preset in BorderColorPalette.presets {
+            let presetItem = NSMenuItem(title: preset.title, action: #selector(selectBorderColor), keyEquivalent: "")
+            presetItem.target = self
+            presetItem.representedObject = preset.hex
+            presetItem.state = BorderColorPalette.normalizedHex(preset.hex) == tiler.borderColorHex ? .on : .off
+            borderColorMenu.addItem(presetItem)
+        }
+        borderColorMenu.addItem(NSMenuItem.separator())
+        let customColorItem = NSMenuItem(title: "Custom Color...", action: #selector(openBorderColorPanel), keyEquivalent: "")
+        customColorItem.target = self
+        borderColorMenu.addItem(customColorItem)
+        borderColorItem.submenu = borderColorMenu
+        menu.addItem(borderColorItem)
+        menu.addItem(NSMenuItem.separator())
         let retileItem = NSMenuItem(title: "Retile Now", action: #selector(retileNow), keyEquivalent: "r")
         retileItem.target = self
         menu.addItem(retileItem)
@@ -132,6 +153,42 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling {
         tiler.setGap(8)
         rebuildMenu()
     }
+    @objc private func toggleBorder() {
+        tiler.setBorderEnabled(!tiler.borderEnabled)
+        rebuildMenu()
+    }
+    @objc private func selectBorderColor(_ sender: NSMenuItem) {
+        guard let hex = sender.representedObject as? String,
+              let color = BorderColorPalette.color(from: hex) else {
+            return
+        }
+        tiler.setBorderColor(color)
+        rebuildMenu()
+    }
+    @objc private func openBorderColorPanel() {
+        let panel = NSColorPanel.shared
+        panel.showsAlpha = false
+        panel.color = tiler.borderColor
+        observeBorderColorPanel(panel)
+        if #available(macOS 14.0, *) {
+            NSApplication.shared.activate()
+        } else {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        }
+        panel.makeKeyAndOrderFront(nil)
+    }
+    private func observeBorderColorPanel(_ panel: NSColorPanel) {
+        guard borderColorPanelObserver == nil else { return }
+        borderColorPanelObserver = NotificationCenter.default.addObserver(
+            forName: NSColorPanel.colorDidChangeNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self, let panel = notification.object as? NSColorPanel else { return }
+            self.tiler.setBorderColor(panel.color)
+            self.rebuildMenu()
+        }
+    }
     @objc private func quit() {
         prepareForTermination()
         NSApplication.shared.terminate(nil)
@@ -141,6 +198,10 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling {
         isPreparingToTerminate = true
         HotKeyManager.shared.stop()
         tiler.stop()
+        if let borderColorPanelObserver {
+            NotificationCenter.default.removeObserver(borderColorPanelObserver)
+            self.borderColorPanelObserver = nil
+        }
         if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
             self.statusItem = nil
@@ -292,9 +353,56 @@ private enum DropAction {
     case swap
     case split(SnapDirection)
 }
+private enum BorderColorPalette {
+    static let defaultHex = "#FF9500"
+    static let presets: [(title: String, hex: String)] = [
+        ("Orange", defaultHex),
+        ("Blue", "#0A84FF"),
+        ("Green", "#30D158"),
+        ("Purple", "#BF5AF2"),
+        ("Red", "#FF453A"),
+        ("White", "#FFFFFF")
+    ]
+    static func color(from hex: String?) -> NSColor? {
+        guard let normalized = normalizedHex(hex) else { return nil }
+        let start = normalized.index(normalized.startIndex, offsetBy: 1)
+        let scanner = Scanner(string: String(normalized[start...]))
+        var value: UInt64 = 0
+        guard scanner.scanHexInt64(&value) else { return nil }
+        return NSColor(
+            srgbRed: CGFloat((value >> 16) & 0xff) / 255,
+            green: CGFloat((value >> 8) & 0xff) / 255,
+            blue: CGFloat(value & 0xff) / 255,
+            alpha: 1
+        )
+    }
+    static func hexString(for color: NSColor) -> String? {
+        guard let srgb = color.usingColorSpace(.sRGB) else { return nil }
+        let red = clampedColorComponent(srgb.redComponent)
+        let green = clampedColorComponent(srgb.greenComponent)
+        let blue = clampedColorComponent(srgb.blueComponent)
+        return String(format: "#%02X%02X%02X", red, green, blue)
+    }
+    static func displayName(for hex: String) -> String {
+        let normalized = normalizedHex(hex) ?? defaultHex
+        return presets.first { normalizedHex($0.hex) == normalized }?.title ?? normalized
+    }
+    static func normalizedHex(_ hex: String?) -> String? {
+        guard let hex else { return nil }
+        let trimmed = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
+        guard raw.count == 6, UInt64(raw, radix: 16) != nil else { return nil }
+        return "#\(raw.uppercased())"
+    }
+    private static func clampedColorComponent(_ value: CGFloat) -> Int {
+        Int((min(max(value, 0), 1) * 255).rounded())
+    }
+}
 final class WindowTiler {
     private let gapDefaultsKey = "gapPixels"
     private let tilingEnabledDefaultsKey = "tilingEnabled"
+    private let borderEnabledDefaultsKey = "borderEnabled"
+    private let borderColorDefaultsKey = "borderColor"
     private let accessibilityPromptedDefaultsKey = "accessibilityPrompted"
     private let defaultGap = 8
     private let maximumGap = 48
@@ -346,6 +454,22 @@ final class WindowTiler {
             return true
         }
         return UserDefaults.standard.bool(forKey: tilingEnabledDefaultsKey)
+    }
+    var borderEnabled: Bool {
+        if UserDefaults.standard.object(forKey: borderEnabledDefaultsKey) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: borderEnabledDefaultsKey)
+    }
+    var borderColorHex: String {
+        BorderColorPalette.normalizedHex(UserDefaults.standard.string(forKey: borderColorDefaultsKey))
+            ?? BorderColorPalette.defaultHex
+    }
+    var borderColorName: String {
+        BorderColorPalette.displayName(for: borderColorHex)
+    }
+    var borderColor: NSColor {
+        BorderColorPalette.color(from: borderColorHex) ?? BorderColorPalette.color(from: BorderColorPalette.defaultHex)!
     }
     func start() {
         isStopping = false
@@ -456,6 +580,21 @@ final class WindowTiler {
         let nextValue = min(max(value, 0), maximumGap)
         UserDefaults.standard.set(nextValue, forKey: gapDefaultsKey)
         scheduleReconcile(delay: 0.01)
+    }
+    func setBorderEnabled(_ enabled: Bool) {
+        guard !isStopping else { return }
+        UserDefaults.standard.set(enabled, forKey: borderEnabledDefaultsKey)
+        if enabled {
+            refreshFocusBorder()
+        } else {
+            focusBorder.hide()
+        }
+    }
+    func setBorderColor(_ color: NSColor) {
+        guard !isStopping else { return }
+        let hex = BorderColorPalette.hexString(for: color) ?? BorderColorPalette.defaultHex
+        UserDefaults.standard.set(hex, forKey: borderColorDefaultsKey)
+        focusBorder.setColor(borderColor)
     }
     func handleAXNotification(_ notification: String, element: AXUIElement) {
         guard !isStopping,
@@ -2086,6 +2225,7 @@ final class WindowTiler {
     }
     private func updateFocusBorder(using windows: [ManagedWindow]) {
         guard tilingEnabled,
+              borderEnabled,
               let focusedID = focusedWindowID(in: windows),
               !floatingWindowIDs.contains(focusedID),
               stateKey(containing: focusedID) != nil,
@@ -2096,11 +2236,18 @@ final class WindowTiler {
         showFocusBorder(for: focusedWindow)
     }
     private func showFocusBorder(for window: ManagedWindow) {
-        guard tilingEnabled, !floatingWindowIDs.contains(window.id), stateKey(containing: window.id) != nil else {
+        guard tilingEnabled, borderEnabled, !floatingWindowIDs.contains(window.id), stateKey(containing: window.id) != nil else {
             focusBorder.hide()
             return
         }
-        focusBorder.show(accessibilityFrame: actualFrame(for: window.element) ?? window.frame)
+        focusBorder.show(accessibilityFrame: actualFrame(for: window.element) ?? window.frame, color: borderColor)
+    }
+    private func refreshFocusBorder() {
+        guard hasAccessibilityPermission(prompt: false), tilingEnabled else {
+            focusBorder.hide()
+            return
+        }
+        updateFocusBorder(using: managedWindows())
     }
     private func copyAXElement(_ element: AXUIElement, attribute: String) -> AXUIElement? {
         var rawValue: CFTypeRef?
@@ -2598,13 +2745,17 @@ private struct ScreenTileState {
 }
 private final class FocusBorderOverlay {
     private var panel: NSPanel?
-    func show(accessibilityFrame frame: CGRect) {
+    func show(accessibilityFrame frame: CGRect, color: NSColor) {
         let panel = ensurePanel()
+        setColor(color)
         let cocoaFrame = Self.cocoaFrame(fromAccessibilityFrame: frame).insetBy(dx: -3, dy: -3)
         panel.setFrame(cocoaFrame, display: true)
         if !panel.isVisible {
             panel.orderFrontRegardless()
         }
+    }
+    func setColor(_ color: NSColor) {
+        panel?.contentView?.layer?.borderColor = color.cgColor
     }
     func hide() {
         panel?.orderOut(nil)
@@ -2632,7 +2783,7 @@ private final class FocusBorderOverlay {
         let view = NSView(frame: .zero)
         view.wantsLayer = true
         view.layer?.borderWidth = 3
-        view.layer?.borderColor = NSColor.systemOrange.cgColor
+        view.layer?.borderColor = BorderColorPalette.color(from: BorderColorPalette.defaultHex)?.cgColor
         view.layer?.cornerRadius = 6
         view.layer?.backgroundColor = NSColor.clear.cgColor
         panel.contentView = view
