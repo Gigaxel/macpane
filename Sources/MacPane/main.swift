@@ -324,6 +324,14 @@ final class WindowTiler {
     private var layoutIdentityByWindowID: [WindowIdentity: WindowLayoutIdentity] = [:]
     private var persistedLayoutsByStateKey: [String: PersistedScreenLayout] = [:]
     private let focusBorder = FocusBorderOverlay()
+    private let visibilityScanInterval: TimeInterval = 2.0
+    private let observerRecoveryInterval: TimeInterval = 15.0
+    private let missionControlActivityCacheDuration: TimeInterval = 0.25
+    private var lastVisibleWindowSignature = VisibleWindowSignature()
+    private var lastObserverRefresh = Date.distantPast
+    private var lastMissionControlActivityCheck = Date.distantPast
+    private var cachedMissionControlLikelyActive = false
+    private var knownNonObservablePIDs: Set<pid_t> = []
     private var suppressExternalChangesUntil = Date.distantPast
     private var systemUILayoutPausedUntil = Date.distantPast
     private var isWatching = false
@@ -384,6 +392,11 @@ final class WindowTiler {
         layoutIdentityByWindowID.removeAll()
         persistedLayoutsByStateKey.removeAll()
         focusBorder.close()
+        lastVisibleWindowSignature = VisibleWindowSignature()
+        lastObserverRefresh = Date.distantPast
+        lastMissionControlActivityCheck = Date.distantPast
+        cachedMissionControlLikelyActive = false
+        knownNonObservablePIDs.removeAll()
         isApplyingLayout = false
         isWatching = false
     }
@@ -503,6 +516,7 @@ final class WindowTiler {
         }
         isWatching = true
         refreshAppObservers()
+        lastVisibleWindowSignature = VisibleWindowSignature(snapshot: onScreenWindowSnapshot())
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         workspaceObservers.append(workspaceCenter.addObserver(
             forName: NSWorkspace.didLaunchApplicationNotification,
@@ -537,16 +551,17 @@ final class WindowTiler {
             self?.pauseLayoutForSystemUI(duration: 0.20, preserveLayout: false)
             self?.scheduleReconcile(delay: 0.30)
         }
-        scanTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self, !self.isStopping, !self.shouldPauseLayoutForSystemUI() else { return }
-            self.refreshAppObservers()
-            self.scheduleReconcileIfWindowSetChanged(delay: 0.01)
+        scanTimer = Timer.scheduledTimer(withTimeInterval: visibilityScanInterval, repeats: true) { [weak self] _ in
+            self?.performPeriodicVisibilityScan()
         }
+        scanTimer?.tolerance = visibilityScanInterval * 0.25
     }
     private func refreshAppObservers() {
         guard !isStopping else { return }
-        let runningApps = NSWorkspace.shared.runningApplications.filter(isObservableApp)
+        let allRunningApps = NSWorkspace.shared.runningApplications
+        let runningApps = allRunningApps.filter(isObservableApp)
         let runningPIDs = Set(runningApps.map(\.processIdentifier))
+        knownNonObservablePIDs = Set(allRunningApps.map(\.processIdentifier)).subtracting(runningPIDs)
         let stalePIDs = Set(appObservers.keys).subtracting(runningPIDs)
         for pid in stalePIDs {
             removeObserver(for: pid)
@@ -556,6 +571,7 @@ final class WindowTiler {
             installObserver(for: app)
         }
         refreshWindowNotificationRegistrations()
+        lastObserverRefresh = Date()
     }
     private func installObserver(for app: NSRunningApplication) {
         guard !isStopping else { return }
@@ -632,6 +648,32 @@ final class WindowTiler {
         guard !isStopping, tilingEnabled, frozenSystemUIScreenStates == nil, !shouldPauseLayoutForSystemUI() else { return }
         let windows = tiledWindows(from: managedWindows())
         guard hasWindowSetChanged(windows) else { return }
+        scheduleReconcile(delay: delay)
+    }
+    // Recovery polling should stay cheap; AX/workspace notifications are the primary update path.
+    private func performPeriodicVisibilityScan() {
+        guard !isStopping, tilingEnabled, frozenSystemUIScreenStates == nil else { return }
+        guard Date() >= systemUILayoutPausedUntil else { return }
+        let snapshot = onScreenWindowSnapshot()
+        refreshAppObserversIfNeeded(visiblePIDs: Set(snapshot.visibleNumbersByPID.keys))
+        scheduleReconcileIfVisibleWindowSetChanged(snapshot: snapshot, delay: 0.01)
+    }
+    private func refreshAppObserversIfNeeded(visiblePIDs: Set<pid_t>) {
+        let observedPIDs = Set(appObservers.keys)
+        let visibleObservableCandidates = visiblePIDs.subtracting(knownNonObservablePIDs)
+        let hasUnobservedVisibleApp = !visibleObservableCandidates.isSubset(of: observedPIDs)
+        let shouldRunRecoveryRefresh = Date().timeIntervalSince(lastObserverRefresh) >= observerRecoveryInterval
+        guard hasUnobservedVisibleApp || shouldRunRecoveryRefresh else { return }
+        refreshAppObservers()
+        if shouldRunRecoveryRefresh {
+            scheduleReconcileIfWindowSetChanged(delay: 0.01)
+        }
+    }
+    private func scheduleReconcileIfVisibleWindowSetChanged(snapshot: OnScreenWindowSnapshot, delay: TimeInterval) {
+        let signature = VisibleWindowSignature(snapshot: snapshot)
+        guard signature != lastVisibleWindowSignature else { return }
+        guard !shouldPauseLayoutForSystemUI() else { return }
+        lastVisibleWindowSignature = signature
         scheduleReconcile(delay: delay)
     }
     private func scheduleFocusRemember(delay: TimeInterval) {
@@ -1111,11 +1153,20 @@ final class WindowTiler {
     }
     private func shouldPauseLayoutForSystemUI() -> Bool {
         if Date() < systemUILayoutPausedUntil { return true }
-        if SystemUIActivity.isMissionControlLikelyActive() {
+        if isMissionControlLikelyActive() {
             pauseLayoutForSystemUI(duration: 1.20, preserveLayout: true)
             return true
         }
         return false
+    }
+    private func isMissionControlLikelyActive() -> Bool {
+        let now = Date()
+        guard now.timeIntervalSince(lastMissionControlActivityCheck) >= missionControlActivityCacheDuration else {
+            return cachedMissionControlLikelyActive
+        }
+        cachedMissionControlLikelyActive = SystemUIActivity.isMissionControlLikelyActive()
+        lastMissionControlActivityCheck = now
+        return cachedMissionControlLikelyActive
     }
     private func scheduleSystemUISettleCheck(delay: TimeInterval = 1.30) {
         guard !isStopping else { return }
@@ -1135,7 +1186,7 @@ final class WindowTiler {
             resetSystemUIWindowSnapshotStability()
             return
         }
-        if Date() < systemUILayoutPausedUntil || SystemUIActivity.isMissionControlLikelyActive() {
+        if Date() < systemUILayoutPausedUntil || isMissionControlLikelyActive() {
             pauseLayoutForSystemUI(duration: 0.80, preserveLayout: true)
             return
         }
@@ -1715,7 +1766,10 @@ final class WindowTiler {
             ?? screenStates.first { $0.value.contains(id) }?.key
     }
     private func managedWindows() -> [ManagedWindow] {
-        let snapshot = onScreenWindowSnapshot()
+        managedWindows(snapshot: onScreenWindowSnapshot())
+    }
+    private func managedWindows(snapshot: OnScreenWindowSnapshot) -> [ManagedWindow] {
+        lastVisibleWindowSignature = VisibleWindowSignature(snapshot: snapshot)
         let apps = NSWorkspace.shared.runningApplications
             .filter(isManageableApp)
             .sorted { lhs, rhs in
@@ -2107,20 +2161,29 @@ final class WindowTiler {
         Dictionary(uniqueKeysWithValues: currentScreenInfos().map { ($0.stateKey, $0) })
     }
     private func currentScreenInfos() -> [ScreenInfo] {
-        NSScreen.screens.map { screen in
+        let missionControlLikelyActive = isMissionControlLikelyActive()
+        return NSScreen.screens.map { screen in
             let displayID = screen.displayID
             let displayKey = ScreenInfo.displayKey(for: displayID, frame: screen.frame)
             return ScreenInfo(
                 key: displayKey,
                 frame: accessibilityVisibleFrame(for: screen),
                 displayID: displayID,
-                activeSpaceID: stableActiveSpaceID(for: displayID, displayKey: displayKey)
+                activeSpaceID: stableActiveSpaceID(
+                    for: displayID,
+                    displayKey: displayKey,
+                    missionControlLikelyActive: missionControlLikelyActive
+                )
             )
         }
     }
-    private func stableActiveSpaceID(for displayID: CGDirectDisplayID?, displayKey: String) -> SpaceID? {
+    private func stableActiveSpaceID(
+        for displayID: CGDirectDisplayID?,
+        displayKey: String,
+        missionControlLikelyActive: Bool
+    ) -> SpaceID? {
         let observed = SpacesController.shared.currentUserSpaceID(for: displayID)
-        if Date() < systemUILayoutPausedUntil || SystemUIActivity.isMissionControlLikelyActive() {
+        if Date() < systemUILayoutPausedUntil || missionControlLikelyActive {
             return stableSpaceIDByDisplayKey[displayKey] ?? observed
         }
         if let observed {
@@ -2300,6 +2363,17 @@ private struct OnScreenWindowSnapshot {
     }
     private func normalizedWindowTitle(_ title: String?) -> String {
         (title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+private struct VisibleWindowSignature: Equatable {
+    let visibleNumbersByPID: [pid_t: Set<Int>]
+
+    init() {
+        visibleNumbersByPID = [:]
+    }
+
+    init(snapshot: OnScreenWindowSnapshot) {
+        visibleNumbersByPID = snapshot.visibleNumbersByPID.filter { !$0.value.isEmpty }
     }
 }
 private struct ScreenInfo {
