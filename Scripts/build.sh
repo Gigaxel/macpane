@@ -14,6 +14,7 @@ rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$MODULE_CACHE_DIR"
 xcrun swiftc \
   -O \
+  -whole-module-optimization \
   -parse-as-library \
   -target "$TARGET_TRIPLE" \
   -module-cache-path "$MODULE_CACHE_DIR" \

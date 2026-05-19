@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Carbon
+import CoreFoundation
 import CoreGraphics
 import Darwin
 typealias SpaceID = UInt64
@@ -70,6 +71,8 @@ struct ManagedDisplaySpaces {
 final class SpacesController {
     static let shared = SpacesController()
     private let api = SkyLightPrivateAPI()
+    private let managedDisplaySpacesCacheDuration: CFTimeInterval = 0.20
+    private var cachedManagedDisplaySpaces: (layouts: [ManagedDisplaySpaces], timestamp: CFAbsoluteTime)?
     private init() {}
     func currentSpaceID(for displayID: CGDirectDisplayID?) -> SpaceID? {
         currentUserSpaceID(for: displayID)
@@ -78,15 +81,30 @@ final class SpacesController {
         layout(for: displayID)?.currentUserSpaceID
     }
     func managedDisplaySpaces() -> [ManagedDisplaySpaces] {
-        api.managedDisplaySpaces()
+        let now = CFAbsoluteTimeGetCurrent()
+        if let cachedManagedDisplaySpaces,
+           now - cachedManagedDisplaySpaces.timestamp <= managedDisplaySpacesCacheDuration {
+            return cachedManagedDisplaySpaces.layouts
+        }
+        let layouts = api.managedDisplaySpaces()
+        cachedManagedDisplaySpaces = (layouts, now)
+        return layouts
+    }
+    func invalidateCache() {
+        cachedManagedDisplaySpaces = nil
     }
     func switchToSpace(_ target: SpaceTarget) -> Bool {
-        api.switchToSpace(target.spaceID, displayIdentifier: target.displayIdentifier)
+        invalidateCache()
+        let switched = api.switchToSpace(target.spaceID, displayIdentifier: target.displayIdentifier)
+        invalidateCache()
+        return switched
     }
     func createSpace(on displayID: CGDirectDisplayID?, completion: @escaping (SpaceTarget?) -> Void) {
+        invalidateCache()
         let targetDisplayIdentifier = layout(for: displayID)?.displayIdentifier ?? Self.displayIdentifier(for: displayID)
         if let createdID = api.createDesktop(on: targetDisplayIdentifier),
            let target = target(for: createdID, fallbackDisplayID: displayID, fallbackDisplayIdentifier: targetDisplayIdentifier) {
+            invalidateCache()
             completion(target)
             return
         }
@@ -106,6 +124,7 @@ final class SpacesController {
                 completion(nil)
                 return
             }
+            self.invalidateCache()
             completion(target)
         }
     }
