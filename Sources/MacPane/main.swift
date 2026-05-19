@@ -48,6 +48,23 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
             }
             showWorkspaceSwitchIndicatorIfNeeded()
             return
+        case .overviewRenameStart:
+            HotKeyManager.shared.unregisterWorkspaceOverviewHotKeys()
+            let didBeginRename = workspaceOverviewOverlay.beginRename(
+                onCommit: { [weak self] name in
+                    guard let self else { return }
+                    self.tiler.renameActiveWorkspace(to: name)
+                    self.showWorkspaceOverview()
+                },
+                onCancel: { [weak self] in
+                    guard let self, let workspaceCount = self.workspaceOverviewOverlay.workspaceCount else { return }
+                    HotKeyManager.shared.registerWorkspaceOverviewHotKeys(workspaceCount: workspaceCount)
+                }
+            )
+            if !didBeginRename, let workspaceCount = workspaceOverviewOverlay.workspaceCount {
+                HotKeyManager.shared.registerWorkspaceOverviewHotKeys(workspaceCount: workspaceCount)
+            }
+            return
         default:
             break
         }
@@ -286,6 +303,7 @@ enum HotKeyAction {
     case showWorkspaceOverview
     case hideWorkspaceOverview
     case overviewSwitchWorkspace(Int)
+    case overviewRenameStart
     case toggleOrientation
     case toggleFloating
     case toggleTiling
@@ -372,6 +390,8 @@ final class HotKeyManager {
         for item in workspaceKeyCodes().prefix(min(max(workspaceCount, 0), 9)) {
             registerOverviewHotKey(keyCode: item.keyCode, modifiers: 0, action: .overviewSwitchWorkspace(item.index))
         }
+        registerOverviewHotKey(keyCode: UInt32(kVK_ANSI_R), modifiers: 0, action: .overviewRenameStart)
+        registerOverviewHotKey(keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(shiftKey), action: .overviewRenameStart)
         registerOverviewHotKey(keyCode: UInt32(kVK_Escape), modifiers: 0, action: .hideWorkspaceOverview)
     }
     func unregisterWorkspaceOverviewHotKeys() {
@@ -548,11 +568,13 @@ private struct WorkspaceOverview {
     let displayID: CGDirectDisplayID?
     let displayName: String
     let activeWorkspaceIndex: Int
+    let activeWorkspaceName: String?
     let workspaceCount: Int
     let items: [WorkspaceOverviewItem]
 }
 private struct WorkspaceOverviewItem {
     let index: Int
+    let name: String?
     let isActive: Bool
     let windows: [WorkspaceOverviewWindow]
 }
@@ -574,6 +596,7 @@ final class WindowTiler {
     private let gapDefaultsKey = "gapPixels"
     private let workspaceCountDefaultsKey = "virtualWorkspaceCount"
     private let tilingEnabledDefaultsKey = "tilingEnabled"
+    private let workspaceNamesDefaultsKey = "workspaceNamesByDisplay"
     private let accessibilityPromptedDefaultsKey = "accessibilityPrompted"
     private let defaultGap = 8
     private let maximumGap = 48
@@ -781,7 +804,9 @@ final class WindowTiler {
             cycleVirtualWorkspace(by: delta)
         case .showWorkspaceOverview:
             break
-        case .hideWorkspaceOverview, .overviewSwitchWorkspace:
+        case .hideWorkspaceOverview,
+             .overviewSwitchWorkspace,
+             .overviewRenameStart:
             break
         case .toggleOrientation:
             toggleFocusedSplitOrientation()
@@ -834,6 +859,7 @@ final class WindowTiler {
             }
             return WorkspaceOverviewItem(
                 index: index,
+                name: workspaceName(forNativeStateKey: context.nativeStateKey, workspaceIndex: index),
                 isActive: index == context.activeWorkspaceIndex,
                 windows: windows
             )
@@ -842,9 +868,21 @@ final class WindowTiler {
             displayID: context.screen.displayID,
             displayName: displayName(for: context.screen),
             activeWorkspaceIndex: context.activeWorkspaceIndex,
+            activeWorkspaceName: workspaceName(
+                forNativeStateKey: context.nativeStateKey,
+                workspaceIndex: context.activeWorkspaceIndex
+            ),
             workspaceCount: workspaceCount,
             items: items
         )
+    }
+    func renameActiveWorkspace(to name: String) {
+        guard !isStopping else { return }
+        guard let context = currentWorkspaceContext() else {
+            NSSound.beep()
+            return
+        }
+        setWorkspaceName(name, forNativeStateKey: context.nativeStateKey, workspaceIndex: context.activeWorkspaceIndex)
     }
     func handleAXNotification(_ notification: String, element: AXUIElement) {
         guard !isStopping, !shouldPauseLayoutForSystemUI(), frozenSystemUIScreenStates == nil else { return }
@@ -1509,6 +1547,7 @@ final class WindowTiler {
         floatingWindowStateKeys = floatingWindowStateKeys.compactMapValues {
             shiftedWorkspaceStateKey($0, deletingWorkspaceIndex: deletingIndex)
         }
+        shiftWorkspaceNames(deletingWorkspaceIndex: deletingIndex)
         activeWorkspaceIndexByNativeStateKey = activeWorkspaceIndexByNativeStateKey.mapValues {
             shiftedActiveWorkspaceIndex($0, deletingWorkspaceIndex: deletingIndex, newWorkspaceCount: newWorkspaceCount)
         }
@@ -2539,6 +2578,43 @@ final class WindowTiler {
         activeWorkspaceIndexByNativeStateKey[nativeStateKey] = index
         activeWorkspaceIndexByDisplayKey[displayKeyComponent(of: nativeStateKey)] = index
     }
+    private func workspaceName(forNativeStateKey nativeStateKey: String, workspaceIndex: Int) -> String? {
+        workspaceNames()[workspaceNameKey(forNativeStateKey: nativeStateKey, workspaceIndex: workspaceIndex)]
+    }
+    private func setWorkspaceName(_ name: String, forNativeStateKey nativeStateKey: String, workspaceIndex: Int) {
+        var names = workspaceNames()
+        let key = workspaceNameKey(forNativeStateKey: nativeStateKey, workspaceIndex: workspaceIndex)
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalizedName.isEmpty {
+            names.removeValue(forKey: key)
+        } else {
+            names[key] = String(normalizedName.prefix(48))
+        }
+        UserDefaults.standard.set(names, forKey: workspaceNamesDefaultsKey)
+    }
+    private func workspaceNames() -> [String: String] {
+        UserDefaults.standard.dictionary(forKey: workspaceNamesDefaultsKey) as? [String: String] ?? [:]
+    }
+    private func workspaceNameKey(forNativeStateKey nativeStateKey: String, workspaceIndex: Int) -> String {
+        "\(displayKeyComponent(of: nativeStateKey)):\(workspaceIndex)"
+    }
+    private func shiftWorkspaceNames(deletingWorkspaceIndex deletingIndex: Int) {
+        var shiftedNames: [String: String] = [:]
+        for (key, name) in workspaceNames() {
+            guard let separator = key.lastIndex(of: ":"),
+                  let index = Int(key[key.index(after: separator)...]) else {
+                shiftedNames[key] = name
+                continue
+            }
+            if index == deletingIndex {
+                continue
+            }
+            let displayKey = String(key[..<separator])
+            let nextIndex = index > deletingIndex ? index - 1 : index
+            shiftedNames["\(displayKey):\(nextIndex)"] = name
+        }
+        UserDefaults.standard.set(shiftedNames, forKey: workspaceNamesDefaultsKey)
+    }
     private func currentWorkspaceContext(
         windows providedWindows: [ManagedWindow]? = nil,
         focusedID providedFocusedID: WindowIdentity? = nil
@@ -3516,17 +3592,85 @@ private struct ScreenTileState {
         return removed
     }
 }
+private final class WorkspaceOverviewPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        centeredTextFrame(for: super.drawingRect(forBounds: rect), bounds: rect)
+    }
+    override func edit(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, event: NSEvent?) {
+        super.edit(withFrame: centeredTextFrame(for: rect, bounds: rect), in: controlView, editor: textObj, delegate: delegate, event: event)
+    }
+    override func select(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, start selStart: Int, length selLength: Int) {
+        super.select(withFrame: centeredTextFrame(for: rect, bounds: rect), in: controlView, editor: textObj, delegate: delegate, start: selStart, length: selLength)
+    }
+    private func centeredTextFrame(for frame: NSRect, bounds: NSRect) -> NSRect {
+        let textHeight = min(cellSize(forBounds: bounds).height, frame.height)
+        let yOffset = max(0, floor((frame.height - textHeight) / 2))
+        return NSRect(
+            x: frame.minX,
+            y: frame.minY + yOffset,
+            width: frame.width,
+            height: textHeight
+        )
+    }
+}
 private final class WorkspaceOverviewOverlay {
-    private var panel: NSPanel?
+    private var panel: WorkspaceOverviewPanel?
     private var hideWorkItem: DispatchWorkItem?
     private var onDismiss: (() -> Void)?
+    private var overview: WorkspaceOverview?
+    var workspaceCount: Int? {
+        overview?.workspaceCount
+    }
     func show(_ overview: WorkspaceOverview, onDismiss: @escaping () -> Void) {
         hide(notify: true)
+        self.overview = overview
         self.onDismiss = onDismiss
         let panel = ensurePanel()
-        panel.contentView = WorkspaceOverviewView(overview: overview)
-        panel.setFrame(Self.panelFrame(for: overview), display: true)
+        let frame = Self.panelFrame(for: overview)
+        panel.setFrame(frame, display: true)
+        let view = WorkspaceOverviewView(overview: overview)
+        view.frame = CGRect(origin: .zero, size: frame.size)
+        view.autoresizingMask = [.width, .height]
+        panel.contentView = view
+        panel.ignoresMouseEvents = true
         panel.orderFrontRegardless()
+        scheduleAutoHide()
+    }
+    @discardableResult
+    func beginRename(onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) -> Bool {
+        guard let overview, let view = overviewView else { return false }
+        hideWorkItem?.cancel()
+        hideWorkItem = nil
+        let panel = ensurePanel()
+        panel.ignoresMouseEvents = false
+        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
+        view.beginRenaming(
+            text: overview.activeWorkspaceName ?? "",
+            onCommit: { [weak self] name in
+                self?.finishRenameMode()
+                onCommit(name)
+            },
+            onCancel: { [weak self] in
+                self?.finishRenameMode()
+                onCancel()
+            }
+        )
+        return true
+    }
+    private var overviewView: WorkspaceOverviewView? {
+        panel?.contentView as? WorkspaceOverviewView
+    }
+    private func finishRenameMode() {
+        overviewView?.endRenaming()
+        panel?.ignoresMouseEvents = true
+        scheduleAutoHide()
+    }
+    private func scheduleAutoHide() {
         let workItem = DispatchWorkItem { [weak self] in
             self?.hide()
         }
@@ -3539,10 +3683,13 @@ private final class WorkspaceOverviewOverlay {
     private func hide(notify: Bool) {
         hideWorkItem?.cancel()
         hideWorkItem = nil
+        overviewView?.endRenaming()
+        panel?.ignoresMouseEvents = true
         panel?.orderOut(nil)
         guard notify else { return }
         let onDismiss = self.onDismiss
         self.onDismiss = nil
+        overview = nil
         onDismiss?()
     }
     func close() {
@@ -3550,9 +3697,9 @@ private final class WorkspaceOverviewOverlay {
         panel?.close()
         panel = nil
     }
-    private func ensurePanel() -> NSPanel {
+    private func ensurePanel() -> WorkspaceOverviewPanel {
         if let panel { return panel }
-        let panel = NSPanel(
+        let panel = WorkspaceOverviewPanel(
             contentRect: .zero,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -3587,8 +3734,13 @@ private final class WorkspaceOverviewOverlay {
         )
     }
 }
-private final class WorkspaceOverviewView: NSView {
+private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
     private let overview: WorkspaceOverview
+    private weak var activeHeaderLabel: NSTextField?
+    private weak var activeRenameField: NSTextField?
+    private var activeDetailViews: [NSView] = []
+    private var onRenameCommit: ((String) -> Void)?
+    private var onRenameCancel: (() -> Void)?
     init(overview: WorkspaceOverview) {
         self.overview = overview
         super.init(frame: .zero)
@@ -3599,6 +3751,7 @@ private final class WorkspaceOverviewView: NSView {
         fatalError("init(coder:) is not available")
     }
     private func buildView() {
+        activeDetailViews.removeAll()
         wantsLayer = true
         layer?.cornerRadius = 12
         layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
@@ -3638,7 +3791,9 @@ private final class WorkspaceOverviewView: NSView {
             root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             root.topAnchor.constraint(equalTo: contentView.topAnchor),
-            root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
+            root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            titleStack.widthAnchor.constraint(equalTo: root.widthAnchor),
+            grid.widthAnchor.constraint(equalTo: root.widthAnchor)
         ])
     }
     private func workspaceGrid() -> NSStackView {
@@ -3680,44 +3835,153 @@ private final class WorkspaceOverviewView: NSView {
             : NSColor.controlBackgroundColor.withAlphaComponent(0.72)).cgColor
         card.translatesAutoresizingMaskIntoConstraints = false
         card.heightAnchor.constraint(equalToConstant: 116).isActive = true
+        let numberBackdrop = workspaceNumberBackdrop(for: item)
+        card.addSubview(numberBackdrop)
         let stack = NSStackView()
         stack.orientation = .vertical
-        stack.alignment = .leading
+        stack.alignment = .width
         stack.spacing = 6
-        stack.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
         stack.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(stack)
         let header = label(
-            item.isActive ? "Workspace \(item.index + 1)  Active" : "Workspace \(item.index + 1)",
+            workspaceTitle(for: item),
             font: .systemFont(ofSize: 13, weight: .semibold),
             color: .labelColor
         )
         stack.addArrangedSubview(header)
+        if item.isActive {
+            activeHeaderLabel = header
+            let renameField = renameTextField()
+            renameField.isHidden = true
+            activeRenameField = renameField
+            stack.addArrangedSubview(renameField)
+        }
         if item.windows.isEmpty {
-            stack.addArrangedSubview(label(
+            let emptyLabel = label(
                 "No tiled windows",
                 font: .systemFont(ofSize: 12, weight: .regular),
                 color: .tertiaryLabelColor
-            ))
+            )
+            stack.addArrangedSubview(emptyLabel)
+            if item.isActive {
+                activeDetailViews.append(emptyLabel)
+            }
         } else {
             for window in item.windows.prefix(4) {
-                stack.addArrangedSubview(windowLabel(for: window))
+                let label = windowLabel(for: window)
+                stack.addArrangedSubview(label)
+                if item.isActive {
+                    activeDetailViews.append(label)
+                }
             }
             if item.windows.count > 4 {
-                stack.addArrangedSubview(label(
+                let moreLabel = label(
                     "+\(item.windows.count - 4) more",
                     font: .systemFont(ofSize: 11, weight: .regular),
                     color: .secondaryLabelColor
-                ))
+                )
+                stack.addArrangedSubview(moreLabel)
+                if item.isActive {
+                    activeDetailViews.append(moreLabel)
+                }
             }
         }
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: card.topAnchor),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: card.bottomAnchor)
+            numberBackdrop.centerXAnchor.constraint(equalTo: card.centerXAnchor),
+            numberBackdrop.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+            numberBackdrop.leadingAnchor.constraint(greaterThanOrEqualTo: card.leadingAnchor, constant: 8),
+            numberBackdrop.trailingAnchor.constraint(lessThanOrEqualTo: card.trailingAnchor, constant: -8),
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: card.bottomAnchor, constant: -10)
         ])
         return card
+    }
+    func beginRenaming(text: String, onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+        guard let activeRenameField else { return }
+        onRenameCommit = onCommit
+        onRenameCancel = onCancel
+        activeHeaderLabel?.isHidden = true
+        activeDetailViews.forEach { $0.isHidden = true }
+        activeRenameField.stringValue = text
+        activeRenameField.isHidden = false
+        DispatchQueue.main.async { [weak self, weak activeRenameField] in
+            guard let self, let activeRenameField else { return }
+            self.window?.makeFirstResponder(activeRenameField)
+            activeRenameField.selectText(nil)
+        }
+    }
+    func endRenaming() {
+        activeRenameField?.isHidden = true
+        activeHeaderLabel?.isHidden = false
+        activeDetailViews.forEach { $0.isHidden = false }
+        onRenameCommit = nil
+        onRenameCancel = nil
+        window?.makeFirstResponder(nil)
+    }
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        switch commandSelector {
+        case #selector(NSResponder.insertNewline(_:)),
+             #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
+            commitActiveRename()
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            cancelActiveRename()
+            return true
+        default:
+            return false
+        }
+    }
+    private func commitActiveRename() {
+        guard let activeRenameField, let onRenameCommit else { return }
+        self.onRenameCommit = nil
+        self.onRenameCancel = nil
+        onRenameCommit(activeRenameField.stringValue)
+    }
+    private func cancelActiveRename() {
+        guard let onRenameCancel else { return }
+        self.onRenameCommit = nil
+        self.onRenameCancel = nil
+        onRenameCancel()
+    }
+    private func workspaceTitle(for item: WorkspaceOverviewItem) -> String {
+        let defaultTitle = "Workspace \(item.index + 1)"
+        return item.name.flatMap { $0.isEmpty ? nil : $0 } ?? defaultTitle
+    }
+    private func workspaceNumberBackdrop(for item: WorkspaceOverviewItem) -> NSTextField {
+        let label = NSTextField(labelWithString: "\(item.index + 1)")
+        label.font = .monospacedDigitSystemFont(ofSize: 58, weight: .bold)
+        label.textColor = NSColor.labelColor.withAlphaComponent(item.isActive ? 0.13 : 0.08)
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        return label
+    }
+    private func renameTextField() -> NSTextField {
+        let field = NSTextField(string: "")
+        field.cell = VerticallyCenteredTextFieldCell(textCell: "")
+        field.font = .systemFont(ofSize: 13, weight: .semibold)
+        field.textColor = .labelColor
+        field.delegate = self
+        field.isEditable = true
+        field.isSelectable = true
+        field.isBordered = false
+        field.drawsBackground = true
+        field.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.22)
+        field.focusRingType = .none
+        field.wantsLayer = true
+        field.layer?.cornerRadius = 5
+        field.layer?.masksToBounds = true
+        field.lineBreakMode = .byTruncatingTail
+        field.usesSingleLineMode = true
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        field.setContentHuggingPriority(.required, for: .vertical)
+        field.setContentCompressionResistancePriority(.required, for: .vertical)
+        field.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        return field
     }
     private func windowLabel(for window: WorkspaceOverviewWindow) -> NSTextField {
         let prefix = window.isFocused ? "> " : "- "
