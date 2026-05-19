@@ -1,16 +1,13 @@
 import Foundation
-
 struct WindowLayoutIdentity: Hashable {
     let pid: pid_t
     let bundleIdentifier: String?
     let axIdentifier: String?
     let document: String?
     let title: String?
-
     var hasStableComponent: Bool {
         axIdentifier != nil || document != nil || title != nil
     }
-
     var matchKeys: [WindowLayoutIdentityMatchKey] {
         var keys: [WindowLayoutIdentityMatchKey] = []
         if let axIdentifier {
@@ -39,7 +36,6 @@ struct WindowLayoutIdentity: Hashable {
         }
         return keys
     }
-
     func value(for kind: WindowLayoutIdentityMatchKey.Kind) -> String? {
         switch kind {
         case .axIdentifier:
@@ -51,13 +47,11 @@ struct WindowLayoutIdentity: Hashable {
         }
     }
 }
-
 struct WindowLayoutIdentityMatchKey: Hashable {
     enum Kind: CaseIterable {
         case axIdentifier
         case document
         case title
-
         var strongerKinds: [Kind] {
             switch self {
             case .axIdentifier:
@@ -69,19 +63,16 @@ struct WindowLayoutIdentityMatchKey: Hashable {
             }
         }
     }
-
     let kind: Kind
     let pid: pid_t
     let bundleIdentifier: String?
     let value: String
 }
-
 enum WindowLayoutIdentityMatcher {
     private struct MatchCandidate<ID: Hashable> {
         let id: ID
         let identity: WindowLayoutIdentity
     }
-
     static func replacements<StoredID: Hashable, VisibleID: Hashable>(
         stored: [(id: StoredID, identity: WindowLayoutIdentity)],
         visible: [(id: VisibleID, identity: WindowLayoutIdentity)]
@@ -89,7 +80,6 @@ enum WindowLayoutIdentityMatcher {
         var replacements: [StoredID: VisibleID] = [:]
         var usedStoredIDs: Set<StoredID> = []
         var usedVisibleIDs: Set<VisibleID> = []
-
         for kind in WindowLayoutIdentityMatchKey.Kind.allCases {
             let storedCandidatesByKey = uniqueCandidatesByKey(stored, kind: kind, excluding: usedStoredIDs)
             let visibleCandidatesByKey = uniqueCandidatesByKey(visible, kind: kind, excluding: usedVisibleIDs)
@@ -105,10 +95,8 @@ enum WindowLayoutIdentityMatcher {
                 usedVisibleIDs.insert(visibleCandidate.id)
             }
         }
-
         return replacements
     }
-
     private static func uniqueCandidatesByKey<ID: Hashable>(
         _ items: [(id: ID, identity: WindowLayoutIdentity)],
         kind: WindowLayoutIdentityMatchKey.Kind,
@@ -124,7 +112,6 @@ enum WindowLayoutIdentityMatcher {
             Set(candidates.map(\.id)).count == 1 ? candidates[0] : nil
         }
     }
-
     private static func canMatch(
         _ stored: WindowLayoutIdentity,
         _ visible: WindowLayoutIdentity,

@@ -1,20 +1,16 @@
 import Foundation
-
 struct WindowIdentity: Hashable {
     let pid: pid_t
     let serial: Int
 }
-
 struct WindowOrderKey: Hashable {
     let pid: pid_t
     let number: Int
 }
-
 struct WindowElementKey: Hashable {
     let pid: pid_t
     let hash: CFHashCode
 }
-
 struct WindowSignature: Hashable {
     let pid: pid_t
     let stateKey: String?
@@ -26,7 +22,6 @@ struct WindowSignature: Hashable {
         axIdentifier != nil || document != nil || title != nil
     }
 }
-
 struct WindowIdentityRegistry {
     private var nextWindowIdentitySerial = 1
     private var identityByWindowNumber: [WindowOrderKey: WindowIdentity] = [:]
