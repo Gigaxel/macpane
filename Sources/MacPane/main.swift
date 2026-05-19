@@ -49,23 +49,6 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
             }
             showWorkspaceSwitchIndicatorIfNeeded()
             return
-        case .overviewRenameStart:
-            HotKeyManager.shared.unregisterWorkspaceOverviewHotKeys()
-            let didBeginRename = workspaceOverviewOverlay.beginRename(
-                onCommit: { [weak self] name in
-                    guard let self else { return }
-                    self.tiler.renameActiveWorkspace(to: name)
-                    self.showWorkspaceOverview()
-                },
-                onCancel: { [weak self] in
-                    guard let self, let workspaceCount = self.workspaceOverviewOverlay.workspaceCount else { return }
-                    HotKeyManager.shared.registerWorkspaceOverviewHotKeys(workspaceCount: workspaceCount)
-                }
-            )
-            if !didBeginRename, let workspaceCount = workspaceOverviewOverlay.workspaceCount {
-                HotKeyManager.shared.registerWorkspaceOverviewHotKeys(workspaceCount: workspaceCount)
-            }
-            return
         default:
             break
         }
@@ -178,7 +161,6 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
             "Cmd+Ctrl+Option+=: create MacPane workspace",
             "Cmd+Ctrl+Option+-: delete current empty workspace",
             "Cmd+Ctrl+Option+V: show workspace overview",
-            "Cmd+Ctrl+Option+N: create native macOS Space",
             "Mouse drop on edge: split target; center: swap target"
         ]
         for shortcut in shortcuts {
@@ -357,7 +339,6 @@ enum HotKeyAction {
     case focus(SnapDirection)
     case swap(SnapDirection)
     case resize(SnapDirection)
-    case createSpace
     case createWorkspace
     case deleteWorkspace
     case switchWorkspace(Int)
@@ -366,7 +347,6 @@ enum HotKeyAction {
     case showWorkspaceOverview
     case hideWorkspaceOverview
     case overviewSwitchWorkspace(Int)
-    case overviewRenameStart
     case toggleOrientation
     case toggleFloating
     case toggleTiling
@@ -453,8 +433,6 @@ final class HotKeyManager {
         for item in workspaceKeyCodes().prefix(min(max(workspaceCount, 0), 9)) {
             registerOverviewHotKey(keyCode: item.keyCode, modifiers: 0, action: .overviewSwitchWorkspace(item.index))
         }
-        registerOverviewHotKey(keyCode: UInt32(kVK_ANSI_R), modifiers: 0, action: .overviewRenameStart)
-        registerOverviewHotKey(keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(shiftKey), action: .overviewRenameStart)
         registerOverviewHotKey(keyCode: UInt32(kVK_Escape), modifiers: 0, action: .hideWorkspaceOverview)
     }
     func unregisterWorkspaceOverviewHotKeys() {
@@ -490,7 +468,6 @@ final class HotKeyManager {
         register(keyCode: UInt32(kVK_ANSI_Equal), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .createWorkspace)
         register(keyCode: UInt32(kVK_ANSI_Minus), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .deleteWorkspace)
         register(keyCode: UInt32(kVK_ANSI_V), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .showWorkspaceOverview)
-        register(keyCode: UInt32(kVK_ANSI_N), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .createSpace)
         register(keyCode: UInt32(kVK_ANSI_O), modifiers: UInt32(cmdKey | optionKey), action: .toggleOrientation)
         register(keyCode: UInt32(kVK_ANSI_G), modifiers: UInt32(cmdKey | optionKey), action: .toggleFloating)
         register(keyCode: UInt32(kVK_ANSI_Y), modifiers: UInt32(cmdKey | optionKey), action: .toggleTiling)
@@ -675,13 +652,11 @@ private struct WorkspaceOverview {
     let displayID: CGDirectDisplayID?
     let displayName: String
     let activeWorkspaceIndex: Int
-    let activeWorkspaceName: String?
     let workspaceCount: Int
     let items: [WorkspaceOverviewItem]
 }
 private struct WorkspaceOverviewItem {
     let index: Int
-    let name: String?
     let isActive: Bool
     let windows: [WorkspaceOverviewWindow]
 }
@@ -699,18 +674,12 @@ private struct WorkspaceSwitchIndicatorState {
     let workspaceIndex: Int
     let displayID: CGDirectDisplayID?
 }
-private enum FocusBorderUpdate {
-    case automatic
-    case none
-    case window(ManagedWindow)
-}
 final class WindowTiler {
     private let gapDefaultsKey = "gapPixels"
     private let workspaceCountDefaultsKey = "virtualWorkspaceCount"
     private let tilingEnabledDefaultsKey = "tilingEnabled"
     private let borderEnabledDefaultsKey = "borderEnabled"
     private let borderColorDefaultsKey = "borderColor"
-    private let workspaceNamesDefaultsKey = "workspaceNamesByDisplay"
     private let accessibilityPromptedDefaultsKey = "accessibilityPrompted"
     private let defaultGap = 8
     private let maximumGap = 48
@@ -723,25 +692,27 @@ final class WindowTiler {
     private var scanTimer: Timer?
     private var pendingReconcile: DispatchWorkItem?
     private var pendingFocusRemember: DispatchWorkItem?
-    private var pendingDeferredFocus: DispatchWorkItem?
-    private var deferredFocusGeneration = 0
     private var pendingMove: DispatchWorkItem?
     private var pendingResize: DispatchWorkItem?
     private var pendingSystemUISettle: DispatchWorkItem?
+    private var pendingWorkspaceSwitchApply: DispatchWorkItem?
+    private var workspaceSwitchApplyGeneration = 0
     private var managedWindowCache: (windows: [ManagedWindow], createdAt: Date)?
     private let interactiveWindowCacheDuration: TimeInterval = 0.80
     private let defaultWindowCacheDuration: TimeInterval = 0.12
-    private let accessibilityMessagingTimeout: Float = 0.20
-    private var lastSyncedVisibleWindowSignature = VisibleWindowSignature()
-    private var lastAppliedFrameByWindowID: [WindowIdentity: CGRect] = [:]
+    private let workspaceSwitchApplyDelay: TimeInterval = 0.045
+    private let accessibilityMessagingTimeout: Float = 0.15
+    private let accessibilityPermissionCacheDuration: TimeInterval = 0.50
+    private var cachedAccessibilityPermission: (granted: Bool, createdAt: Date)?
     private var screenStates: [String: ScreenTileState] = [:]
     private var activeWorkspaceIndexByNativeStateKey: [String: Int] = [:]
     private var activeWorkspaceIndexByDisplayKey: [String: Int] = [:]
+    private var lastAppliedWorkspaceIndexByNativeStateKey: [String: Int] = [:]
+    private var lastWorkspaceSwitchContext: WorkspaceContext?
     private var shouldMigrateWorkspaceStatesAfterScreenChange = false
     private var pendingWorkspaceSwitchIndicator: WorkspaceSwitchIndicatorState?
     private var frozenSystemUIScreenStates: [String: ScreenTileState]?
     private var frozenSystemUIActiveStateKeys: Set<String>?
-    private var stableSpaceIDByDisplayKey: [String: SpaceID] = [:]
     private var lastSystemUIWindowSnapshot: SystemUIWindowSnapshot?
     private var stableSystemUIWindowSnapshotCount = 0
     private var systemUISettleBeganAt: Date?
@@ -756,11 +727,11 @@ final class WindowTiler {
     private let focusBorder = FocusBorderOverlay()
     private let visibilityScanInterval: TimeInterval = 2.0
     private let observerRecoveryInterval: TimeInterval = 15.0
-    private let missionControlActivityCacheDuration: TimeInterval = 0.25
     private var lastVisibleWindowSignature = VisibleWindowSignature()
+    private var lastSyncedVisibleWindowSignature = VisibleWindowSignature()
+    private var lastAppliedFrameByWindowID: [WindowIdentity: CGRect] = [:]
+    private var lastKnownFocusedWindowID: WindowIdentity?
     private var lastObserverRefresh = Date.distantPast
-    private var lastMissionControlActivityCheck = Date.distantPast
-    private var cachedMissionControlLikelyActive = false
     private var knownNonObservablePIDs: Set<pid_t> = []
     private var suppressExternalChangesUntil = Date.distantPast
     private var systemUILayoutPausedUntil = Date.distantPast
@@ -825,23 +796,22 @@ final class WindowTiler {
         scheduleReconcile(delay: 0.05)
     }
     func stop() {
-        guard !isStopping else { return }
+        isStopping = true
         pendingReconcile?.cancel()
         pendingReconcile = nil
         pendingFocusRemember?.cancel()
         pendingFocusRemember = nil
-        pendingDeferredFocus?.cancel()
-        pendingDeferredFocus = nil
-        deferredFocusGeneration += 1
         pendingMove?.cancel()
         pendingMove = nil
         pendingResize?.cancel()
         pendingResize = nil
         pendingSystemUISettle?.cancel()
         pendingSystemUISettle = nil
-        restoreWorkspaceWindowsForTermination()
-        isStopping = true
+        pendingWorkspaceSwitchApply?.cancel()
+        pendingWorkspaceSwitchApply = nil
+        workspaceSwitchApplyGeneration += 1
         managedWindowCache = nil
+        cachedAccessibilityPermission = nil
         permissionTimer?.invalidate()
         permissionTimer = nil
         scanTimer?.invalidate()
@@ -860,6 +830,8 @@ final class WindowTiler {
         screenStates.removeAll()
         activeWorkspaceIndexByNativeStateKey.removeAll()
         activeWorkspaceIndexByDisplayKey.removeAll()
+        lastAppliedWorkspaceIndexByNativeStateKey.removeAll()
+        lastWorkspaceSwitchContext = nil
         shouldMigrateWorkspaceStatesAfterScreenChange = false
         pendingWorkspaceSwitchIndicator = nil
         frozenSystemUIScreenStates = nil
@@ -873,94 +845,26 @@ final class WindowTiler {
         lastVisibleWindowSignature = VisibleWindowSignature()
         lastSyncedVisibleWindowSignature = VisibleWindowSignature()
         lastAppliedFrameByWindowID.removeAll()
+        lastKnownFocusedWindowID = nil
         lastObserverRefresh = Date.distantPast
-        lastMissionControlActivityCheck = Date.distantPast
-        cachedMissionControlLikelyActive = false
         knownNonObservablePIDs.removeAll()
         isApplyingLayout = false
         isWatching = false
     }
-    private func restoreWorkspaceWindowsForTermination() {
-        guard hasAccessibilityPermission(prompt: false), !screenStates.isEmpty else { return }
-        invalidateManagedWindowCache(clearAppliedFrames: true)
-        let allWindows = managedWindows()
-        let windowsByID = Dictionary(allWindows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        guard !windowsByID.isEmpty else { return }
-
-        var orderedIDsByDisplayKey: [String: [WindowIdentity]] = [:]
-        var seenIDsByDisplayKey: [String: Set<WindowIdentity>] = [:]
-        var screenByDisplayKey: [String: ScreenInfo] = [:]
-
-        for (stateKey, state) in screenStates.sorted(by: workspaceStateSort) where !state.isEmpty {
-            let displayKey = displayKeyComponent(of: stateKey)
-            let fallbackScreen = state.windowIDs.compactMap { windowsByID[$0]?.screen }.first
-                ?? allWindows.first?.screen
-                ?? currentScreenInfos().first
-            guard let fallbackScreen else { continue }
-            screenByDisplayKey[displayKey] = restorationScreen(forStateKey: stateKey, fallback: fallbackScreen)
-
-            for id in orderedWindowIDs(in: state) where windowsByID[id] != nil && !floatingWindowIDs.contains(id) {
-                if seenIDsByDisplayKey[displayKey, default: []].insert(id).inserted {
-                    orderedIDsByDisplayKey[displayKey, default: []].append(id)
-                }
-            }
-        }
-
-        guard !orderedIDsByDisplayKey.isEmpty else { return }
-        suppressExternalChanges(for: 1.0)
-        isApplyingLayout = true
-        defer {
-            isApplyingLayout = false
-            focusBorder.hide()
-            invalidateManagedWindowCache(clearAppliedFrames: true)
-        }
-
-        for (displayKey, ids) in orderedIDsByDisplayKey {
-            guard let screen = screenByDisplayKey[displayKey], !ids.isEmpty else { continue }
-            var restoreState = ScreenTileState()
-            restoreState.sync(windowIDs: ids, focusedID: ids.first)
-            restoreState.balance()
-            for (id, slot) in restoreState.slotList {
-                guard let window = windowsByID[id] else { continue }
-                let frame = slot.frame(in: screen.frame, gap: CGFloat(gapPixels), smartOuterGap: true)
-                _ = set(window: window, frame: frame)
-            }
-        }
-    }
-    private func workspaceStateSort(_ lhs: (key: String, value: ScreenTileState), _ rhs: (key: String, value: ScreenTileState)) -> Bool {
-        let lhsDisplay = displayKeyComponent(of: lhs.key)
-        let rhsDisplay = displayKeyComponent(of: rhs.key)
-        if lhsDisplay != rhsDisplay { return lhsDisplay < rhsDisplay }
-        let lhsWorkspace = ScreenInfo.workspaceIndex(from: lhs.key) ?? Int.max
-        let rhsWorkspace = ScreenInfo.workspaceIndex(from: rhs.key) ?? Int.max
-        if lhsWorkspace != rhsWorkspace { return lhsWorkspace < rhsWorkspace }
-        return lhs.key < rhs.key
-    }
-    private func orderedWindowIDs(in state: ScreenTileState) -> [WindowIdentity] {
-        var seen: Set<WindowIdentity> = []
-        var ids: [WindowIdentity] = []
-        for id in state.slotList.map(\.id) {
-            if seen.insert(id).inserted {
-                ids.append(id)
-            }
-        }
-        for id in state.windowIDs where seen.insert(id).inserted {
-            ids.append(id)
-        }
-        return ids
-    }
-    private func restorationScreen(forStateKey stateKey: String, fallback: ScreenInfo) -> ScreenInfo {
-        let displayKey = displayKeyComponent(of: stateKey)
-        return currentScreenInfos().first { screen in
-            displayKeyComponent(of: screen.nativeStateKey) == displayKey
-        } ?? screenInfo(forKnownStateKey: stateKey, fallback: fallback).withoutStateKeyOverride()
-    }
     func hasAccessibilityPermission(prompt: Bool) -> Bool {
+        let now = Date()
+        if !prompt, let cachedAccessibilityPermission,
+           now.timeIntervalSince(cachedAccessibilityPermission.createdAt) <= accessibilityPermissionCacheDuration {
+            return cachedAccessibilityPermission.granted
+        }
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary
-        return AXIsProcessTrustedWithOptions(options)
+        let granted = AXIsProcessTrustedWithOptions(options)
+        cachedAccessibilityPermission = (granted, now)
+        return granted
     }
     func requestAccessibilityPermission() -> Bool {
         UserDefaults.standard.set(true, forKey: accessibilityPromptedDefaultsKey)
+        cachedAccessibilityPermission = nil
         return hasAccessibilityPermission(prompt: true)
     }
     func retileNow() {
@@ -989,8 +893,6 @@ final class WindowTiler {
             swapFocusedWindow(direction: direction)
         case .resize(let direction):
             resizeFocusedWindow(direction: direction)
-        case .createSpace:
-            createSpaceForFocusedDisplay()
         case .createWorkspace:
             createVirtualWorkspace()
         case .deleteWorkspace:
@@ -1003,9 +905,7 @@ final class WindowTiler {
             cycleVirtualWorkspace(by: delta)
         case .showWorkspaceOverview:
             break
-        case .hideWorkspaceOverview,
-             .overviewSwitchWorkspace,
-             .overviewRenameStart:
+        case .hideWorkspaceOverview, .overviewSwitchWorkspace:
             break
         case .toggleOrientation:
             toggleFocusedSplitOrientation()
@@ -1073,7 +973,6 @@ final class WindowTiler {
             }
             return WorkspaceOverviewItem(
                 index: index,
-                name: workspaceName(forNativeStateKey: context.nativeStateKey, workspaceIndex: index),
                 isActive: index == context.activeWorkspaceIndex,
                 windows: windows
             )
@@ -1082,46 +981,33 @@ final class WindowTiler {
             displayID: context.screen.displayID,
             displayName: displayName(for: context.screen),
             activeWorkspaceIndex: context.activeWorkspaceIndex,
-            activeWorkspaceName: workspaceName(
-                forNativeStateKey: context.nativeStateKey,
-                workspaceIndex: context.activeWorkspaceIndex
-            ),
             workspaceCount: workspaceCount,
             items: items
         )
     }
-    func renameActiveWorkspace(to name: String) {
-        guard !isStopping else { return }
-        guard let context = currentWorkspaceContext() else {
-            NSSound.beep()
-            return
-        }
-        setWorkspaceName(name, forNativeStateKey: context.nativeStateKey, workspaceIndex: context.activeWorkspaceIndex)
-    }
     func handleAXNotification(_ notification: String, element: AXUIElement) {
-        guard !isStopping,
-              !isApplyingLayout,
-              !isSuppressingExternalChanges,
-              !shouldPauseLayoutForSystemUI(),
-              frozenSystemUIScreenStates == nil else { return }
+        guard !isStopping, !shouldPauseLayoutForSystemUI(), frozenSystemUIScreenStates == nil else { return }
         switch notification {
         case kAXWindowCreatedNotification:
-            invalidateManagedWindowCache()
+            invalidateManagedWindowCache(clearAppliedFrames: true)
             refreshWindowNotificationRegistrations()
-            scheduleReconcile(delay: 0.04)
+            scheduleReconcile(delay: 0.025)
         case kAXUIElementDestroyedNotification:
-            invalidateManagedWindowCache()
+            invalidateManagedWindowCache(clearAppliedFrames: true)
             removeFloatingWindowID(forDestroyedElement: element)
-            scheduleReconcile(delay: 0.03)
+            scheduleReconcile(delay: 0.015)
         case kAXFocusedWindowChangedNotification,
              kAXApplicationActivatedNotification,
              kAXMainWindowChangedNotification:
+            guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
             scheduleFocusRemember(delay: 0.01)
         case kAXMovedNotification:
             invalidateManagedWindowCache(clearAppliedFrames: true)
+            guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
             scheduleExternalMove(element: element, userInitiated: isPointerButtonDown)
         case kAXResizedNotification:
             invalidateManagedWindowCache(clearAppliedFrames: true)
+            guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
             scheduleExternalResize(element: element, userInitiated: isPointerButtonDown)
         default:
             break
@@ -1181,24 +1067,11 @@ final class WindowTiler {
             self?.refreshAppObservers()
             self?.scheduleReconcile(delay: 0.04)
         })
-        workspaceObservers.append(workspaceCenter.addObserver(
-            forName: NSWorkspace.activeSpaceDidChangeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            SpacesController.shared.invalidateCache()
-            self?.invalidateManagedWindowCache(clearAppliedFrames: true)
-            self?.refreshStableSpaceIDsFromObservedScreens()
-            self?.pauseLayoutForSystemUI(duration: 1.20, preserveLayout: true)
-            self?.refreshAppObservers()
-        })
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            SpacesController.shared.invalidateCache()
-            self?.invalidateManagedWindowCache(clearAppliedFrames: true)
             self?.shouldMigrateWorkspaceStatesAfterScreenChange = true
             self?.pauseLayoutForSystemUI(duration: 1.20, preserveLayout: true)
             self?.scheduleReconcile(delay: 1.35)
@@ -1210,7 +1083,6 @@ final class WindowTiler {
     }
     private func refreshAppObservers() {
         guard !isStopping else { return }
-        invalidateManagedWindowCache()
         let allRunningApps = NSWorkspace.shared.runningApplications
         let runningApps = allRunningApps.filter(isObservableApp)
         let runningPIDs = Set(runningApps.map(\.processIdentifier))
@@ -1403,6 +1275,7 @@ final class WindowTiler {
             updateFocusBorder(using: windows)
             return
         }
+        lastKnownFocusedWindowID = focusedID
         if let key = stateKey(containing: focusedID), var state = screenStates[key] {
             state.markFocusedIfKnown(focusedID)
             screenStates[key] = state
@@ -1566,25 +1439,14 @@ final class WindowTiler {
     }
     private func focusNeighbor(direction: SnapDirection) {
         let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowID(in: allWindows)
+        let focusedID = focusedWindowIDForHotKey(in: allWindows)
         syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
         guard let focusedID,
               let key = stateKey(containing: focusedID),
               var state = screenStates[key],
               let targetID = state.neighborID(from: focusedID, direction: direction),
               let targetWindow = allWindows.first(where: { $0.id == targetID }) else {
-            syncStates(with: tiledWindows(from: allWindows), focusedID: focusedID)
-            guard let focusedID,
-                  let key = stateKey(containing: focusedID),
-                  var state = screenStates[key],
-                  let targetID = state.neighborID(from: focusedID, direction: direction),
-                  let targetWindow = allWindows.first(where: { $0.id == targetID }) else {
-                NSSound.beep()
-                return
-            }
-            state.markFocused(targetID)
-            screenStates[key] = state
-            focus(window: targetWindow, updateTreeFocus: true)
+            NSSound.beep()
             return
         }
         state.markFocused(targetID)
@@ -1592,169 +1454,173 @@ final class WindowTiler {
         focus(window: targetWindow, updateTreeFocus: true)
     }
     private func swapFocusedWindow(direction: SnapDirection) {
-        invalidateManagedWindowCache(clearAppliedFrames: true)
         let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowID(in: allWindows)
+        let focusedID = focusedWindowIDForHotKey(in: allWindows)
         syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
         guard let focusedID,
               let key = stateKey(containing: focusedID),
               var state = screenStates[key],
               state.swapFocused(focusedID, direction: direction) else {
-            syncStates(with: tiledWindows(from: allWindows), focusedID: focusedID)
-            guard let focusedID,
-                  let key = stateKey(containing: focusedID),
-                  var state = screenStates[key],
-                  state.swapFocused(focusedID, direction: direction) else {
-                NSSound.beep()
-                return
-            }
-            screenStates[key] = state
-            let focusedWindow = allWindows.first(where: { $0.id == focusedID })
-            applyLayout(to: allWindows, limitingToStateKeys: [key], focusBorderUpdate: focusedWindow.map(FocusBorderUpdate.window) ?? .automatic)
+            NSSound.beep()
             return
         }
         screenStates[key] = state
-        let focusedWindow = allWindows.first(where: { $0.id == focusedID })
-        applyLayout(to: allWindows, limitingToStateKeys: [key], focusBorderUpdate: focusedWindow.map(FocusBorderUpdate.window) ?? .automatic)
+        applyLayout(to: allWindows, limitingToStateKeys: [key], updateFocusBorder: false)
+        if let window = allWindows.first(where: { $0.id == focusedID }) {
+            showFocusBorder(for: window)
+        }
     }
     private func resizeFocusedWindow(direction: SnapDirection) {
-        invalidateManagedWindowCache(clearAppliedFrames: true)
         let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowID(in: allWindows)
+        let focusedID = focusedWindowIDForHotKey(in: allWindows)
         syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
         guard let focusedID,
               let key = stateKey(containing: focusedID),
               var state = screenStates[key],
               state.resizeFocused(focusedID, direction: direction) else {
-            syncStates(with: tiledWindows(from: allWindows), focusedID: focusedID)
-            guard let focusedID,
-                  let key = stateKey(containing: focusedID),
-                  var state = screenStates[key],
-                  state.resizeFocused(focusedID, direction: direction) else {
-                NSSound.beep()
-                return
-            }
-            screenStates[key] = state
-            let focusedWindow = allWindows.first(where: { $0.id == focusedID })
-            applyLayout(to: allWindows, limitingToStateKeys: [key], focusBorderUpdate: focusedWindow.map(FocusBorderUpdate.window) ?? .automatic)
+            NSSound.beep()
             return
         }
         screenStates[key] = state
-        let focusedWindow = allWindows.first(where: { $0.id == focusedID })
-        applyLayout(to: allWindows, limitingToStateKeys: [key], focusBorderUpdate: focusedWindow.map(FocusBorderUpdate.window) ?? .automatic)
+        applyLayout(to: allWindows, limitingToStateKeys: [key], updateFocusBorder: false)
+        if let window = allWindows.first(where: { $0.id == focusedID }) {
+            showFocusBorder(for: window)
+        }
     }
     private func toggleFocusedSplitOrientation() {
-        invalidateManagedWindowCache(clearAppliedFrames: true)
         let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowID(in: allWindows)
+        let focusedID = focusedWindowIDForHotKey(in: allWindows)
         syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
         guard let focusedID,
               let key = stateKey(containing: focusedID),
               var state = screenStates[key],
               state.toggleOrientation(focusedID: focusedID) else {
-            syncStates(with: tiledWindows(from: allWindows), focusedID: focusedID)
-            guard let focusedID,
-                  let key = stateKey(containing: focusedID),
-                  var state = screenStates[key],
-                  state.toggleOrientation(focusedID: focusedID) else {
-                NSSound.beep()
-                return
-            }
-            screenStates[key] = state
-            let focusedWindow = allWindows.first(where: { $0.id == focusedID })
-            applyLayout(to: allWindows, limitingToStateKeys: [key], focusBorderUpdate: focusedWindow.map(FocusBorderUpdate.window) ?? .automatic)
+            NSSound.beep()
             return
         }
         screenStates[key] = state
-        let focusedWindow = allWindows.first(where: { $0.id == focusedID })
-        applyLayout(to: allWindows, limitingToStateKeys: [key], focusBorderUpdate: focusedWindow.map(FocusBorderUpdate.window) ?? .automatic)
-    }
-    private func moveFocusedWindowToDisplay(direction: SnapDirection) {
-        invalidateManagedWindowCache(clearAppliedFrames: true)
-        let allWindows = managedWindows()
-        let focusedID = focusedWindowID(in: allWindows)
-        syncStates(with: tiledWindows(from: allWindows), focusedID: focusedID)
-        guard let focusedID,
-              let focusedWindow = allWindows.first(where: { $0.id == focusedID }),
-              let targetScreen = adjacentScreen(from: focusedWindow.screen, direction: direction),
-              let sourceKey = stateKey(containing: focusedID),
-              var sourceState = screenStates[sourceKey] else {
-            NSSound.beep()
-            return
+        applyLayout(to: allWindows, limitingToStateKeys: [key], updateFocusBorder: false)
+        if let window = allWindows.first(where: { $0.id == focusedID }) {
+            showFocusBorder(for: window)
         }
-        sourceState.remove(focusedID)
-        screenStates[sourceKey] = sourceState
-        var targetState = screenStates[targetScreen.stateKey] ?? ScreenTileState()
-        targetState.insertExisting(focusedID, near: targetState.lastFocusedOrLargestID, placement: .automatic)
-        targetState.markFocused(focusedID)
-        screenStates[targetScreen.stateKey] = targetState
-        applyLayout(to: allWindows)
-        focus(window: focusedWindow, updateTreeFocus: true)
     }
     private func cycleVirtualWorkspace(by delta: Int) {
-        let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowID(in: allWindows)
-        guard let context = currentWorkspaceContext(windows: allWindows, focusedID: focusedID) else {
+        guard let context = workspaceSwitchContextFast() else {
             NSSound.beep()
             return
         }
-        let nextIndex = wrappedWorkspaceIndex(context.activeWorkspaceIndex + delta)
-        switchVirtualWorkspace(
-            to: nextIndex,
-            onNativeStateKey: context.nativeStateKey,
-            displayID: context.screen.displayID,
-            allWindows: allWindows,
-            focusedID: focusedID
+        switchVirtualWorkspaceFast(
+            to: wrappedWorkspaceIndex(context.activeWorkspaceIndex + delta),
+            context: context
         )
     }
     private func switchVirtualWorkspace(to index: Int) {
-        let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowID(in: allWindows)
-        guard let context = currentWorkspaceContext(windows: allWindows, focusedID: focusedID) else {
+        guard let context = workspaceSwitchContextFast() else {
             NSSound.beep()
             return
         }
-        switchVirtualWorkspace(
-            to: index,
-            onNativeStateKey: context.nativeStateKey,
-            displayID: context.screen.displayID,
-            allWindows: allWindows,
-            focusedID: focusedID
-        )
+        switchVirtualWorkspaceFast(to: index, context: context)
     }
-    private func switchVirtualWorkspace(
-        to requestedIndex: Int,
-        onNativeStateKey nativeStateKey: String,
-        displayID: CGDirectDisplayID?,
-        allWindows providedWindows: [ManagedWindow],
-        focusedID providedFocusedID: WindowIdentity?
-    ) {
+    private func switchVirtualWorkspaceFast(to requestedIndex: Int, context: WorkspaceContext) {
         guard let targetIndex = availableWorkspaceIndex(requestedIndex) else {
             NSSound.beep()
             return
         }
-        let currentIndex = activeWorkspaceIndex(forNativeStateKey: nativeStateKey)
+        let currentIndex = activeWorkspaceIndex(forNativeStateKey: context.nativeStateKey)
         guard targetIndex != currentIndex else { return }
-        let allWindows = providedWindows
-        let focusedID = providedFocusedID
-        syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
-        let currentStateKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: currentIndex)
-        let targetStateKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: targetIndex)
-        setActiveWorkspaceIndex(targetIndex, forNativeStateKey: nativeStateKey)
-        pendingWorkspaceSwitchIndicator = WorkspaceSwitchIndicatorState(workspaceIndex: targetIndex, displayID: displayID)
-        suppressExternalChanges(for: 0.65)
+        let visibleIndex = lastAppliedWorkspaceIndexByNativeStateKey[context.nativeStateKey] ?? currentIndex
+        setActiveWorkspaceIndex(targetIndex, forNativeStateKey: context.nativeStateKey)
+        let activeScreen = ScreenInfo(
+            key: context.screen.key,
+            frame: context.screen.frame,
+            displayID: context.screen.displayID,
+            workspaceIndex: targetIndex
+        )
+        lastWorkspaceSwitchContext = WorkspaceContext(
+            screen: activeScreen,
+            nativeStateKey: context.nativeStateKey,
+            activeWorkspaceIndex: targetIndex
+        )
+        pendingWorkspaceSwitchIndicator = WorkspaceSwitchIndicatorState(
+            workspaceIndex: targetIndex,
+            displayID: context.screen.displayID
+        )
+        cancelPendingWorkspaceSwitchApply()
         focusBorder.hide()
-        applyLayout(to: allWindows, limitingToStateKeys: [currentStateKey, targetStateKey], focusBorderUpdate: .none)
-        guard let targetState = screenStates[targetStateKey],
-              let targetID = targetState.lastFocusedOrLargestID,
-              let targetWindow = allWindows.first(where: { $0.id == targetID }) else {
-            scheduleReconcile(delay: 0.35)
+        suppressExternalChanges(for: 0.20)
+        guard targetIndex != visibleIndex else { return }
+        let generation = workspaceSwitchApplyGeneration
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.finishWorkspaceSwitchApply(
+                nativeStateKey: context.nativeStateKey,
+                displayID: context.screen.displayID,
+                visibleIndex: visibleIndex,
+                targetIndex: targetIndex,
+                generation: generation
+            )
+        }
+        pendingWorkspaceSwitchApply = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + workspaceSwitchApplyDelay, execute: workItem)
+    }
+    private func workspaceSwitchContextFast() -> WorkspaceContext? {
+        if let lastKnownFocusedWindowID,
+           let managedWindowCache,
+           Date().timeIntervalSince(managedWindowCache.createdAt) <= interactiveWindowCacheDuration,
+           let focusedWindow = managedWindowCache.windows.first(where: { $0.id == lastKnownFocusedWindowID }) {
+            let context = workspaceContext(for: focusedWindow.screen)
+            lastWorkspaceSwitchContext = context
+            return context
+        }
+        if let screen = screenContainingCursor() {
+            let context = workspaceContext(for: screenInfo(forScreen: screen))
+            lastWorkspaceSwitchContext = context
+            return context
+        }
+        if let cached = lastWorkspaceSwitchContext {
+            let activeIndex = activeWorkspaceIndex(forNativeStateKey: cached.nativeStateKey)
+            return WorkspaceContext(screen: cached.screen, nativeStateKey: cached.nativeStateKey, activeWorkspaceIndex: activeIndex)
+        }
+        if let main = NSScreen.main {
+            let context = workspaceContext(for: screenInfo(forScreen: main))
+            lastWorkspaceSwitchContext = context
+            return context
+        }
+        return currentScreenInfos().first.map { screen in
+            let context = workspaceContext(for: screen)
+            lastWorkspaceSwitchContext = context
+            return context
+        }
+    }
+    private func finishWorkspaceSwitchApply(
+        nativeStateKey: String,
+        displayID: CGDirectDisplayID?,
+        visibleIndex: Int,
+        targetIndex: Int,
+        generation: Int
+    ) {
+        guard !isStopping, workspaceSwitchApplyGeneration == generation else { return }
+        guard hasAccessibilityPermission(prompt: false), tilingEnabled else { return }
+        guard !shouldPauseLayoutForSystemUI(), frozenSystemUIScreenStates == nil else {
+            scheduleReconcile(delay: 0.08)
             return
         }
-        scheduleDeferredFocus(window: targetWindow, updateTreeFocus: true, delay: 0.06)
-        scheduleReconcile(delay: 0.35)
+        let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
+        let focusedID = focusedWindowIDForHotKey(in: allWindows)
+        syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
+        let visibleStateKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: visibleIndex)
+        let targetStateKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: targetIndex)
+        suppressExternalChanges(for: 0.45)
+        applyLayout(to: allWindows, limitingToStateKeys: [visibleStateKey, targetStateKey], updateFocusBorder: false)
+        lastAppliedWorkspaceIndexByNativeStateKey[nativeStateKey] = targetIndex
+        if let targetState = screenStates[targetStateKey],
+           let targetID = targetState.lastFocusedOrLargestID,
+           let targetWindow = allWindows.first(where: { $0.id == targetID }) {
+            focus(window: targetWindow, updateTreeFocus: true)
+        }
+        scheduleReconcile(delay: 0.18)
     }
     private func createVirtualWorkspace() {
+        cancelPendingWorkspaceSwitchApply()
         guard workspaceCount < maximumWorkspaceCount else {
             NSSound.beep()
             return
@@ -1779,6 +1645,7 @@ final class WindowTiler {
         scheduleReconcile(delay: 0.10)
     }
     private func deleteCurrentVirtualWorkspace() {
+        cancelPendingWorkspaceSwitchApply()
         guard let context = currentWorkspaceContext() else {
             NSSound.beep()
             return
@@ -1802,7 +1669,6 @@ final class WindowTiler {
         floatingWindowStateKeys = floatingWindowStateKeys.compactMapValues {
             shiftedWorkspaceStateKey($0, deletingWorkspaceIndex: deletingIndex)
         }
-        shiftWorkspaceNames(deletingWorkspaceIndex: deletingIndex)
         activeWorkspaceIndexByNativeStateKey = activeWorkspaceIndexByNativeStateKey.mapValues {
             shiftedActiveWorkspaceIndex($0, deletingWorkspaceIndex: deletingIndex, newWorkspaceCount: newWorkspaceCount)
         }
@@ -1831,7 +1697,7 @@ final class WindowTiler {
         scheduleReconcile(delay: 0.15)
     }
     private func moveFocusedWindowToWorkspace(index requestedIndex: Int) {
-        invalidateManagedWindowCache(clearAppliedFrames: true)
+        cancelPendingWorkspaceSwitchApply()
         let allWindows = managedWindows()
         let focusedID = focusedWindowID(in: allWindows)
         syncStates(with: tiledWindows(from: allWindows), focusedID: focusedID)
@@ -1876,31 +1742,8 @@ final class WindowTiler {
             focusBorder.hide()
         }
     }
-    private func createSpaceForFocusedDisplay() {
-        let allWindows = managedWindows()
-        let focusedID = focusedWindowID(in: allWindows)
-        let displayID = focusedID.flatMap { id in
-            allWindows.first(where: { $0.id == id })?.screen.displayID
-        } ?? NSScreen.main?.displayID
-        pauseLayoutForSystemUI(duration: 1.70)
-        suppressExternalChanges(for: 1.70)
-        SpacesController.shared.createSpace(on: displayID) { [weak self] target in
-            guard let self, !self.isStopping else { return }
-            guard let target else {
-                NSSound.beep()
-                self.scheduleReconcile(delay: 0.35)
-                return
-            }
-            _ = SpacesController.shared.switchToSpace(target)
-            SpacesController.shared.invalidateCache()
-            self.refreshStableSpaceIDsFromObservedScreens()
-            self.pauseLayoutForSystemUI(duration: 0.35)
-            self.suppressExternalChanges(for: 0.80)
-            self.focusBorder.hide()
-            self.scheduleReconcile(delay: 0.85)
-        }
-    }
     private func toggleFocusedFloating() {
+        cancelPendingWorkspaceSwitchApply()
         let allWindows = managedWindows()
         guard let focusedID = focusedWindowID(in: allWindows) else {
             NSSound.beep()
@@ -1923,6 +1766,7 @@ final class WindowTiler {
         scheduleReconcile(delay: 0.01)
     }
     private func toggleTiling() {
+        cancelPendingWorkspaceSwitchApply()
         UserDefaults.standard.set(!tilingEnabled, forKey: tilingEnabledDefaultsKey)
         if tilingEnabled {
             scheduleReconcile(delay: 0.01)
@@ -1931,32 +1775,22 @@ final class WindowTiler {
         }
     }
     private func balanceFocusedTree() {
-        invalidateManagedWindowCache(clearAppliedFrames: true)
         let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowID(in: allWindows)
+        let focusedID = focusedWindowIDForHotKey(in: allWindows)
         syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
         guard let focusedID,
               let key = stateKey(containing: focusedID),
               var state = screenStates[key] else {
-            syncStates(with: tiledWindows(from: allWindows), focusedID: focusedID)
-            guard let focusedID,
-                  let key = stateKey(containing: focusedID),
-                  var state = screenStates[key] else {
-                NSSound.beep()
-                return
-            }
-            state.balance()
-            state.markFocused(focusedID)
-            screenStates[key] = state
-            let focusedWindow = allWindows.first(where: { $0.id == focusedID })
-            applyLayout(to: allWindows, limitingToStateKeys: [key], focusBorderUpdate: focusedWindow.map(FocusBorderUpdate.window) ?? .automatic)
+            NSSound.beep()
             return
         }
         state.balance()
         state.markFocused(focusedID)
         screenStates[key] = state
-        let focusedWindow = allWindows.first(where: { $0.id == focusedID })
-        applyLayout(to: allWindows, limitingToStateKeys: [key], focusBorderUpdate: focusedWindow.map(FocusBorderUpdate.window) ?? .automatic)
+        applyLayout(to: allWindows, limitingToStateKeys: [key], updateFocusBorder: false)
+        if let window = allWindows.first(where: { $0.id == focusedID }) {
+            showFocusBorder(for: window)
+        }
     }
     private func syncStates(with windows: [ManagedWindow], focusedID: WindowIdentity?) {
         _ = restoreKnownLayoutIdentities(using: windows)
@@ -1983,6 +1817,9 @@ final class WindowTiler {
         rememberLayoutIdentities(using: windows)
         pruneLayoutIdentityCache(retainingVisibleIDs: Set(windows.map(\.id)))
         rememberPersistedLayouts(using: windows)
+        if let focusedID {
+            lastKnownFocusedWindowID = focusedID
+        }
         lastSyncedVisibleWindowSignature = lastVisibleWindowSignature
     }
     private func syncStatesForHotKeyIfNeeded(with windows: [ManagedWindow], focusedID: WindowIdentity?) {
@@ -1991,7 +1828,7 @@ final class WindowTiler {
             return
         }
         guard let focusedID,
-              let key = stateKey(containing: focusedID, preferActive: false),
+              let key = stateKey(containing: focusedID),
               var state = screenStates[key] else {
             return
         }
@@ -2001,7 +1838,7 @@ final class WindowTiler {
     private func applyLayout(
         to windows: [ManagedWindow],
         limitingToStateKeys stateKeyLimit: Set<String>? = nil,
-        focusBorderUpdate: FocusBorderUpdate = .automatic
+        updateFocusBorder shouldUpdateFocusBorder: Bool = true
     ) {
         guard !isStopping else { return }
         guard tilingEnabled else {
@@ -2032,6 +1869,7 @@ final class WindowTiler {
         defer {
             isApplyingLayout = false
             updateManagedWindowCache(withAppliedFrames: appliedFramesByID)
+            updateLastAppliedWorkspaceIndices(using: currentScreens)
             suppressExternalChanges(for: 0.45)
         }
         for (screenKey, state) in statesToApply {
@@ -2042,8 +1880,8 @@ final class WindowTiler {
                 for (id, slot) in state.slots {
                     guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { continue }
                     let frame = slot.frame(in: screen.frame, gap: CGFloat(gapPixels), smartOuterGap: true)
-                    if set(window: window, frame: frame) {
-                        appliedFramesByID[id] = sanitizedFrame(frame)
+                    if let appliedFrame = set(window: window, frame: frame) {
+                        appliedFramesByID[id] = appliedFrame
                     }
                 }
                 continue
@@ -2055,22 +1893,22 @@ final class WindowTiler {
             for id in state.windowIDs {
                 guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { continue }
                 let frame = hiddenFrame(for: window, on: screen)
-                if set(window: window, frame: frame) {
-                    appliedFramesByID[id] = sanitizedFrame(frame)
+                if let appliedFrame = set(window: window, frame: frame) {
+                    appliedFramesByID[id] = appliedFrame
                 }
             }
         }
         rememberPersistedLayouts(using: windows, limitingToStateKeys: stateKeyLimit)
-        switch focusBorderUpdate {
-        case .automatic:
+        if shouldUpdateFocusBorder {
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.isStopping else { return }
                 self.updateFocusBorder(using: windows)
             }
-        case .window(let window):
-            showFocusBorder(for: window)
-        case .none:
-            break
+        }
+    }
+    private func updateLastAppliedWorkspaceIndices(using screens: [ScreenInfo]? = nil) {
+        for screen in screens ?? currentScreenInfos() {
+            lastAppliedWorkspaceIndexByNativeStateKey[screen.nativeStateKey] = activeWorkspaceIndex(forNativeStateKey: screen.nativeStateKey)
         }
     }
     private func hiddenFrame(for window: ManagedWindow, on screen: ScreenInfo) -> CGRect {
@@ -2091,6 +1929,11 @@ final class WindowTiler {
     private func suppressExternalChanges(for duration: TimeInterval) {
         suppressExternalChangesUntil = max(suppressExternalChangesUntil, Date().addingTimeInterval(duration))
     }
+    private func cancelPendingWorkspaceSwitchApply() {
+        pendingWorkspaceSwitchApply?.cancel()
+        pendingWorkspaceSwitchApply = nil
+        workspaceSwitchApplyGeneration += 1
+    }
     private func pauseLayoutForSystemUI(duration: TimeInterval, preserveLayout: Bool = true) {
         guard !isStopping else { return }
         if preserveLayout {
@@ -2105,30 +1948,15 @@ final class WindowTiler {
         systemUILayoutPausedUntil = max(systemUILayoutPausedUntil, Date().addingTimeInterval(duration))
         pendingReconcile?.cancel()
         pendingFocusRemember?.cancel()
-        pendingDeferredFocus?.cancel()
-        deferredFocusGeneration += 1
         pendingMove?.cancel()
         pendingResize?.cancel()
+        cancelPendingWorkspaceSwitchApply()
         if preserveLayout {
             scheduleSystemUISettleCheck(delay: max(0.35, duration + 0.10))
         }
     }
     private func shouldPauseLayoutForSystemUI() -> Bool {
-        if Date() < systemUILayoutPausedUntil { return true }
-        if isMissionControlLikelyActive() {
-            pauseLayoutForSystemUI(duration: 1.20, preserveLayout: true)
-            return true
-        }
-        return false
-    }
-    private func isMissionControlLikelyActive() -> Bool {
-        let now = Date()
-        guard now.timeIntervalSince(lastMissionControlActivityCheck) >= missionControlActivityCacheDuration else {
-            return cachedMissionControlLikelyActive
-        }
-        cachedMissionControlLikelyActive = SystemUIActivity.isMissionControlLikelyActive()
-        lastMissionControlActivityCheck = now
-        return cachedMissionControlLikelyActive
+        Date() < systemUILayoutPausedUntil
     }
     private func scheduleSystemUISettleCheck(delay: TimeInterval = 1.30) {
         guard !isStopping else { return }
@@ -2148,7 +1976,7 @@ final class WindowTiler {
             resetSystemUIWindowSnapshotStability()
             return
         }
-        if Date() < systemUILayoutPausedUntil || isMissionControlLikelyActive() {
+        if Date() < systemUILayoutPausedUntil {
             pauseLayoutForSystemUI(duration: 0.80, preserveLayout: true)
             return
         }
@@ -2254,12 +2082,7 @@ final class WindowTiler {
         return String(stateKey[..<range.lowerBound])
     }
     private func displayKeyComponent(of stateKey: String) -> String {
-        let nativeStateKey = nativeStateKeyComponent(of: stateKey)
-        guard let range = nativeStateKey.range(of: ":space:") else { return nativeStateKey }
-        return String(nativeStateKey[..<range.lowerBound])
-    }
-    private func keyHasExplicitSpace(_ stateKey: String) -> Bool {
-        nativeStateKeyComponent(of: stateKey).contains(":space:")
+        nativeStateKeyComponent(of: stateKey)
     }
     private func canMigrateState(from storedKey: String, to currentKey: String) -> Bool {
         guard storedKey != currentKey else { return true }
@@ -2896,43 +2719,6 @@ final class WindowTiler {
         activeWorkspaceIndexByNativeStateKey[nativeStateKey] = index
         activeWorkspaceIndexByDisplayKey[displayKeyComponent(of: nativeStateKey)] = index
     }
-    private func workspaceName(forNativeStateKey nativeStateKey: String, workspaceIndex: Int) -> String? {
-        workspaceNames()[workspaceNameKey(forNativeStateKey: nativeStateKey, workspaceIndex: workspaceIndex)]
-    }
-    private func setWorkspaceName(_ name: String, forNativeStateKey nativeStateKey: String, workspaceIndex: Int) {
-        var names = workspaceNames()
-        let key = workspaceNameKey(forNativeStateKey: nativeStateKey, workspaceIndex: workspaceIndex)
-        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if normalizedName.isEmpty {
-            names.removeValue(forKey: key)
-        } else {
-            names[key] = String(normalizedName.prefix(48))
-        }
-        UserDefaults.standard.set(names, forKey: workspaceNamesDefaultsKey)
-    }
-    private func workspaceNames() -> [String: String] {
-        UserDefaults.standard.dictionary(forKey: workspaceNamesDefaultsKey) as? [String: String] ?? [:]
-    }
-    private func workspaceNameKey(forNativeStateKey nativeStateKey: String, workspaceIndex: Int) -> String {
-        "\(displayKeyComponent(of: nativeStateKey)):\(workspaceIndex)"
-    }
-    private func shiftWorkspaceNames(deletingWorkspaceIndex deletingIndex: Int) {
-        var shiftedNames: [String: String] = [:]
-        for (key, name) in workspaceNames() {
-            guard let separator = key.lastIndex(of: ":"),
-                  let index = Int(key[key.index(after: separator)...]) else {
-                shiftedNames[key] = name
-                continue
-            }
-            if index == deletingIndex {
-                continue
-            }
-            let displayKey = String(key[..<separator])
-            let nextIndex = index > deletingIndex ? index - 1 : index
-            shiftedNames["\(displayKey):\(nextIndex)"] = name
-        }
-        UserDefaults.standard.set(shiftedNames, forKey: workspaceNamesDefaultsKey)
-    }
     private func currentWorkspaceContext(
         windows providedWindows: [ManagedWindow]? = nil,
         focusedID providedFocusedID: WindowIdentity? = nil
@@ -2960,7 +2746,6 @@ final class WindowTiler {
             key: screen.key,
             frame: screen.frame,
             displayID: screen.displayID,
-            activeSpaceID: screen.activeSpaceID,
             workspaceIndex: activeIndex
         )
         return WorkspaceContext(screen: activeScreen, nativeStateKey: nativeStateKey, activeWorkspaceIndex: activeIndex)
@@ -2968,17 +2753,11 @@ final class WindowTiler {
     private func screenInfo(forScreen screen: NSScreen) -> ScreenInfo {
         let displayID = screen.displayID
         let displayKey = ScreenInfo.displayKey(for: displayID, frame: screen.frame)
-        let activeSpaceID = stableActiveSpaceID(
-            for: displayID,
-            displayKey: displayKey,
-            missionControlLikelyActive: isMissionControlLikelyActive()
-        )
-        let nativeStateKey = ScreenInfo.nativeStateKey(displayKey: displayKey, spaceID: activeSpaceID)
+        let nativeStateKey = ScreenInfo.nativeStateKey(displayKey: displayKey)
         return ScreenInfo(
             key: displayKey,
             frame: accessibilityVisibleFrame(for: screen),
             displayID: displayID,
-            activeSpaceID: activeSpaceID,
             workspaceIndex: activeWorkspaceIndex(forNativeStateKey: nativeStateKey)
         )
     }
@@ -3032,14 +2811,10 @@ final class WindowTiler {
         return fallback.withStateKeyOverride(stateKey)
     }
     private func stateKey(containing id: WindowIdentity) -> String? {
-        stateKey(containing: id, preferActive: true)
+        stateKey(containing: id, activeStateKeys: Set(currentScreenInfos().map(\.stateKey)))
     }
-    private func stateKey(containing id: WindowIdentity, preferActive: Bool) -> String? {
-        guard preferActive else {
-            return screenStates.first { $0.value.contains(id) }?.key
-        }
-        let activeStateKeys = Set(currentScreenInfos().map(\.stateKey))
-        return screenStates.first { activeStateKeys.contains($0.key) && $0.value.contains(id) }?.key
+    private func stateKey(containing id: WindowIdentity, activeStateKeys: Set<String>) -> String? {
+        screenStates.first { activeStateKeys.contains($0.key) && $0.value.contains(id) }?.key
             ?? screenStates.first { $0.value.contains(id) }?.key
     }
     private func managedWindows(useCache: Bool = false, cacheDuration: TimeInterval? = nil) -> [ManagedWindow] {
@@ -3150,7 +2925,7 @@ final class WindowTiler {
             visibleCandidates.append(candidate)
         }
         candidates = visibleCandidates
-        let activeStateKeys = Set(currentScreenInfos().map(\.stateKey))
+        let activeStateKeys = Set(screens.map(\.stateKey))
         let retainedOffscreenIDs = retainedOffscreenWindowIDs(activeStateKeys: activeStateKeys)
         let stronglyVisibleIDs = Set(candidates.compactMap { candidate -> WindowIdentity? in
             let windowKey = candidate.windowNumber.map { WindowOrderKey(pid: candidate.pid, number: $0) }
@@ -3174,7 +2949,7 @@ final class WindowTiler {
             )
             guard !seenIDs.contains(id) else { continue }
             seenIDs.insert(id)
-            let screen = stateKey(containing: id)
+            let screen = stateKey(containing: id, activeStateKeys: activeStateKeys)
                 .map { screenInfo(forKnownStateKey: $0, fallback: candidate.screen) }
                 ?? candidate.screen
             windows.append(ManagedWindow(
@@ -3265,19 +3040,36 @@ final class WindowTiler {
         }
         return true
     }
+    private func focusedWindowIDForHotKey(in windows: [ManagedWindow]) -> WindowIdentity? {
+        if let lastKnownFocusedWindowID,
+           windows.contains(where: { $0.id == lastKnownFocusedWindowID }),
+           stateKey(containing: lastKnownFocusedWindowID) != nil {
+            return lastKnownFocusedWindowID
+        }
+        let focusedID = focusedWindowID(in: windows)
+        if let focusedID {
+            lastKnownFocusedWindowID = focusedID
+        }
+        return focusedID
+    }
     private func focusedWindowID(in windows: [ManagedWindow]) -> WindowIdentity? {
         guard let focusedWindow = focusedWindow() else { return nil }
         if let exactMatch = windows.first(where: { CFEqual($0.element, focusedWindow) }) {
+            lastKnownFocusedWindowID = exactMatch.id
             return exactMatch.id
         }
         var focusedPID: pid_t = 0
         guard AXUIElementGetPid(focusedWindow, &focusedPID) == .success else { return nil }
         if let number = copyInt(focusedWindow, attribute: "AXWindowNumber") ?? copyInt(focusedWindow, attribute: "_AXWindowNumber") {
-            return windows.first { $0.id.pid == focusedPID && $0.windowNumber == number }?.id
+            let focusedID = windows.first { $0.id.pid == focusedPID && $0.windowNumber == number }?.id
+            if let focusedID { lastKnownFocusedWindowID = focusedID }
+            return focusedID
         }
-        return windows.first { candidate in
+        let focusedID = windows.first { candidate in
             candidate.id.pid == focusedPID && windowsRepresentSameWindow(candidate.element, focusedWindow)
         }?.id
+        if let focusedID { lastKnownFocusedWindowID = focusedID }
+        return focusedID
     }
     private func focusedWindow() -> AXUIElement? {
         let systemWide = AXUIElementCreateSystemWide()
@@ -3326,21 +3118,8 @@ final class WindowTiler {
         }
         return approximatelyEqual(lhsPosition, rhsPosition) && approximatelyEqual(lhsSize, rhsSize)
     }
-    private func scheduleDeferredFocus(window: ManagedWindow, updateTreeFocus: Bool, delay: TimeInterval) {
-        pendingDeferredFocus?.cancel()
-        deferredFocusGeneration += 1
-        let generation = deferredFocusGeneration
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self, !self.isStopping, self.deferredFocusGeneration == generation else { return }
-            self.focus(window: window, updateTreeFocus: updateTreeFocus)
-        }
-        pendingDeferredFocus = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
-    }
     private func focus(window: ManagedWindow, updateTreeFocus: Bool) {
-        pendingDeferredFocus?.cancel()
-        pendingDeferredFocus = nil
-        deferredFocusGeneration += 1
+        lastKnownFocusedWindowID = window.id
         if NSWorkspace.shared.frontmostApplication?.processIdentifier != window.id.pid,
            let app = NSRunningApplication(processIdentifier: window.id.pid) {
             if #available(macOS 14.0, *) {
@@ -3373,27 +3152,18 @@ final class WindowTiler {
         return "fallback:\(hash):\(title):\(fallbackIndex)"
     }
     @discardableResult
-    private func set(window: ManagedWindow, frame: CGRect) -> Bool {
+    private func set(window: ManagedWindow, frame: CGRect) -> CGRect? {
         let frame = sanitizedFrame(frame)
         if approximatelyEqual(window.frame, frame) {
             lastAppliedFrameByWindowID[window.id] = frame
-            return false
+            return nil
         }
-        if let lastApplied = lastAppliedFrameByWindowID[window.id], approximatelyEqual(lastApplied, frame) {
-            if let actual = actualFrame(for: window.element), approximatelyEqual(actual, frame) {
-                return false
-            }
-        }
+        // Do not synchronously read the AX frame here. AX reads are one of the slowest
+        // operations on the hot resize/workspace paths; a later window scan refreshes
+        // this cache and will re-apply if the app rejected the write.
         applyFrame(frame, to: window.element)
-        if let actual = actualFrame(for: window.element), !approximatelyEqual(actual, frame) {
-            applyFrame(frame, to: window.element)
-            if let retriedActual = actualFrame(for: window.element), !approximatelyEqual(retriedActual, frame) {
-                lastAppliedFrameByWindowID.removeValue(forKey: window.id)
-                return false
-            }
-        }
         lastAppliedFrameByWindowID[window.id] = frame
-        return true
+        return frame
     }
     private func applyFrame(_ frame: CGRect, to window: AXUIElement) {
         var size = frame.size
@@ -3410,13 +3180,6 @@ final class WindowTiler {
         if let sizeValue {
             AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
         }
-    }
-    private func actualFrame(for window: AXUIElement) -> CGRect? {
-        guard let position = copyCGPoint(window, attribute: kAXPositionAttribute),
-              let size = copyCGSize(window, attribute: kAXSizeAttribute) else {
-            return nil
-        }
-        return CGRect(origin: position, size: size)
     }
     private func sanitizedFrame(_ frame: CGRect) -> CGRect {
         CGRect(
@@ -3450,7 +3213,7 @@ final class WindowTiler {
             focusBorder.hide()
             return
         }
-        focusBorder.show(accessibilityFrame: actualFrame(for: window.element) ?? window.frame, color: borderColor)
+        focusBorder.show(accessibilityFrame: window.frame, color: borderColor)
     }
     private func refreshFocusBorder() {
         guard hasAccessibilityPermission(prompt: false), tilingEnabled else {
@@ -3517,55 +3280,18 @@ final class WindowTiler {
     private func currentScreenInfosByKey() -> [String: ScreenInfo] {
         Dictionary(uniqueKeysWithValues: currentScreenInfos().map { ($0.stateKey, $0) })
     }
-    private func currentScreenInfosByNativeStateKey() -> [String: ScreenInfo] {
-        Dictionary(currentScreenInfos().map { ($0.nativeStateKey, $0) }, uniquingKeysWith: { first, _ in first })
-    }
     private func currentScreenInfos() -> [ScreenInfo] {
-        let missionControlLikelyActive = isMissionControlLikelyActive()
-        return NSScreen.screens.map { screen in
+        NSScreen.screens.map { screen in
             let displayID = screen.displayID
             let displayKey = ScreenInfo.displayKey(for: displayID, frame: screen.frame)
-            let activeSpaceID = stableActiveSpaceID(
-                for: displayID,
-                displayKey: displayKey,
-                missionControlLikelyActive: missionControlLikelyActive
-            )
-            let nativeStateKey = ScreenInfo.nativeStateKey(displayKey: displayKey, spaceID: activeSpaceID)
+            let nativeStateKey = ScreenInfo.nativeStateKey(displayKey: displayKey)
             return ScreenInfo(
                 key: displayKey,
                 frame: accessibilityVisibleFrame(for: screen),
                 displayID: displayID,
-                activeSpaceID: activeSpaceID,
                 workspaceIndex: activeWorkspaceIndex(forNativeStateKey: nativeStateKey)
             )
         }
-    }
-    private func stableActiveSpaceID(
-        for displayID: CGDirectDisplayID?,
-        displayKey: String,
-        missionControlLikelyActive: Bool
-    ) -> SpaceID? {
-        let observed = SpacesController.shared.currentUserSpaceID(for: displayID)
-        if Date() < systemUILayoutPausedUntil || missionControlLikelyActive {
-            return stableSpaceIDByDisplayKey[displayKey] ?? observed
-        }
-        if let observed {
-            stableSpaceIDByDisplayKey[displayKey] = observed
-            return observed
-        }
-        return stableSpaceIDByDisplayKey[displayKey]
-    }
-    private func refreshStableSpaceIDsFromObservedScreens() {
-        for screen in NSScreen.screens {
-            let displayID = screen.displayID
-            let displayKey = ScreenInfo.displayKey(for: displayID, frame: screen.frame)
-            if let observed = SpacesController.shared.currentUserSpaceID(for: displayID) {
-                stableSpaceIDByDisplayKey[displayKey] = observed
-            }
-        }
-    }
-    private func screenInfo(for windowRect: CGRect) -> ScreenInfo {
-        screenInfo(for: windowRect, screens: currentScreenInfos())
     }
     private func screenInfo(for windowRect: CGRect, screens: [ScreenInfo]) -> ScreenInfo {
         let center = CGPoint(x: windowRect.midX, y: windowRect.midY)
@@ -3581,24 +3307,8 @@ final class WindowTiler {
             key: "fallback",
             frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
             displayID: nil,
-            activeSpaceID: nil,
             workspaceIndex: 0
         )
-    }
-    private func adjacentScreen(from source: ScreenInfo, direction: SnapDirection) -> ScreenInfo? {
-        let sourceCenter = CGPoint(x: source.frame.midX, y: source.frame.midY)
-        return currentScreenInfos().filter { candidate in
-            guard candidate.key != source.key else { return false }
-            let center = CGPoint(x: candidate.frame.midX, y: candidate.frame.midY)
-            switch direction {
-            case .left: return center.x < sourceCenter.x
-            case .right: return center.x > sourceCenter.x
-            case .up: return center.y < sourceCenter.y
-            case .down: return center.y > sourceCenter.y
-            }
-        }.min { lhs, rhs in
-            lhs.frame.centerDistanceSquared(to: sourceCenter) < rhs.frame.centerDistanceSquared(to: sourceCenter)
-        }
     }
     private func accessibilityVisibleFrame(for screen: NSScreen) -> CGRect {
         let screenFrame = screen.frame
@@ -3614,9 +3324,6 @@ final class WindowTiler {
             width: displayBounds.width - leftInset - rightInset,
             height: displayBounds.height - topInset - bottomInset
         )
-    }
-    private func frameIntersectsAnyVisibleScreen(_ frame: CGRect) -> Bool {
-        frameIntersectsAnyVisibleScreen(frame, screens: currentScreenInfos())
     }
     private func frameIntersectsAnyVisibleScreen(_ frame: CGRect, screens: [ScreenInfo]) -> Bool {
         screens.contains { $0.frame.intersects(frame) }
@@ -3753,26 +3460,23 @@ private struct ScreenInfo {
     let key: String
     let frame: CGRect
     let displayID: CGDirectDisplayID?
-    let activeSpaceID: SpaceID?
     let workspaceIndex: Int
     private let stateKeyOverride: String?
     init(
         key: String,
         frame: CGRect,
         displayID: CGDirectDisplayID?,
-        activeSpaceID: SpaceID?,
         workspaceIndex: Int,
         stateKeyOverride: String? = nil
     ) {
         self.key = key
         self.frame = frame
         self.displayID = displayID
-        self.activeSpaceID = activeSpaceID
         self.workspaceIndex = workspaceIndex
         self.stateKeyOverride = stateKeyOverride
     }
     var nativeStateKey: String {
-        Self.nativeStateKey(displayKey: key, spaceID: activeSpaceID)
+        Self.nativeStateKey(displayKey: key)
     }
     var stateKey: String {
         stateKeyOverride ?? Self.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: workspaceIndex)
@@ -3782,7 +3486,6 @@ private struct ScreenInfo {
             key: key,
             frame: frame,
             displayID: displayID,
-            activeSpaceID: activeSpaceID,
             workspaceIndex: Self.workspaceIndex(from: stateKey) ?? workspaceIndex,
             stateKeyOverride: stateKey
         )
@@ -3792,13 +3495,11 @@ private struct ScreenInfo {
             key: key,
             frame: frame,
             displayID: displayID,
-            activeSpaceID: activeSpaceID,
             workspaceIndex: workspaceIndex
         )
     }
-    static func nativeStateKey(displayKey: String, spaceID: SpaceID?) -> String {
-        guard let spaceID else { return displayKey }
-        return "\(displayKey):space:\(spaceID)"
+    static func nativeStateKey(displayKey: String) -> String {
+        displayKey
     }
     static func workspaceStateKey(nativeStateKey: String, workspaceIndex: Int) -> String {
         "\(nativeStateKey)\(workspaceStateSeparator)\(workspaceIndex)"
@@ -4063,7 +3764,7 @@ private final class FocusBorderOverlay {
         panel.backgroundColor = .clear
         panel.ignoresMouseEvents = true
         panel.level = .statusBar
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .stationary]
+        panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle, .stationary]
         panel.hidesOnDeactivate = false
         panel.hasShadow = false
         let view = NSView(frame: .zero)
@@ -4094,85 +3795,17 @@ private final class FocusBorderOverlay {
         )
     }
 }
-private final class WorkspaceOverviewPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
-}
-private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
-    override func drawingRect(forBounds rect: NSRect) -> NSRect {
-        centeredTextFrame(for: super.drawingRect(forBounds: rect), bounds: rect)
-    }
-    override func edit(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, event: NSEvent?) {
-        super.edit(withFrame: centeredTextFrame(for: rect, bounds: rect), in: controlView, editor: textObj, delegate: delegate, event: event)
-    }
-    override func select(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, start selStart: Int, length selLength: Int) {
-        super.select(withFrame: centeredTextFrame(for: rect, bounds: rect), in: controlView, editor: textObj, delegate: delegate, start: selStart, length: selLength)
-    }
-    private func centeredTextFrame(for frame: NSRect, bounds: NSRect) -> NSRect {
-        let textHeight = min(cellSize(forBounds: bounds).height, frame.height)
-        let yOffset = max(0, floor((frame.height - textHeight) / 2))
-        return NSRect(
-            x: frame.minX,
-            y: frame.minY + yOffset,
-            width: frame.width,
-            height: textHeight
-        )
-    }
-}
 private final class WorkspaceOverviewOverlay {
-    private var panel: WorkspaceOverviewPanel?
+    private var panel: NSPanel?
     private var hideWorkItem: DispatchWorkItem?
     private var onDismiss: (() -> Void)?
-    private var overview: WorkspaceOverview?
-    var workspaceCount: Int? {
-        overview?.workspaceCount
-    }
     func show(_ overview: WorkspaceOverview, onDismiss: @escaping () -> Void) {
         hide(notify: true)
-        self.overview = overview
         self.onDismiss = onDismiss
         let panel = ensurePanel()
-        let frame = Self.panelFrame(for: overview)
-        panel.setFrame(frame, display: true)
-        let view = WorkspaceOverviewView(overview: overview)
-        view.frame = CGRect(origin: .zero, size: frame.size)
-        view.autoresizingMask = [.width, .height]
-        panel.contentView = view
-        panel.ignoresMouseEvents = true
+        panel.contentView = WorkspaceOverviewView(overview: overview)
+        panel.setFrame(Self.panelFrame(for: overview), display: true)
         panel.orderFrontRegardless()
-        scheduleAutoHide()
-    }
-    @discardableResult
-    func beginRename(onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) -> Bool {
-        guard let overview, let view = overviewView else { return false }
-        hideWorkItem?.cancel()
-        hideWorkItem = nil
-        let panel = ensurePanel()
-        panel.ignoresMouseEvents = false
-        panel.makeKeyAndOrderFront(nil)
-        panel.orderFrontRegardless()
-        view.beginRenaming(
-            text: overview.activeWorkspaceName ?? "",
-            onCommit: { [weak self] name in
-                self?.finishRenameMode()
-                onCommit(name)
-            },
-            onCancel: { [weak self] in
-                self?.finishRenameMode()
-                onCancel()
-            }
-        )
-        return true
-    }
-    private var overviewView: WorkspaceOverviewView? {
-        panel?.contentView as? WorkspaceOverviewView
-    }
-    private func finishRenameMode() {
-        overviewView?.endRenaming()
-        panel?.ignoresMouseEvents = true
-        scheduleAutoHide()
-    }
-    private func scheduleAutoHide() {
         let workItem = DispatchWorkItem { [weak self] in
             self?.hide()
         }
@@ -4185,13 +3818,10 @@ private final class WorkspaceOverviewOverlay {
     private func hide(notify: Bool) {
         hideWorkItem?.cancel()
         hideWorkItem = nil
-        overviewView?.endRenaming()
-        panel?.ignoresMouseEvents = true
         panel?.orderOut(nil)
         guard notify else { return }
         let onDismiss = self.onDismiss
         self.onDismiss = nil
-        overview = nil
         onDismiss?()
     }
     func close() {
@@ -4199,9 +3829,9 @@ private final class WorkspaceOverviewOverlay {
         panel?.close()
         panel = nil
     }
-    private func ensurePanel() -> WorkspaceOverviewPanel {
+    private func ensurePanel() -> NSPanel {
         if let panel { return panel }
-        let panel = WorkspaceOverviewPanel(
+        let panel = NSPanel(
             contentRect: .zero,
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -4211,7 +3841,7 @@ private final class WorkspaceOverviewOverlay {
         panel.backgroundColor = .clear
         panel.ignoresMouseEvents = true
         panel.level = .statusBar
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .transient]
+        panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle, .transient]
         panel.hidesOnDeactivate = false
         panel.hasShadow = true
         self.panel = panel
@@ -4236,13 +3866,8 @@ private final class WorkspaceOverviewOverlay {
         )
     }
 }
-private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
+private final class WorkspaceOverviewView: NSView {
     private let overview: WorkspaceOverview
-    private weak var activeHeaderLabel: NSTextField?
-    private weak var activeRenameField: NSTextField?
-    private var activeDetailViews: [NSView] = []
-    private var onRenameCommit: ((String) -> Void)?
-    private var onRenameCancel: (() -> Void)?
     init(overview: WorkspaceOverview) {
         self.overview = overview
         super.init(frame: .zero)
@@ -4253,7 +3878,6 @@ private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
         fatalError("init(coder:) is not available")
     }
     private func buildView() {
-        activeDetailViews.removeAll()
         wantsLayer = true
         layer?.cornerRadius = 12
         layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
@@ -4293,9 +3917,7 @@ private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
             root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             root.topAnchor.constraint(equalTo: contentView.topAnchor),
-            root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            titleStack.widthAnchor.constraint(equalTo: root.widthAnchor),
-            grid.widthAnchor.constraint(equalTo: root.widthAnchor)
+            root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
         ])
     }
     private func workspaceGrid() -> NSStackView {
@@ -4337,153 +3959,44 @@ private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
             : NSColor.controlBackgroundColor.withAlphaComponent(0.72)).cgColor
         card.translatesAutoresizingMaskIntoConstraints = false
         card.heightAnchor.constraint(equalToConstant: 116).isActive = true
-        let numberBackdrop = workspaceNumberBackdrop(for: item)
-        card.addSubview(numberBackdrop)
         let stack = NSStackView()
         stack.orientation = .vertical
-        stack.alignment = .width
+        stack.alignment = .leading
         stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
         stack.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(stack)
         let header = label(
-            workspaceTitle(for: item),
+            item.isActive ? "Workspace \(item.index + 1)  Active" : "Workspace \(item.index + 1)",
             font: .systemFont(ofSize: 13, weight: .semibold),
             color: .labelColor
         )
         stack.addArrangedSubview(header)
-        if item.isActive {
-            activeHeaderLabel = header
-            let renameField = renameTextField()
-            renameField.isHidden = true
-            activeRenameField = renameField
-            stack.addArrangedSubview(renameField)
-        }
         if item.windows.isEmpty {
-            let emptyLabel = label(
+            stack.addArrangedSubview(label(
                 "No tiled windows",
                 font: .systemFont(ofSize: 12, weight: .regular),
                 color: .tertiaryLabelColor
-            )
-            stack.addArrangedSubview(emptyLabel)
-            if item.isActive {
-                activeDetailViews.append(emptyLabel)
-            }
+            ))
         } else {
             for window in item.windows.prefix(4) {
-                let label = windowLabel(for: window)
-                stack.addArrangedSubview(label)
-                if item.isActive {
-                    activeDetailViews.append(label)
-                }
+                stack.addArrangedSubview(windowLabel(for: window))
             }
             if item.windows.count > 4 {
-                let moreLabel = label(
+                stack.addArrangedSubview(label(
                     "+\(item.windows.count - 4) more",
                     font: .systemFont(ofSize: 11, weight: .regular),
                     color: .secondaryLabelColor
-                )
-                stack.addArrangedSubview(moreLabel)
-                if item.isActive {
-                    activeDetailViews.append(moreLabel)
-                }
+                ))
             }
         }
         NSLayoutConstraint.activate([
-            numberBackdrop.centerXAnchor.constraint(equalTo: card.centerXAnchor),
-            numberBackdrop.centerYAnchor.constraint(equalTo: card.centerYAnchor),
-            numberBackdrop.leadingAnchor.constraint(greaterThanOrEqualTo: card.leadingAnchor, constant: 8),
-            numberBackdrop.trailingAnchor.constraint(lessThanOrEqualTo: card.trailingAnchor, constant: -8),
-            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
-            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: card.bottomAnchor, constant: -10)
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: card.topAnchor),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: card.bottomAnchor)
         ])
         return card
-    }
-    func beginRenaming(text: String, onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
-        guard let activeRenameField else { return }
-        onRenameCommit = onCommit
-        onRenameCancel = onCancel
-        activeHeaderLabel?.isHidden = true
-        activeDetailViews.forEach { $0.isHidden = true }
-        activeRenameField.stringValue = text
-        activeRenameField.isHidden = false
-        DispatchQueue.main.async { [weak self, weak activeRenameField] in
-            guard let self, let activeRenameField else { return }
-            self.window?.makeFirstResponder(activeRenameField)
-            activeRenameField.selectText(nil)
-        }
-    }
-    func endRenaming() {
-        activeRenameField?.isHidden = true
-        activeHeaderLabel?.isHidden = false
-        activeDetailViews.forEach { $0.isHidden = false }
-        onRenameCommit = nil
-        onRenameCancel = nil
-        window?.makeFirstResponder(nil)
-    }
-    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        switch commandSelector {
-        case #selector(NSResponder.insertNewline(_:)),
-             #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
-            commitActiveRename()
-            return true
-        case #selector(NSResponder.cancelOperation(_:)):
-            cancelActiveRename()
-            return true
-        default:
-            return false
-        }
-    }
-    private func commitActiveRename() {
-        guard let activeRenameField, let onRenameCommit else { return }
-        self.onRenameCommit = nil
-        self.onRenameCancel = nil
-        onRenameCommit(activeRenameField.stringValue)
-    }
-    private func cancelActiveRename() {
-        guard let onRenameCancel else { return }
-        self.onRenameCommit = nil
-        self.onRenameCancel = nil
-        onRenameCancel()
-    }
-    private func workspaceTitle(for item: WorkspaceOverviewItem) -> String {
-        let defaultTitle = "Workspace \(item.index + 1)"
-        return item.name.flatMap { $0.isEmpty ? nil : $0 } ?? defaultTitle
-    }
-    private func workspaceNumberBackdrop(for item: WorkspaceOverviewItem) -> NSTextField {
-        let label = NSTextField(labelWithString: "\(item.index + 1)")
-        label.font = .monospacedDigitSystemFont(ofSize: 58, weight: .bold)
-        label.textColor = NSColor.labelColor.withAlphaComponent(item.isActive ? 0.13 : 0.08)
-        label.alignment = .center
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        return label
-    }
-    private func renameTextField() -> NSTextField {
-        let field = NSTextField(string: "")
-        field.cell = VerticallyCenteredTextFieldCell(textCell: "")
-        field.font = .systemFont(ofSize: 13, weight: .semibold)
-        field.textColor = .labelColor
-        field.delegate = self
-        field.isEditable = true
-        field.isSelectable = true
-        field.isBordered = false
-        field.drawsBackground = true
-        field.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.22)
-        field.focusRingType = .none
-        field.wantsLayer = true
-        field.layer?.cornerRadius = 5
-        field.layer?.masksToBounds = true
-        field.lineBreakMode = .byTruncatingTail
-        field.usesSingleLineMode = true
-        field.translatesAutoresizingMaskIntoConstraints = false
-        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        field.setContentHuggingPriority(.required, for: .vertical)
-        field.setContentCompressionResistancePriority(.required, for: .vertical)
-        field.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        return field
     }
     private func windowLabel(for window: WorkspaceOverviewWindow) -> NSTextField {
         let prefix = window.isFocused ? "> " : "- "
@@ -4509,7 +4022,6 @@ private final class WorkspaceSwitchIndicatorOverlay {
     private var panel: NSPanel?
     private var indicatorView: WorkspaceSwitchIndicatorView?
     private var fadeWorkItem: DispatchWorkItem?
-    private var lastPanelFrame: CGRect?
     private var generation = 0
     func show(workspaceNumber: Int, displayID: CGDirectDisplayID?) {
         generation += 1
@@ -4517,11 +4029,7 @@ private final class WorkspaceSwitchIndicatorOverlay {
         fadeWorkItem?.cancel()
         let panel = ensurePanel()
         indicatorView?.setWorkspaceNumber(workspaceNumber)
-        let frame = Self.panelFrame(displayID: displayID)
-        if lastPanelFrame != frame {
-            panel.setFrame(frame, display: true)
-            lastPanelFrame = frame
-        }
+        panel.setFrame(Self.panelFrame(displayID: displayID), display: true)
         panel.alphaValue = 1
         if !panel.isVisible {
             panel.orderFrontRegardless()
@@ -4529,7 +4037,7 @@ private final class WorkspaceSwitchIndicatorOverlay {
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, let panel = self.panel, self.generation == currentGeneration else { return }
             NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.12
+                context.duration = 0.18
                 context.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 panel.animator().alphaValue = 0
             } completionHandler: {
@@ -4538,7 +4046,7 @@ private final class WorkspaceSwitchIndicatorOverlay {
             }
         }
         fadeWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.28, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: workItem)
     }
     func close() {
         generation += 1
@@ -4548,7 +4056,6 @@ private final class WorkspaceSwitchIndicatorOverlay {
         panel?.close()
         panel = nil
         indicatorView = nil
-        lastPanelFrame = nil
     }
     private func ensurePanel() -> NSPanel {
         if let panel { return panel }
@@ -4562,7 +4069,7 @@ private final class WorkspaceSwitchIndicatorOverlay {
         panel.backgroundColor = .clear
         panel.ignoresMouseEvents = true
         panel.level = .statusBar
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle, .transient]
+        panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle, .transient]
         panel.hidesOnDeactivate = false
         panel.hasShadow = false
         let indicatorView = WorkspaceSwitchIndicatorView()

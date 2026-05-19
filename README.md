@@ -2,7 +2,7 @@
 <img src="Assets/macpane.png" alt="MacPane preview" width="560">
 > **Pre-alpha:** MacPane is a work in progress. Bugs, rough edges, and behavior changes are expected.
 MacPane is a tiny macOS menu bar window manager. It auto-tiles regular app windows with the macOS Accessibility API, then lets you focus, swap, resize, and rotate tiles with global keyboard shortcuts.
-When MacPane launches, it immediately arranges the windows on each display. It watches for launched apps, closed apps, active Space changes, and Accessibility window-created notifications so new windows snap into the layout as they appear.
+When MacPane launches, it immediately arranges the windows on each display. It watches for launched apps, closed apps, screen changes, and Accessibility window-created notifications so new windows snap into the layout as they appear.
 ## Demo
 <img src="docs/macpane_demo.gif" alt="MacPane demo" width="560">
 ## Shortcuts
@@ -10,13 +10,12 @@ When MacPane launches, it immediately arranges the windows on each display. It w
 - `Cmd+Shift+Arrow`: swap the focused window with the nearest tiled neighbor in that direction.
 - `Cmd+Ctrl+Arrow`: resize the split containing the focused window.
 - `Cmd+Option+O`: rotate the focused fork between horizontal and vertical splits.
-- `Cmd+Option+1...9`: switch MacPane's virtual workspace on the current native Space/display.
+- `Cmd+Option+1...9`: switch MacPane's virtual workspace on the current display.
 - `Cmd+Ctrl+1...9`: move the focused tiled window to a MacPane virtual workspace.
 - `Cmd+Ctrl+Option+Left/Right`: switch to the previous or next MacPane virtual workspace.
 - `Cmd+Ctrl+Option+=`: create a new MacPane virtual workspace and switch to it.
 - `Cmd+Ctrl+Option+-`: delete the current MacPane virtual workspace when it is empty.
 - `Cmd+Ctrl+Option+V`: show a quick visual overview of MacPane virtual workspaces. Press `1...9` while it is visible to switch.
-- `Cmd+Ctrl+Option+N`: create a new native macOS Space and switch to it.
 New windows split the currently focused tile, similar to Pop Shell and i3-style binary tiling. Closing a window promotes its sibling so the layout does not leave stale empty space.
 ## Gaps
 Use the menu bar item to increase, decrease, or reset the configurable gap around and between tiled windows. The current gap is stored in `UserDefaults`; the default is `8 px`.

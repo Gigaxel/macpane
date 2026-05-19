@@ -19,12 +19,10 @@ struct SnapGeometryTests {
         testGaps()
         testNormalizedSlotClampsToUnitBounds()
         testScreenGeometryChoosesLargestIntersection()
-        testManagedDisplaySpacesParsesNestedCurrentSpace()
-        testManagedDisplaySpacesRejectsTransientCurrentSpace()
         testWindowIdentitySurvivesRenumberByElement()
         testWindowIdentitySurvivesRenumberBySignature()
         testWindowIdentityRejectsReusedNumberWithDifferentSignature()
-        testWindowIdentityDoesNotReuseSignatureAcrossSpaces()
+        testWindowIdentityDoesNotReuseSignatureAcrossDisplays()
         testWindowIdentityPrunesStaleSignatureAliases()
         testWindowIdentityPrunesStaleWindowNumberAliases()
         testWindowIdentityPrunesStaleElementAliases()
@@ -260,62 +258,6 @@ struct SnapGeometryTests {
             fail("expected largest screen intersection")
         }
     }
-    private static func testManagedDisplaySpacesParsesNestedCurrentSpace() {
-        let display = ManagedDisplaySpaces.fromSkyLightDictionary([
-            "Display Identifier": "display-a",
-            "Current Space": [
-                "ManagedSpaceID": NSNumber(value: 18),
-                "id64": NSNumber(value: 18),
-                "type": NSNumber(value: 0)
-            ],
-            "Spaces": [
-                [
-                    "ManagedSpaceID": NSNumber(value: 1),
-                    "id64": NSNumber(value: 1),
-                    "type": NSNumber(value: 0)
-                ],
-                [
-                    "ManagedSpaceID": NSNumber(value: 18),
-                    "id64": NSNumber(value: 18),
-                    "type": NSNumber(value: 0)
-                ]
-            ]
-        ])
-        guard display?.displayIdentifier == "display-a",
-              display?.currentSpaceID == 18,
-              display?.currentUserSpaceID == 18,
-              display?.spaces.map(\.id) == [1, 18],
-              display?.spaces.allSatisfy(\.isUserSpace) == true else {
-            fail("expected nested Current Space dictionary to parse into active user Space")
-        }
-    }
-    private static func testManagedDisplaySpacesRejectsTransientCurrentSpace() {
-        let display = ManagedDisplaySpaces.fromSkyLightDictionary([
-            "Display Identifier": "display-a",
-            "Current Space": [
-                "ManagedSpaceID": NSNumber(value: 99),
-                "id64": NSNumber(value: 99),
-                "type": NSNumber(value: 4)
-            ],
-            "Spaces": [
-                [
-                    "ManagedSpaceID": NSNumber(value: 18),
-                    "id64": NSNumber(value: 18),
-                    "type": NSNumber(value: 0)
-                ],
-                [
-                    "ManagedSpaceID": NSNumber(value: 99),
-                    "id64": NSNumber(value: 99),
-                    "type": NSNumber(value: 4)
-                ]
-            ]
-        ])
-        guard display?.displayIdentifier == "display-a",
-              display?.currentSpaceID == 99,
-              display?.currentUserSpaceID == nil else {
-            fail("transient/non-user Current Space should not be used as a tiling state key")
-        }
-    }
     private static func testWindowIdentitySurvivesRenumberByElement() {
         var registry = WindowIdentityRegistry()
         let pid: pid_t = 42
@@ -368,21 +310,21 @@ struct SnapGeometryTests {
             fail("same CG window number with a different known signature should not inherit stale identity")
         }
     }
-    private static func testWindowIdentityDoesNotReuseSignatureAcrossSpaces() {
+    private static func testWindowIdentityDoesNotReuseSignatureAcrossDisplays() {
         var registry = WindowIdentityRegistry()
         let pid: pid_t = 42
         let first = registry.identity(
             for: WindowOrderKey(pid: pid, number: 100),
             elementKey: WindowElementKey(pid: pid, hash: 9001),
-            signature: windowSignature(pid: pid, title: "Same Title", stateKey: "display-a:space:1")
+            signature: windowSignature(pid: pid, title: "Same Title", stateKey: "display-a")
         )
-        let otherSpace = registry.identity(
+        let otherDisplay = registry.identity(
             for: WindowOrderKey(pid: pid, number: 200),
             elementKey: WindowElementKey(pid: pid, hash: 9002),
-            signature: windowSignature(pid: pid, title: "Same Title", stateKey: "display-a:space:2")
+            signature: windowSignature(pid: pid, title: "Same Title", stateKey: "display-b")
         )
-        guard first != otherSpace else {
-            fail("same title on a different Space should not reuse the old tile identity")
+        guard first != otherDisplay else {
+            fail("same title on a different display should not reuse the old tile identity")
         }
     }
     private static func testWindowIdentityPrunesStaleSignatureAliases() {
@@ -493,7 +435,7 @@ struct SnapGeometryTests {
             elementKey: WindowElementKey(pid: pid, hash: 9002)
         )
         guard strongAlias == nil else {
-            fail("title/document signatures alone should not keep stale floating windows alive on the active Space")
+            fail("title/document signatures alone should not keep stale floating windows alive on the active display")
         }
     }
     private static func testWindowIdentityRemovesAliasesForStaleIdentity() {
@@ -652,7 +594,7 @@ struct SnapGeometryTests {
             fail("layout identity should not fall back to matching weak titles after stable documents conflict")
         }
     }
-    private static func windowSignature(pid: pid_t, title: String, stateKey: String = "display-a:space:1") -> WindowSignature {
+    private static func windowSignature(pid: pid_t, title: String, stateKey: String = "display-a") -> WindowSignature {
         WindowSignature(
             pid: pid,
             stateKey: stateKey,
