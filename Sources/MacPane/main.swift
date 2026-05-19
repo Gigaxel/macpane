@@ -68,12 +68,24 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         default:
             break
         }
+        let tilingEnabledBefore: Bool?
+        let tilingIndicatorDisplayID: CGDirectDisplayID?
+        if case .toggleTiling = action {
+            tilingEnabledBefore = tiler.tilingEnabled
+            tilingIndicatorDisplayID = tiler.currentDisplayID
+        } else {
+            tilingEnabledBefore = nil
+            tilingIndicatorDisplayID = nil
+        }
         tiler.handle(action: action)
         if shouldRebuildMenu {
             rebuildMenu()
         }
         if action.shouldShowWorkspaceSwitchIndicator {
             showWorkspaceSwitchIndicatorIfNeeded()
+        }
+        if let tilingEnabledBefore, tiler.tilingEnabled != tilingEnabledBefore {
+            showTilingStateIndicator(displayID: tilingIndicatorDisplayID)
         }
     }
     private func setupMenu() {
@@ -258,6 +270,9 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
     private func showWorkspaceSwitchIndicatorIfNeeded() {
         guard let indicator = tiler.consumeWorkspaceSwitchIndicator() else { return }
         workspaceSwitchIndicatorOverlay.show(workspaceNumber: indicator.workspaceIndex + 1, displayID: indicator.displayID)
+    }
+    private func showTilingStateIndicator(displayID: CGDirectDisplayID?) {
+        workspaceSwitchIndicatorOverlay.show(text: tiler.tilingEnabled ? "On" : "Off", displayID: displayID)
     }
     @objc private func decreaseGap() {
         tiler.adjustGap(by: -2)
@@ -676,6 +691,9 @@ final class WindowTiler {
     }
     var currentWorkspaceIndex: Int? {
         currentWorkspaceContext()?.activeWorkspaceIndex
+    }
+    fileprivate var currentDisplayID: CGDirectDisplayID? {
+        currentWorkspaceContext()?.screen.displayID
     }
     var workspaceStatusText: String {
         workspaceMenuState.statusText
@@ -4009,11 +4027,14 @@ private final class WorkspaceSwitchIndicatorOverlay {
     private var fadeWorkItem: DispatchWorkItem?
     private var generation = 0
     func show(workspaceNumber: Int, displayID: CGDirectDisplayID?) {
+        show(text: "\(workspaceNumber)", displayID: displayID)
+    }
+    func show(text: String, displayID: CGDirectDisplayID?) {
         generation += 1
         let currentGeneration = generation
         fadeWorkItem?.cancel()
         let panel = ensurePanel()
-        indicatorView?.setWorkspaceNumber(workspaceNumber)
+        indicatorView?.setText(text)
         panel.setFrame(Self.panelFrame(displayID: displayID), display: true)
         panel.alphaValue = 1
         if !panel.isVisible {
@@ -4091,8 +4112,11 @@ private final class WorkspaceSwitchIndicatorView: NSView {
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not available")
     }
-    func setWorkspaceNumber(_ workspaceNumber: Int) {
-        label.stringValue = "\(workspaceNumber)"
+    func setText(_ text: String) {
+        label.stringValue = text
+        label.font = text.count <= 1
+            ? .monospacedDigitSystemFont(ofSize: 76, weight: .bold)
+            : .systemFont(ofSize: 58, weight: .bold)
     }
     private func buildView() {
         wantsLayer = true
