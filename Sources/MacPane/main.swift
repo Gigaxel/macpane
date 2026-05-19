@@ -7,7 +7,6 @@ private let appBundleIdentifier = Bundle.main.bundleIdentifier ?? "com.gigaxel.m
 final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuDelegate {
     private static let sharedDelegate = MacPaneApp()
     private var statusItem: NSStatusItem?
-    private var borderColorPanelObserver: NSObjectProtocol?
     private let tiler = WindowTiler()
     private let workspaceOverviewOverlay = WorkspaceOverviewOverlay()
     private let workspaceSwitchIndicatorOverlay = WorkspaceSwitchIndicatorOverlay()
@@ -157,7 +156,7 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
             "Cmd+Option+B: balance current BSP tree",
             "Cmd+Option+1...9: switch MacPane workspace",
             "Cmd+Ctrl+1...9: move focused window to workspace",
-            "Cmd+Ctrl+Option+Left/Right: previous/next workspace",
+            "Cmd+Ctrl+Option+Left/Right or H/L: previous/next workspace",
             "Cmd+Ctrl+Option+=: create MacPane workspace",
             "Cmd+Ctrl+Option+-: delete current empty workspace",
             "Cmd+Ctrl+Option+V: show workspace overview",
@@ -181,26 +180,6 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         let resetGapItem = NSMenuItem(title: "Reset Gap", action: #selector(resetGap), keyEquivalent: "0")
         resetGapItem.target = self
         menu.addItem(resetGapItem)
-        menu.addItem(NSMenuItem.separator())
-        let borderItem = NSMenuItem(title: "Show Focus Border", action: #selector(toggleBorder), keyEquivalent: "")
-        borderItem.target = self
-        borderItem.state = tiler.borderEnabled ? .on : .off
-        menu.addItem(borderItem)
-        let borderColorItem = NSMenuItem(title: "Border Color: \(tiler.borderColorName)", action: nil, keyEquivalent: "")
-        let borderColorMenu = NSMenu()
-        for preset in BorderColorPalette.presets {
-            let presetItem = NSMenuItem(title: preset.title, action: #selector(selectBorderColor), keyEquivalent: "")
-            presetItem.target = self
-            presetItem.representedObject = preset.hex
-            presetItem.state = BorderColorPalette.normalizedHex(preset.hex) == tiler.borderColorHex ? .on : .off
-            borderColorMenu.addItem(presetItem)
-        }
-        borderColorMenu.addItem(NSMenuItem.separator())
-        let customColorItem = NSMenuItem(title: "Custom Color...", action: #selector(openBorderColorPanel), keyEquivalent: "")
-        customColorItem.target = self
-        borderColorMenu.addItem(customColorItem)
-        borderColorItem.submenu = borderColorMenu
-        menu.addItem(borderColorItem)
         menu.addItem(NSMenuItem.separator())
         let retileItem = NSMenuItem(title: "Retile Now", action: #selector(retileNow), keyEquivalent: "r")
         retileItem.target = self
@@ -275,42 +254,6 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         tiler.setGap(8)
         rebuildMenu()
     }
-    @objc private func toggleBorder() {
-        tiler.setBorderEnabled(!tiler.borderEnabled)
-        rebuildMenu()
-    }
-    @objc private func selectBorderColor(_ sender: NSMenuItem) {
-        guard let hex = sender.representedObject as? String,
-              let color = BorderColorPalette.color(from: hex) else {
-            return
-        }
-        tiler.setBorderColor(color)
-        rebuildMenu()
-    }
-    @objc private func openBorderColorPanel() {
-        let panel = NSColorPanel.shared
-        panel.showsAlpha = false
-        panel.color = tiler.borderColor
-        observeBorderColorPanel(panel)
-        if #available(macOS 14.0, *) {
-            NSApplication.shared.activate()
-        } else {
-            NSApplication.shared.activate(ignoringOtherApps: true)
-        }
-        panel.makeKeyAndOrderFront(nil)
-    }
-    private func observeBorderColorPanel(_ panel: NSColorPanel) {
-        guard borderColorPanelObserver == nil else { return }
-        borderColorPanelObserver = NotificationCenter.default.addObserver(
-            forName: NSColorPanel.colorDidChangeNotification,
-            object: panel,
-            queue: .main
-        ) { [weak self] notification in
-            guard let self, let panel = notification.object as? NSColorPanel else { return }
-            self.tiler.setBorderColor(panel.color)
-            self.rebuildMenu()
-        }
-    }
     @objc private func quit() {
         prepareForTermination()
         NSApplication.shared.terminate(nil)
@@ -320,10 +263,6 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         isPreparingToTerminate = true
         HotKeyManager.shared.stop()
         tiler.stop()
-        if let borderColorPanelObserver {
-            NotificationCenter.default.removeObserver(borderColorPanelObserver)
-            self.borderColorPanelObserver = nil
-        }
         if let statusItem {
             NSStatusBar.system.removeStatusItem(statusItem)
             self.statusItem = nil
@@ -465,6 +404,8 @@ final class HotKeyManager {
         }
         register(keyCode: UInt32(kVK_LeftArrow), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .cycleWorkspace(-1))
         register(keyCode: UInt32(kVK_RightArrow), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .cycleWorkspace(1))
+        register(keyCode: UInt32(kVK_ANSI_H), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .cycleWorkspace(-1))
+        register(keyCode: UInt32(kVK_ANSI_L), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .cycleWorkspace(1))
         register(keyCode: UInt32(kVK_ANSI_Equal), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .createWorkspace)
         register(keyCode: UInt32(kVK_ANSI_Minus), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .deleteWorkspace)
         register(keyCode: UInt32(kVK_ANSI_V), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .showWorkspaceOverview)
@@ -579,51 +520,6 @@ private enum DropAction {
     case swap
     case split(SnapDirection)
 }
-private enum BorderColorPalette {
-    static let defaultHex = "#FF9500"
-    static let presets: [(title: String, hex: String)] = [
-        ("Orange", defaultHex),
-        ("Blue", "#0A84FF"),
-        ("Green", "#30D158"),
-        ("Purple", "#BF5AF2"),
-        ("Red", "#FF453A"),
-        ("White", "#FFFFFF")
-    ]
-    static func color(from hex: String?) -> NSColor? {
-        guard let normalized = normalizedHex(hex) else { return nil }
-        let start = normalized.index(normalized.startIndex, offsetBy: 1)
-        let scanner = Scanner(string: String(normalized[start...]))
-        var value: UInt64 = 0
-        guard scanner.scanHexInt64(&value) else { return nil }
-        return NSColor(
-            srgbRed: CGFloat((value >> 16) & 0xff) / 255,
-            green: CGFloat((value >> 8) & 0xff) / 255,
-            blue: CGFloat(value & 0xff) / 255,
-            alpha: 1
-        )
-    }
-    static func hexString(for color: NSColor) -> String? {
-        guard let srgb = color.usingColorSpace(.sRGB) else { return nil }
-        let red = clampedColorComponent(srgb.redComponent)
-        let green = clampedColorComponent(srgb.greenComponent)
-        let blue = clampedColorComponent(srgb.blueComponent)
-        return String(format: "#%02X%02X%02X", red, green, blue)
-    }
-    static func displayName(for hex: String) -> String {
-        let normalized = normalizedHex(hex) ?? defaultHex
-        return presets.first { normalizedHex($0.hex) == normalized }?.title ?? normalized
-    }
-    static func normalizedHex(_ hex: String?) -> String? {
-        guard let hex else { return nil }
-        let trimmed = hex.trimmingCharacters(in: .whitespacesAndNewlines)
-        let raw = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
-        guard raw.count == 6, UInt64(raw, radix: 16) != nil else { return nil }
-        return "#\(raw.uppercased())"
-    }
-    private static func clampedColorComponent(_ value: CGFloat) -> Int {
-        Int((min(max(value, 0), 1) * 255).rounded())
-    }
-}
 private struct WorkspaceMenuState {
     let activeIndex: Int?
     let displayID: CGDirectDisplayID?
@@ -678,8 +574,6 @@ final class WindowTiler {
     private let gapDefaultsKey = "gapPixels"
     private let workspaceCountDefaultsKey = "virtualWorkspaceCount"
     private let tilingEnabledDefaultsKey = "tilingEnabled"
-    private let borderEnabledDefaultsKey = "borderEnabled"
-    private let borderColorDefaultsKey = "borderColor"
     private let accessibilityPromptedDefaultsKey = "accessibilityPrompted"
     private let defaultGap = 8
     private let maximumGap = 48
@@ -724,7 +618,6 @@ final class WindowTiler {
     private var identityRegistry = WindowIdentityRegistry()
     private var layoutIdentityByWindowID: [WindowIdentity: WindowLayoutIdentity] = [:]
     private var persistedLayoutsByStateKey: [String: PersistedScreenLayout] = [:]
-    private let focusBorder = FocusBorderOverlay()
     private let visibilityScanInterval: TimeInterval = 2.0
     private let observerRecoveryInterval: TimeInterval = 15.0
     private var lastVisibleWindowSignature = VisibleWindowSignature()
@@ -769,22 +662,6 @@ final class WindowTiler {
             return true
         }
         return UserDefaults.standard.bool(forKey: tilingEnabledDefaultsKey)
-    }
-    var borderEnabled: Bool {
-        if UserDefaults.standard.object(forKey: borderEnabledDefaultsKey) == nil {
-            return true
-        }
-        return UserDefaults.standard.bool(forKey: borderEnabledDefaultsKey)
-    }
-    var borderColorHex: String {
-        BorderColorPalette.normalizedHex(UserDefaults.standard.string(forKey: borderColorDefaultsKey))
-            ?? BorderColorPalette.defaultHex
-    }
-    var borderColorName: String {
-        BorderColorPalette.displayName(for: borderColorHex)
-    }
-    var borderColor: NSColor {
-        BorderColorPalette.color(from: borderColorHex) ?? BorderColorPalette.color(from: BorderColorPalette.defaultHex)!
     }
     func start() {
         isStopping = false
@@ -841,7 +718,6 @@ final class WindowTiler {
         floatingWindowStateKeys.removeAll()
         layoutIdentityByWindowID.removeAll()
         persistedLayoutsByStateKey.removeAll()
-        focusBorder.close()
         lastVisibleWindowSignature = VisibleWindowSignature()
         lastSyncedVisibleWindowSignature = VisibleWindowSignature()
         lastAppliedFrameByWindowID.removeAll()
@@ -932,21 +808,6 @@ final class WindowTiler {
         let nextValue = min(max(value, 0), maximumGap)
         UserDefaults.standard.set(nextValue, forKey: gapDefaultsKey)
         scheduleReconcile(delay: 0.01)
-    }
-    func setBorderEnabled(_ enabled: Bool) {
-        guard !isStopping else { return }
-        UserDefaults.standard.set(enabled, forKey: borderEnabledDefaultsKey)
-        if enabled {
-            refreshFocusBorder()
-        } else {
-            focusBorder.hide()
-        }
-    }
-    func setBorderColor(_ color: NSColor) {
-        guard !isStopping else { return }
-        let hex = BorderColorPalette.hexString(for: color) ?? BorderColorPalette.defaultHex
-        UserDefaults.standard.set(hex, forKey: borderColorDefaultsKey)
-        focusBorder.setColor(borderColor)
     }
     fileprivate func workspaceOverview() -> WorkspaceOverview? {
         guard !isStopping else { return nil }
@@ -1238,10 +1099,7 @@ final class WindowTiler {
     private func reconcileAndApplyLayout() {
         guard !isStopping else { return }
         guard hasAccessibilityPermission(prompt: false) else { return }
-        guard tilingEnabled else {
-            focusBorder.hide()
-            return
-        }
+        guard tilingEnabled else { return }
         guard !shouldPauseLayoutForSystemUI() else {
             scheduleReconcile(delay: 0.70)
             return
@@ -1260,10 +1118,7 @@ final class WindowTiler {
     private func rememberFocusedWindowOnly() {
         guard !isStopping else { return }
         guard hasAccessibilityPermission(prompt: false) else { return }
-        guard tilingEnabled else {
-            focusBorder.hide()
-            return
-        }
+        guard tilingEnabled else { return }
         guard !shouldPauseLayoutForSystemUI(), frozenSystemUIScreenStates == nil else { return }
         let windows = managedWindows()
         let tiled = tiledWindows(from: windows)
@@ -1271,16 +1126,12 @@ final class WindowTiler {
             scheduleReconcile(delay: 0.01)
             return
         }
-        guard let focusedID = focusedWindowID(in: windows) else {
-            updateFocusBorder(using: windows)
-            return
-        }
+        guard let focusedID = focusedWindowID(in: windows) else { return }
         lastKnownFocusedWindowID = focusedID
         if let key = stateKey(containing: focusedID), var state = screenStates[key] {
             state.markFocusedIfKnown(focusedID)
             screenStates[key] = state
         }
-        updateFocusBorder(using: windows)
     }
     private func handleExternalMove(element: AXUIElement, userInitiated: Bool) {
         guard !isStopping,
@@ -1465,10 +1316,7 @@ final class WindowTiler {
             return
         }
         screenStates[key] = state
-        applyLayout(to: allWindows, limitingToStateKeys: [key], updateFocusBorder: false)
-        if let window = allWindows.first(where: { $0.id == focusedID }) {
-            showFocusBorder(for: window)
-        }
+        applyLayout(to: allWindows, limitingToStateKeys: [key])
     }
     private func resizeFocusedWindow(direction: SnapDirection) {
         let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
@@ -1482,10 +1330,7 @@ final class WindowTiler {
             return
         }
         screenStates[key] = state
-        applyLayout(to: allWindows, limitingToStateKeys: [key], updateFocusBorder: false)
-        if let window = allWindows.first(where: { $0.id == focusedID }) {
-            showFocusBorder(for: window)
-        }
+        applyLayout(to: allWindows, limitingToStateKeys: [key])
     }
     private func toggleFocusedSplitOrientation() {
         let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
@@ -1499,10 +1344,7 @@ final class WindowTiler {
             return
         }
         screenStates[key] = state
-        applyLayout(to: allWindows, limitingToStateKeys: [key], updateFocusBorder: false)
-        if let window = allWindows.first(where: { $0.id == focusedID }) {
-            showFocusBorder(for: window)
-        }
+        applyLayout(to: allWindows, limitingToStateKeys: [key])
     }
     private func cycleVirtualWorkspace(by delta: Int) {
         guard let context = workspaceSwitchContextFast() else {
@@ -1546,7 +1388,6 @@ final class WindowTiler {
             displayID: context.screen.displayID
         )
         cancelPendingWorkspaceSwitchApply()
-        focusBorder.hide()
         suppressExternalChanges(for: 0.20)
         guard targetIndex != visibleIndex else { return }
         let generation = workspaceSwitchApplyGeneration
@@ -1610,7 +1451,7 @@ final class WindowTiler {
         let visibleStateKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: visibleIndex)
         let targetStateKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: targetIndex)
         suppressExternalChanges(for: 0.45)
-        applyLayout(to: allWindows, limitingToStateKeys: [visibleStateKey, targetStateKey], updateFocusBorder: false)
+        applyLayout(to: allWindows, limitingToStateKeys: [visibleStateKey, targetStateKey])
         lastAppliedWorkspaceIndexByNativeStateKey[nativeStateKey] = targetIndex
         if let targetState = screenStates[targetStateKey],
            let targetID = targetState.lastFocusedOrLargestID,
@@ -1640,7 +1481,6 @@ final class WindowTiler {
             displayID: context.screen.displayID
         )
         suppressExternalChanges(for: 0.65)
-        focusBorder.hide()
         applyLayout(to: allWindows)
         scheduleReconcile(delay: 0.10)
     }
@@ -1683,7 +1523,6 @@ final class WindowTiler {
             displayID: context.screen.displayID
         )
         suppressExternalChanges(for: 0.65)
-        focusBorder.hide()
         applyLayout(to: allWindows)
         let targetStateKey = ScreenInfo.workspaceStateKey(
             nativeStateKey: context.nativeStateKey,
@@ -1738,8 +1577,6 @@ final class WindowTiler {
         if let fallbackID = sourceState.lastFocusedOrLargestID,
            let fallbackWindow = allWindows.first(where: { $0.id == fallbackID }) {
             focus(window: fallbackWindow, updateTreeFocus: true)
-        } else {
-            focusBorder.hide()
         }
     }
     private func toggleFocusedFloating() {
@@ -1770,8 +1607,6 @@ final class WindowTiler {
         UserDefaults.standard.set(!tilingEnabled, forKey: tilingEnabledDefaultsKey)
         if tilingEnabled {
             scheduleReconcile(delay: 0.01)
-        } else {
-            focusBorder.hide()
         }
     }
     private func balanceFocusedTree() {
@@ -1787,10 +1622,7 @@ final class WindowTiler {
         state.balance()
         state.markFocused(focusedID)
         screenStates[key] = state
-        applyLayout(to: allWindows, limitingToStateKeys: [key], updateFocusBorder: false)
-        if let window = allWindows.first(where: { $0.id == focusedID }) {
-            showFocusBorder(for: window)
-        }
+        applyLayout(to: allWindows, limitingToStateKeys: [key])
     }
     private func syncStates(with windows: [ManagedWindow], focusedID: WindowIdentity?) {
         _ = restoreKnownLayoutIdentities(using: windows)
@@ -1837,14 +1669,10 @@ final class WindowTiler {
     }
     private func applyLayout(
         to windows: [ManagedWindow],
-        limitingToStateKeys stateKeyLimit: Set<String>? = nil,
-        updateFocusBorder shouldUpdateFocusBorder: Bool = true
+        limitingToStateKeys stateKeyLimit: Set<String>? = nil
     ) {
         guard !isStopping else { return }
-        guard tilingEnabled else {
-            focusBorder.hide()
-            return
-        }
+        guard tilingEnabled else { return }
         let windowsByID = Dictionary(windows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let currentScreens = currentScreenInfos()
         let screens = Dictionary(uniqueKeysWithValues: currentScreens.map { ($0.stateKey, $0) })
@@ -1899,12 +1727,6 @@ final class WindowTiler {
             }
         }
         rememberPersistedLayouts(using: windows, limitingToStateKeys: stateKeyLimit)
-        if shouldUpdateFocusBorder {
-            DispatchQueue.main.async { [weak self] in
-                guard let self, !self.isStopping else { return }
-                self.updateFocusBorder(using: windows)
-            }
-        }
     }
     private func updateLastAppliedWorkspaceIndices(using screens: [ScreenInfo]? = nil) {
         for screen in screens ?? currentScreenInfos() {
@@ -1998,8 +1820,6 @@ final class WindowTiler {
             scheduleReconcile(delay: 0.05)
         } else if restoredFrozenLayout || restoredIdentityLayout || restoredPersistedLayout || migratedWorkspaceStates {
             applyLayout(to: allWindows)
-        } else {
-            updateFocusBorder(using: allWindows)
         }
     }
     private func isSystemUIWindowSnapshotStable(_ windows: [ManagedWindow]) -> Bool {
@@ -3138,7 +2958,6 @@ final class WindowTiler {
             state.markFocused(window.id)
             screenStates[key] = state
         }
-        showFocusBorder(for: window)
     }
     private func notificationToken(for window: AXUIElement, fallbackIndex: Int) -> String {
         if let number = copyInt(window, attribute: "AXWindowNumber") ?? copyInt(window, attribute: "_AXWindowNumber") {
@@ -3188,39 +3007,6 @@ final class WindowTiler {
             width: max(1, frame.width.rounded(.toNearestOrAwayFromZero)),
             height: max(1, frame.height.rounded(.toNearestOrAwayFromZero))
         )
-    }
-    private func updateFocusBorder(using windows: [ManagedWindow]) {
-        let activeStateKeys = Set(currentScreenInfos().map(\.stateKey))
-        guard tilingEnabled,
-              borderEnabled,
-              let focusedID = focusedWindowID(in: windows),
-              !floatingWindowIDs.contains(focusedID),
-              stateKey(containing: focusedID) != nil,
-              let focusedWindow = windows.first(where: { $0.id == focusedID }),
-              activeStateKeys.contains(focusedWindow.screen.stateKey) else {
-            focusBorder.hide()
-            return
-        }
-        showFocusBorder(for: focusedWindow)
-    }
-    private func showFocusBorder(for window: ManagedWindow) {
-        let activeStateKeys = Set(currentScreenInfos().map(\.stateKey))
-        guard tilingEnabled,
-              borderEnabled,
-              !floatingWindowIDs.contains(window.id),
-              stateKey(containing: window.id) != nil,
-              activeStateKeys.contains(window.screen.stateKey) else {
-            focusBorder.hide()
-            return
-        }
-        focusBorder.show(accessibilityFrame: window.frame, color: borderColor)
-    }
-    private func refreshFocusBorder() {
-        guard hasAccessibilityPermission(prompt: false), tilingEnabled else {
-            focusBorder.hide()
-            return
-        }
-        updateFocusBorder(using: managedWindows())
     }
     private func copyAXElement(_ element: AXUIElement, attribute: String) -> AXUIElement? {
         var rawValue: CFTypeRef?
@@ -3728,71 +3514,6 @@ private struct ScreenTileState {
             self.lastFocusedID = tree.firstID
         }
         return removed
-    }
-}
-private final class FocusBorderOverlay {
-    private var panel: NSPanel?
-    func show(accessibilityFrame frame: CGRect, color: NSColor) {
-        let panel = ensurePanel()
-        setColor(color)
-        let cocoaFrame = Self.cocoaFrame(fromAccessibilityFrame: frame).insetBy(dx: -3, dy: -3)
-        panel.setFrame(cocoaFrame, display: true)
-        if !panel.isVisible {
-            panel.orderFrontRegardless()
-        }
-    }
-    func setColor(_ color: NSColor) {
-        panel?.contentView?.layer?.borderColor = color.cgColor
-    }
-    func hide() {
-        panel?.orderOut(nil)
-    }
-    func close() {
-        panel?.orderOut(nil)
-        panel?.close()
-        panel = nil
-    }
-    private func ensurePanel() -> NSPanel {
-        if let panel { return panel }
-        let panel = NSPanel(
-            contentRect: .zero,
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.ignoresMouseEvents = true
-        panel.level = .statusBar
-        panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle, .stationary]
-        panel.hidesOnDeactivate = false
-        panel.hasShadow = false
-        let view = NSView(frame: .zero)
-        view.wantsLayer = true
-        view.layer?.borderWidth = 3
-        view.layer?.borderColor = BorderColorPalette.color(from: BorderColorPalette.defaultHex)?.cgColor
-        view.layer?.cornerRadius = 6
-        view.layer?.backgroundColor = NSColor.clear.cgColor
-        panel.contentView = view
-        self.panel = panel
-        return panel
-    }
-    private static func cocoaFrame(fromAccessibilityFrame frame: CGRect) -> CGRect {
-        let center = CGPoint(x: frame.midX, y: frame.midY)
-        let matchingScreen = NSScreen.screens.first { screen in
-            guard let displayID = screen.displayID else { return false }
-            return CGDisplayBounds(displayID).contains(center)
-        } ?? NSScreen.main
-        guard let screen = matchingScreen else { return frame }
-        let displayBounds = screen.displayID.map { CGDisplayBounds($0) } ?? screen.frame
-        let localX = frame.minX - displayBounds.minX
-        let localYFromTop = frame.minY - displayBounds.minY
-        return CGRect(
-            x: screen.frame.minX + localX,
-            y: screen.frame.maxY - localYFromTop - frame.height,
-            width: frame.width,
-            height: frame.height
-        )
     }
 }
 private final class WorkspaceOverviewOverlay {
