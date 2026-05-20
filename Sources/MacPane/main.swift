@@ -919,12 +919,12 @@ final class WindowTiler {
             guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
             scheduleFocusRemember(delay: 0.01)
         case kAXMovedNotification:
-            invalidateManagedWindowCache(clearAppliedFrames: true)
             guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
+            invalidateManagedWindowCache(clearAppliedFrames: true)
             scheduleExternalMove(element: element, userInitiated: isPointerButtonDown)
         case kAXResizedNotification:
-            invalidateManagedWindowCache(clearAppliedFrames: true)
             guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
+            invalidateManagedWindowCache(clearAppliedFrames: true)
             scheduleExternalResize(element: element, userInitiated: isPointerButtonDown)
         default:
             break
@@ -1344,63 +1344,328 @@ final class WindowTiler {
         }
         return false
     }
-    private func focusNeighbor(direction: SnapDirection) {
-        let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowIDForHotKey(in: allWindows)
-        syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
-        guard let focusedID,
-              let key = stateKey(containing: focusedID),
-              var state = screenStates[key],
-              let targetID = state.neighborID(from: focusedID, direction: direction),
-              let targetWindow = allWindows.first(where: { $0.id == targetID }) else {
-            NSSound.beep()
-            return
+    private func hasLikelyPartialHotKeySnapshot(_ windows: [ManagedWindow]) -> Bool {
+        let activeStateKeys = Set(currentScreenInfos().map(\.stateKey))
+        for key in activeStateKeys {
+            if hasLikelyPartialHotKeySnapshot(forStateKey: key, windows: windows) {
+                return true
+            }
         }
-        state.markFocused(targetID)
-        screenStates[key] = state
-        focus(window: targetWindow, updateTreeFocus: true)
+        return false
+    }
+    private func hasLikelyPartialHotKeySnapshot(
+        forStateKey key: String,
+        windows: [ManagedWindow]
+    ) -> Bool {
+        guard let state = screenStates[key], !state.isEmpty else { return false }
+        let observedCount = windows.reduce(into: 0) { count, window in
+            if window.screen.stateKey == key {
+                count += 1
+            }
+        }
+        return observedCount < state.windowIDs.count
+    }
+    private func interactiveManagedWindows() -> [ManagedWindow] {
+        let cachedWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
+        let cachedTiled = tiledWindows(from: cachedWindows)
+        let shouldRefresh =
+            lastVisibleWindowSignature != lastSyncedVisibleWindowSignature ||
+            hasWindowSetChanged(cachedTiled)
+        guard shouldRefresh else { return cachedWindows }
+        let refreshedWindows = managedWindows()
+        return refreshedWindows.isEmpty ? cachedWindows : refreshedWindows
+    }
+    @discardableResult
+    private func performHotKeyActionWithRetry(
+        _ action: (_ windows: [ManagedWindow], _ focusedID: WindowIdentity?) -> Bool
+    ) -> Bool {
+        let initialWindows = interactiveManagedWindows()
+        if !initialWindows.isEmpty {
+            let initialFocusedID = resolvedHotKeyFocusedID(
+                in: initialWindows,
+                preferredFocusedID: focusedWindowIDForHotKey(in: initialWindows)
+            )
+            syncStatesForHotKeyIfNeeded(with: initialWindows, focusedID: initialFocusedID)
+            if action(initialWindows, initialFocusedID) {
+                return true
+            }
+        }
+        let refreshedWindows = managedWindows()
+        guard !refreshedWindows.isEmpty else {
+            scheduleReconcile(delay: 0.01)
+            NSSound.beep()
+            return false
+        }
+        let refreshedFocusedID = resolvedHotKeyFocusedID(
+            in: refreshedWindows,
+            preferredFocusedID: focusedWindowIDForHotKey(in: refreshedWindows)
+        )
+        let refreshedTiled = tiledWindows(from: refreshedWindows)
+        if hasLikelyPartialHotKeySnapshot(refreshedTiled) {
+            scheduleReconcile(delay: 0.01)
+            let initialFallbackFocusedID = resolvedHotKeyFocusedID(
+                in: initialWindows,
+                preferredFocusedID: focusedWindowIDForHotKey(in: initialWindows)
+            )
+            if action(initialWindows, initialFallbackFocusedID) {
+                return true
+            }
+        }
+        if action(refreshedWindows, refreshedFocusedID) {
+            return true
+        }
+        scheduleReconcile(delay: 0.02)
+        NSSound.beep()
+        return false
+    }
+    private func resolvedHotKeyFocusedID(
+        in windows: [ManagedWindow],
+        preferredFocusedID: WindowIdentity?
+    ) -> WindowIdentity? {
+        let visibleIDs = Set(windows.map(\.id))
+        if let preferredFocusedID, visibleIDs.contains(preferredFocusedID) {
+            lastKnownFocusedWindowID = preferredFocusedID
+            return preferredFocusedID
+        }
+        if let lastKnownFocusedWindowID, visibleIDs.contains(lastKnownFocusedWindowID) {
+            return lastKnownFocusedWindowID
+        }
+        if let context = currentWorkspaceContext(windows: windows, focusedID: preferredFocusedID) {
+            let activeStateKey = ScreenInfo.workspaceStateKey(
+                nativeStateKey: context.nativeStateKey,
+                workspaceIndex: context.activeWorkspaceIndex
+            )
+            if let fallbackID = screenStates[activeStateKey]?.lastFocusedOrLargestID,
+               visibleIDs.contains(fallbackID) {
+                lastKnownFocusedWindowID = fallbackID
+                return fallbackID
+            }
+        }
+        for state in screenStates.values {
+            if let fallbackID = state.lastFocusedOrLargestID, visibleIDs.contains(fallbackID) {
+                lastKnownFocusedWindowID = fallbackID
+                return fallbackID
+            }
+        }
+        let cursor = currentCursorPoint()
+        if let context = currentWorkspaceContext(windows: windows, focusedID: nil) {
+            let activeStateKey = ScreenInfo.workspaceStateKey(
+                nativeStateKey: context.nativeStateKey,
+                workspaceIndex: context.activeWorkspaceIndex
+            )
+            if let fallback = windows
+                .filter({ $0.screen.stateKey == activeStateKey && !floatingWindowIDs.contains($0.id) })
+                .min(by: { $0.frame.distanceSquared(to: cursor) < $1.frame.distanceSquared(to: cursor) }) {
+                lastKnownFocusedWindowID = fallback.id
+                return fallback.id
+            }
+        }
+        if let fallback = windows
+            .filter({ !floatingWindowIDs.contains($0.id) })
+            .min(by: { $0.frame.distanceSquared(to: cursor) < $1.frame.distanceSquared(to: cursor) }) {
+            lastKnownFocusedWindowID = fallback.id
+            return fallback.id
+        }
+        return nil
+    }
+    private func resolvedHotKeyStateKey(
+        for focusedID: WindowIdentity,
+        windows: [ManagedWindow]
+    ) -> String? {
+        if let key = stateKey(containing: focusedID),
+           screenStates[key] != nil {
+            return key
+        }
+        guard let focusedWindow = windows.first(where: { $0.id == focusedID }) else { return nil }
+        let candidateKey = focusedWindow.screen.stateKey
+        if screenStates[candidateKey] != nil {
+            return candidateKey
+        }
+        if hasLikelyPartialHotKeySnapshot(forStateKey: candidateKey, windows: windows) {
+            return nil
+        }
+        let candidateIDs = windows
+            .filter { $0.screen.stateKey == candidateKey && !floatingWindowIDs.contains($0.id) }
+            .map(\.id)
+        guard !candidateIDs.isEmpty else { return nil }
+        var state = screenStates[candidateKey] ?? ScreenTileState()
+        state.sync(windowIDs: candidateIDs, focusedID: candidateIDs.contains(focusedID) ? focusedID : nil)
+        screenStates[candidateKey] = state
+        return candidateKey
+    }
+    private func synchronizeHotKeyState(
+        key: String,
+        focusedID: WindowIdentity,
+        windows: [ManagedWindow]
+    ) -> ScreenTileState? {
+        guard var state = screenStates[key] else { return nil }
+        let candidateIDs = windows
+            .filter { $0.screen.stateKey == key && !floatingWindowIDs.contains($0.id) }
+            .map(\.id)
+        guard !candidateIDs.isEmpty else { return nil }
+        let candidateSet = Set(candidateIDs)
+        if candidateSet.count < state.windowIDs.count {
+            // Hotkey paths can observe transiently incomplete AX snapshots during rapid resizes.
+            // Avoid shrinking the tree in that case; a scheduled reconcile will heal once stable.
+            if !state.contains(focusedID) {
+                return nil
+            }
+            state.markFocusedIfKnown(focusedID)
+            screenStates[key] = state
+            return state
+        }
+        if state.windowIDs != candidateSet {
+            state.sync(windowIDs: candidateIDs, focusedID: candidateSet.contains(focusedID) ? focusedID : nil)
+            screenStates[key] = state
+        } else if candidateSet.contains(focusedID) {
+            state.markFocusedIfKnown(focusedID)
+            screenStates[key] = state
+        }
+        return screenStates[key]
+    }
+    private func focusNeighbor(direction: SnapDirection) {
+        _ = performHotKeyActionWithRetry { [weak self] allWindows, focusedID in
+            guard let self,
+                  let focusedID else {
+                return false
+            }
+            let key = self.resolvedHotKeyStateKey(for: focusedID, windows: allWindows)
+            let targetID: WindowIdentity?
+            if let key, let state = self.synchronizeHotKeyState(key: key, focusedID: focusedID, windows: allWindows) {
+                targetID = state.neighborID(from: focusedID, direction: direction)
+                    ?? self.frameBasedNeighborID(from: focusedID, direction: direction, windows: allWindows)
+            } else {
+                targetID = self.frameBasedNeighborID(from: focusedID, direction: direction, windows: allWindows)
+            }
+            guard let targetID,
+                  let targetWindow = allWindows.first(where: { $0.id == targetID }) else {
+                return false
+            }
+            if let key, var state = self.screenStates[key] {
+                state.markFocused(targetID)
+                self.screenStates[key] = state
+            }
+            self.focus(window: targetWindow, updateTreeFocus: true)
+            if let targetKey = self.resolvedHotKeyStateKey(for: targetID, windows: allWindows),
+               var targetState = self.screenStates[targetKey] {
+                targetState.markFocused(targetID)
+                self.screenStates[targetKey] = targetState
+            }
+            return true
+        }
+    }
+    private func frameBasedNeighborID(
+        from focusedID: WindowIdentity,
+        direction: SnapDirection,
+        windows: [ManagedWindow]
+    ) -> WindowIdentity? {
+        guard let focusedWindow = windows.first(where: { $0.id == focusedID }) else { return nil }
+        let sourceFrame = focusedWindow.frame
+        let sourcePoint = frameSideCenter(of: sourceFrame, leaving: direction)
+        var best: (id: WindowIdentity, score: CGFloat, overlap: CGFloat)?
+        for candidate in windows where candidate.id != focusedID {
+            guard !floatingWindowIDs.contains(candidate.id),
+                  candidate.screen.stateKey == focusedWindow.screen.stateKey,
+                  isFrameCandidate(candidate.frame, from: sourceFrame, direction: direction) else {
+                continue
+            }
+            let targetPoint = frameSideCenter(of: candidate.frame, enteringFrom: direction)
+            let dx = sourcePoint.x - targetPoint.x
+            let dy = sourcePoint.y - targetPoint.y
+            let distanceSquared = dx * dx + dy * dy
+            let overlap = framePerpendicularOverlap(sourceFrame, candidate.frame, direction: direction)
+            let score = distanceSquared - overlap * overlap * 0.25
+            if best == nil || score < best!.score - TileLayout.epsilon ||
+                (abs(score - best!.score) <= TileLayout.epsilon && overlap > best!.overlap) {
+                best = (candidate.id, score, overlap)
+            }
+        }
+        return best?.id
+    }
+    private func frameSideCenter(of frame: CGRect, leaving direction: SnapDirection) -> CGPoint {
+        switch direction {
+        case .left: return CGPoint(x: frame.minX, y: frame.midY)
+        case .right: return CGPoint(x: frame.maxX, y: frame.midY)
+        case .up: return CGPoint(x: frame.midX, y: frame.minY)
+        case .down: return CGPoint(x: frame.midX, y: frame.maxY)
+        }
+    }
+    private func frameSideCenter(of frame: CGRect, enteringFrom direction: SnapDirection) -> CGPoint {
+        switch direction {
+        case .left: return CGPoint(x: frame.maxX, y: frame.midY)
+        case .right: return CGPoint(x: frame.minX, y: frame.midY)
+        case .up: return CGPoint(x: frame.midX, y: frame.maxY)
+        case .down: return CGPoint(x: frame.midX, y: frame.minY)
+        }
+    }
+    private func isFrameCandidate(_ candidate: CGRect, from focused: CGRect, direction: SnapDirection) -> Bool {
+        switch direction {
+        case .left: return candidate.midX < focused.midX - TileLayout.epsilon
+        case .right: return candidate.midX > focused.midX + TileLayout.epsilon
+        case .up: return candidate.midY < focused.midY - TileLayout.epsilon
+        case .down: return candidate.midY > focused.midY + TileLayout.epsilon
+        }
+    }
+    private func framePerpendicularOverlap(_ lhs: CGRect, _ rhs: CGRect, direction: SnapDirection) -> CGFloat {
+        switch direction {
+        case .left, .right:
+            return max(0, min(lhs.maxY, rhs.maxY) - max(lhs.minY, rhs.minY))
+        case .up, .down:
+            return max(0, min(lhs.maxX, rhs.maxX) - max(lhs.minX, rhs.minX))
+        }
+    }
+    private func scheduleHotKeyReconcileBurst() {
+        scheduleReconcile(delay: 0.03)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self, !self.isStopping else { return }
+            self.scheduleReconcile(delay: 0.01)
+        }
     }
     private func swapFocusedWindow(direction: SnapDirection) {
-        let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowIDForHotKey(in: allWindows)
-        syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
-        guard let focusedID,
-              let key = stateKey(containing: focusedID),
-              var state = screenStates[key],
-              state.swapFocused(focusedID, direction: direction) else {
-            NSSound.beep()
-            return
+        _ = performHotKeyActionWithRetry { [weak self] allWindows, focusedID in
+            guard let self,
+                  let focusedID,
+                  let key = self.resolvedHotKeyStateKey(for: focusedID, windows: allWindows),
+                  var state = self.synchronizeHotKeyState(key: key, focusedID: focusedID, windows: allWindows),
+                  state.swapFocused(focusedID, direction: direction) else {
+                return false
+            }
+            self.screenStates[key] = state
+            self.applyLayout(to: allWindows, limitingToStateKeys: [key])
+            return true
         }
-        screenStates[key] = state
-        applyLayout(to: allWindows, limitingToStateKeys: [key])
     }
     private func resizeFocusedWindow(direction: SnapDirection) {
-        let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowIDForHotKey(in: allWindows)
-        syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
-        guard let focusedID,
-              let key = stateKey(containing: focusedID),
-              var state = screenStates[key],
-              state.resizeFocused(focusedID, direction: direction) else {
-            NSSound.beep()
-            return
+        _ = performHotKeyActionWithRetry { [weak self] allWindows, focusedID in
+            guard let self,
+                  let focusedID,
+                  let key = self.resolvedHotKeyStateKey(for: focusedID, windows: allWindows),
+                  var state = self.synchronizeHotKeyState(key: key, focusedID: focusedID, windows: allWindows),
+                  state.resizeFocused(focusedID, direction: direction) else {
+                return false
+            }
+            self.screenStates[key] = state
+            self.applyLayout(to: allWindows, limitingToStateKeys: [key])
+            if let focusedWindow = allWindows.first(where: { $0.id == focusedID }) {
+                self.focus(window: focusedWindow, updateTreeFocus: false)
+            }
+            self.scheduleHotKeyReconcileBurst()
+            return true
         }
-        screenStates[key] = state
-        applyLayout(to: allWindows, limitingToStateKeys: [key])
     }
     private func toggleFocusedSplitOrientation() {
-        let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowIDForHotKey(in: allWindows)
-        syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
-        guard let focusedID,
-              let key = stateKey(containing: focusedID),
-              var state = screenStates[key],
-              state.toggleOrientation(focusedID: focusedID) else {
-            NSSound.beep()
-            return
+        _ = performHotKeyActionWithRetry { [weak self] allWindows, focusedID in
+            guard let self,
+                  let focusedID,
+                  let key = self.resolvedHotKeyStateKey(for: focusedID, windows: allWindows),
+                  var state = self.synchronizeHotKeyState(key: key, focusedID: focusedID, windows: allWindows),
+                  state.toggleOrientation(focusedID: focusedID) else {
+                return false
+            }
+            self.screenStates[key] = state
+            self.applyLayout(to: allWindows, limitingToStateKeys: [key])
+            return true
         }
-        screenStates[key] = state
-        applyLayout(to: allWindows, limitingToStateKeys: [key])
     }
     private func cycleVirtualWorkspace(by delta: Int) {
         guard let context = workspaceSwitchContextFast() else {
@@ -1501,7 +1766,7 @@ final class WindowTiler {
             scheduleReconcile(delay: 0.08)
             return
         }
-        let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
+        let allWindows = interactiveManagedWindows()
         let focusedID = focusedWindowIDForHotKey(in: allWindows)
         syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
         let visibleStateKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: visibleIndex)
@@ -1667,19 +1932,19 @@ final class WindowTiler {
         }
     }
     private func balanceFocusedTree() {
-        let allWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let focusedID = focusedWindowIDForHotKey(in: allWindows)
-        syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
-        guard let focusedID,
-              let key = stateKey(containing: focusedID),
-              var state = screenStates[key] else {
-            NSSound.beep()
-            return
+        _ = performHotKeyActionWithRetry { [weak self] allWindows, focusedID in
+            guard let self,
+                  let focusedID,
+                  let key = self.resolvedHotKeyStateKey(for: focusedID, windows: allWindows),
+                  var state = self.synchronizeHotKeyState(key: key, focusedID: focusedID, windows: allWindows) else {
+                return false
+            }
+            state.balance()
+            state.markFocused(focusedID)
+            self.screenStates[key] = state
+            self.applyLayout(to: allWindows, limitingToStateKeys: [key])
+            return true
         }
-        state.balance()
-        state.markFocused(focusedID)
-        screenStates[key] = state
-        applyLayout(to: allWindows, limitingToStateKeys: [key])
     }
     private func syncStates(with windows: [ManagedWindow], focusedID: WindowIdentity?) {
         _ = restoreKnownLayoutIdentities(using: windows)
@@ -1712,8 +1977,27 @@ final class WindowTiler {
         lastSyncedVisibleWindowSignature = lastVisibleWindowSignature
     }
     private func syncStatesForHotKeyIfNeeded(with windows: [ManagedWindow], focusedID: WindowIdentity?) {
+        let tiled = tiledWindows(from: windows)
+        guard !hasLikelyPartialHotKeySnapshot(tiled) else {
+            scheduleReconcile(delay: 0.01)
+            if let focusedID,
+               let key = stateKey(containing: focusedID),
+               var state = screenStates[key] {
+                state.markFocusedIfKnown(focusedID)
+                screenStates[key] = state
+            }
+            return
+        }
         guard lastVisibleWindowSignature == lastSyncedVisibleWindowSignature else {
-            syncStates(with: tiledWindows(from: windows), focusedID: focusedID)
+            syncStates(with: tiled, focusedID: focusedID)
+            return
+        }
+        guard !hasWindowSetChanged(tiled) else {
+            syncStates(with: tiled, focusedID: focusedID)
+            return
+        }
+        if let focusedID, stateKey(containing: focusedID) == nil {
+            syncStates(with: tiled, focusedID: focusedID)
             return
         }
         guard let focusedID,
@@ -1751,15 +2035,26 @@ final class WindowTiler {
         suppressExternalChanges(for: 0.45)
         isApplyingLayout = true
         var appliedFramesByID: [WindowIdentity: CGRect] = [:]
+        var skippedIncompleteState = false
         defer {
             isApplyingLayout = false
             updateManagedWindowCache(withAppliedFrames: appliedFramesByID)
             updateLastAppliedWorkspaceIndices(using: currentScreens)
             suppressExternalChanges(for: 0.45)
+            if skippedIncompleteState {
+                scheduleReconcile(delay: 0.01)
+            }
         }
         for (screenKey, state) in statesToApply {
             if activeStateKeys.contains(screenKey) {
                 guard let screen = screens[screenKey] ?? windows.first(where: { $0.screen.stateKey == screenKey })?.screen else {
+                    continue
+                }
+                let hasCompleteWindowSet = state.windowIDs.allSatisfy { id in
+                    windowsByID[id] != nil || floatingWindowIDs.contains(id)
+                }
+                guard hasCompleteWindowSet else {
+                    skippedIncompleteState = true
                     continue
                 }
                 for (id, slot) in state.slots {
@@ -2956,8 +3251,7 @@ final class WindowTiler {
     }
     private func focusedWindowIDForHotKey(in windows: [ManagedWindow]) -> WindowIdentity? {
         if let lastKnownFocusedWindowID,
-           windows.contains(where: { $0.id == lastKnownFocusedWindowID }),
-           stateKey(containing: lastKnownFocusedWindowID) != nil {
+           windows.contains(where: { $0.id == lastKnownFocusedWindowID }) {
             return lastKnownFocusedWindowID
         }
         let focusedID = focusedWindowID(in: windows)
