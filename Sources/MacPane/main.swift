@@ -642,6 +642,8 @@ final class WindowTiler {
     private var lastAppliedWorkspaceIndexByNativeStateKey: [String: Int] = [:]
     private var lastWorkspaceSwitchContext: WorkspaceContext?
     private var shouldMigrateWorkspaceStatesAfterScreenChange = false
+    private var lastKnownScreenNativeStateKeys: Set<String> = []
+    private var disconnectedNativeStateKeysPendingMigration: Set<String> = []
     private var pendingWorkspaceSwitchIndicator: WorkspaceSwitchIndicatorState?
     private var frozenSystemUIScreenStates: [String: ScreenTileState]?
     private var frozenSystemUIActiveStateKeys: Set<String>?
@@ -714,6 +716,7 @@ final class WindowTiler {
         scheduleReconcile(delay: 0.05)
     }
     func stop() {
+        restoreAllWorkspacesBeforeStopping()
         isStopping = true
         pendingReconcile?.cancel()
         pendingReconcile = nil
@@ -751,6 +754,8 @@ final class WindowTiler {
         lastAppliedWorkspaceIndexByNativeStateKey.removeAll()
         lastWorkspaceSwitchContext = nil
         shouldMigrateWorkspaceStatesAfterScreenChange = false
+        lastKnownScreenNativeStateKeys.removeAll()
+        disconnectedNativeStateKeysPendingMigration.removeAll()
         pendingWorkspaceSwitchIndicator = nil
         frozenSystemUIScreenStates = nil
         frozenSystemUIActiveStateKeys = nil
@@ -767,6 +772,33 @@ final class WindowTiler {
         knownNonObservablePIDs.removeAll()
         isApplyingLayout = false
         isWatching = false
+    }
+    private func restoreAllWorkspacesBeforeStopping() {
+        guard hasAccessibilityPermission(prompt: false) else { return }
+        cancelPendingWorkspaceSwitchApply()
+        refreshAppObservers()
+        var allWindows = managedWindows()
+        let focusedID = focusedWindowID(in: allWindows)
+        syncStates(with: tiledWindows(from: allWindows, respectingTilingEnabled: false), focusedID: focusedID)
+        let migratedAfterScreenChange = migrateWorkspaceStatesAfterScreenChangeIfNeeded(
+            windows: allWindows,
+            focusedID: focusedID
+        )
+        if migratedAfterScreenChange {
+            invalidateManagedWindowCache(clearAppliedFrames: true)
+            allWindows = managedWindows()
+            syncStates(with: tiledWindows(from: allWindows, respectingTilingEnabled: false), focusedID: focusedID)
+        }
+        pruneScreenStatesForVisibleWindows(Set(allWindows.map(\.id)))
+        let mergedWorkspaces = mergeAllWorkspaceStatesIntoActiveWorkspaces(focusedID: focusedID)
+        guard migratedAfterScreenChange || mergedWorkspaces else { return }
+        invalidateManagedWindowCache(clearAppliedFrames: true)
+        allWindows = managedWindows()
+        applyLayout(to: allWindows, respectingTilingEnabled: false)
+        if let focusedID,
+           let focusedWindow = allWindows.first(where: { $0.id == focusedID }) {
+            focus(window: focusedWindow, updateTreeFocus: true)
+        }
     }
     func hasAccessibilityPermission(prompt: Bool) -> Bool {
         let now = Date()
@@ -856,13 +888,18 @@ final class WindowTiler {
         guard !isStopping else { return nil }
         guard hasAccessibilityPermission(prompt: false) else { return nil }
         startWatching()
-        let allWindows = managedWindows()
-        let focusedID = focusedWindowID(in: allWindows)
+        var allWindows = managedWindows()
+        var focusedID = focusedWindowID(in: allWindows)
         syncStates(with: tiledWindows(from: allWindows), focusedID: focusedID)
+        if migrateWorkspaceStatesAfterScreenChangeIfNeeded(windows: allWindows, focusedID: focusedID) {
+            invalidateManagedWindowCache(clearAppliedFrames: true)
+            allWindows = managedWindows()
+            focusedID = focusedWindowID(in: allWindows)
+            syncStates(with: tiledWindows(from: allWindows), focusedID: focusedID)
+        }
         guard let context = currentWorkspaceContext(windows: allWindows, focusedID: focusedID) else {
             return nil
         }
-        migrateWorkspaceStatesAfterScreenChangeIfNeeded()
         let windowsByID = Dictionary(allWindows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let items = (0..<workspaceCount).map { index in
             let stateKey = ScreenInfo.workspaceStateKey(nativeStateKey: context.nativeStateKey, workspaceIndex: index)
@@ -966,6 +1003,7 @@ final class WindowTiler {
         }
         isWatching = true
         refreshAppObservers()
+        lastKnownScreenNativeStateKeys = Set(currentScreenInfos().map(\.nativeStateKey))
         lastVisibleWindowSignature = VisibleWindowSignature(snapshot: onScreenWindowSnapshot())
         let workspaceCenter = NSWorkspace.shared.notificationCenter
         workspaceObservers.append(workspaceCenter.addObserver(
@@ -989,7 +1027,7 @@ final class WindowTiler {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.shouldMigrateWorkspaceStatesAfterScreenChange = true
+            self?.recordScreenParameterChangeForWorkspaceMigration()
             self?.pauseLayoutForSystemUI(duration: 1.20, preserveLayout: true)
             self?.scheduleReconcile(delay: 1.35)
         }
@@ -997,6 +1035,16 @@ final class WindowTiler {
             self?.performPeriodicVisibilityScan()
         }
         scanTimer?.tolerance = visibilityScanInterval * 0.25
+    }
+    private func recordScreenParameterChangeForWorkspaceMigration() {
+        let currentNativeStateKeys = Set(currentScreenInfos().map(\.nativeStateKey))
+        if !lastKnownScreenNativeStateKeys.isEmpty {
+            disconnectedNativeStateKeysPendingMigration.formUnion(
+                lastKnownScreenNativeStateKeys.subtracting(currentNativeStateKeys)
+            )
+        }
+        lastKnownScreenNativeStateKeys = currentNativeStateKeys
+        shouldMigrateWorkspaceStatesAfterScreenChange = true
     }
     private func refreshAppObservers() {
         guard !isStopping else { return }
@@ -1976,6 +2024,60 @@ final class WindowTiler {
         }
         lastSyncedVisibleWindowSignature = lastVisibleWindowSignature
     }
+    private func pruneScreenStatesForVisibleWindows(_ visibleIDs: Set<WindowIdentity>) {
+        for key in Array(screenStates.keys) {
+            guard var state = screenStates[key] else { continue }
+            state.removeMissing(keeping: visibleIDs)
+            if state.isEmpty {
+                screenStates.removeValue(forKey: key)
+            } else {
+                screenStates[key] = state
+            }
+        }
+    }
+    private func mergeAllWorkspaceStatesIntoActiveWorkspaces(focusedID: WindowIdentity?) -> Bool {
+        let screens = currentScreenInfos()
+        guard !screens.isEmpty else { return false }
+        var merged = false
+        for screen in screens {
+            let targetIndex = activeWorkspaceIndex(forNativeStateKey: screen.nativeStateKey)
+            let targetKey = ScreenInfo.workspaceStateKey(
+                nativeStateKey: screen.nativeStateKey,
+                workspaceIndex: targetIndex
+            )
+            merged = mergeWorkspaceStates(
+                inNativeStateKey: screen.nativeStateKey,
+                into: targetKey,
+                focusedID: focusedID
+            ) || merged
+            merged = moveFloatingWindowStateKeys(inNativeStateKey: screen.nativeStateKey, to: targetKey) || merged
+        }
+        return merged
+    }
+    private func mergeWorkspaceStates(
+        inNativeStateKey nativeStateKey: String,
+        into targetKey: String,
+        focusedID: WindowIdentity?
+    ) -> Bool {
+        let sourceKeys = screenStates.keys
+            .filter { key in
+                key != targetKey && nativeStateKeyComponent(of: key) == nativeStateKey
+            }
+            .sorted()
+        var merged = false
+        for sourceKey in sourceKeys {
+            merged = migrateScreenState(from: sourceKey, to: targetKey, focusedID: focusedID) || merged
+        }
+        return merged
+    }
+    private func moveFloatingWindowStateKeys(inNativeStateKey nativeStateKey: String, to targetKey: String) -> Bool {
+        var moved = false
+        for (id, stateKey) in floatingWindowStateKeys where stateKey != targetKey && nativeStateKeyComponent(of: stateKey) == nativeStateKey {
+            floatingWindowStateKeys[id] = targetKey
+            moved = true
+        }
+        return moved
+    }
     private func syncStatesForHotKeyIfNeeded(with windows: [ManagedWindow], focusedID: WindowIdentity?) {
         let tiled = tiledWindows(from: windows)
         guard !hasLikelyPartialHotKeySnapshot(tiled) else {
@@ -2010,10 +2112,11 @@ final class WindowTiler {
     }
     private func applyLayout(
         to windows: [ManagedWindow],
-        limitingToStateKeys stateKeyLimit: Set<String>? = nil
+        limitingToStateKeys stateKeyLimit: Set<String>? = nil,
+        respectingTilingEnabled: Bool = true
     ) {
         guard !isStopping else { return }
-        guard tilingEnabled else { return }
+        guard !respectingTilingEnabled || tilingEnabled else { return }
         let windowsByID = Dictionary(windows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let currentScreens = currentScreenInfos()
         let screens = Dictionary(uniqueKeysWithValues: currentScreens.map { ($0.stateKey, $0) })
@@ -2155,8 +2258,8 @@ final class WindowTiler {
             return
         }
         refreshAppObservers()
-        let allWindows = managedWindows()
-        let tiled = tiledWindows(from: allWindows)
+        var allWindows = managedWindows()
+        var tiled = tiledWindows(from: allWindows)
         guard isSystemUIWindowSnapshotStable(tiled) else {
             scheduleSystemUISettleCheck(delay: 0.35)
             return
@@ -2164,7 +2267,13 @@ final class WindowTiler {
         let restoredFrozenLayout = restoreFrozenStatesIfWindowSetUnchanged(using: tiled)
         let restoredIdentityLayout = restoreKnownLayoutIdentities(using: tiled, sourceStates: frozenSystemUIScreenStates)
         let restoredPersistedLayout = restorePersistedLayouts(using: tiled)
-        let migratedWorkspaceStates = migrateWorkspaceStatesAfterScreenChangeIfNeeded()
+        let focusedID = focusedWindowID(in: allWindows)
+        let migratedWorkspaceStates = migrateWorkspaceStatesAfterScreenChangeIfNeeded(windows: allWindows, focusedID: focusedID)
+        if migratedWorkspaceStates {
+            invalidateManagedWindowCache(clearAppliedFrames: true)
+            allWindows = managedWindows()
+            tiled = tiledWindows(from: allWindows)
+        }
         frozenSystemUIScreenStates = nil
         frozenSystemUIActiveStateKeys = nil
         resetSystemUIWindowSnapshotStability()
@@ -2267,13 +2376,325 @@ final class WindowTiler {
         storedKey != currentKey && canMigrateState(from: storedKey, to: currentKey)
     }
     @discardableResult
-    private func migrateWorkspaceStatesAfterScreenChangeIfNeeded() -> Bool {
+    private func migrateWorkspaceStatesAfterScreenChangeIfNeeded(
+        windows: [ManagedWindow]? = nil,
+        focusedID: WindowIdentity? = nil
+    ) -> Bool {
         guard shouldMigrateWorkspaceStatesAfterScreenChange else { return false }
+        let currentScreens = currentScreenInfos()
         var migrated = false
-        for screen in currentScreenInfos() {
+        migrated = migrateOrphanedWorkspaceStatesAfterScreenChange(
+            currentScreens: currentScreens,
+            windows: windows,
+            focusedID: focusedID
+        ) || migrated
+        for screen in currentScreens {
             migrated = migrateWorkspaceStates(toNativeStateKey: screen.nativeStateKey) || migrated
         }
         shouldMigrateWorkspaceStatesAfterScreenChange = false
+        return migrated
+    }
+    private func migrateOrphanedWorkspaceStatesAfterScreenChange(
+        currentScreens: [ScreenInfo],
+        windows: [ManagedWindow]?,
+        focusedID: WindowIdentity?
+    ) -> Bool {
+        guard !currentScreens.isEmpty else { return false }
+        let currentNativeStateKeys = Set(currentScreens.map(\.nativeStateKey))
+        let orphanedNativeStateKeys = orphanedNativeStateKeys(currentNativeStateKeys: currentNativeStateKeys)
+        guard !orphanedNativeStateKeys.isEmpty else { return false }
+        var migrated = false
+        for sourceNativeStateKey in orphanedNativeStateKeys.sorted() {
+            guard let targetNativeStateKey = targetNativeStateKeyForOrphanedDisplay(
+                sourceNativeStateKey,
+                currentScreens: currentScreens,
+                windows: windows
+            ) else {
+                continue
+            }
+            migrated = migrateOrphanedWorkspaceStates(
+                fromNativeStateKey: sourceNativeStateKey,
+                toNativeStateKey: targetNativeStateKey,
+                focusedID: focusedID
+            ) || migrated
+            disconnectedNativeStateKeysPendingMigration.remove(sourceNativeStateKey)
+        }
+        return migrated
+    }
+    private func orphanedNativeStateKeys(currentNativeStateKeys: Set<String>) -> Set<String> {
+        var keys: Set<String> = []
+        for stateKey in screenStates.keys {
+            let nativeStateKey = nativeStateKeyComponent(of: stateKey)
+            if !currentNativeStateKeys.contains(nativeStateKey) {
+                keys.insert(nativeStateKey)
+            }
+        }
+        for snapshot in persistedLayoutsByStateKey.values {
+            let nativeStateKey = nativeStateKeyComponent(of: snapshot.stateKey)
+            if !currentNativeStateKeys.contains(nativeStateKey) {
+                keys.insert(nativeStateKey)
+            }
+        }
+        for stateKey in floatingWindowStateKeys.values {
+            let nativeStateKey = nativeStateKeyComponent(of: stateKey)
+            if !currentNativeStateKeys.contains(nativeStateKey) {
+                keys.insert(nativeStateKey)
+            }
+        }
+        for nativeStateKey in disconnectedNativeStateKeysPendingMigration
+            where !currentNativeStateKeys.contains(nativeStateKey) && hasWorkspaceMetadata(forNativeStateKey: nativeStateKey) {
+            keys.insert(nativeStateKey)
+        }
+        return keys
+    }
+    private func hasWorkspaceMetadata(forNativeStateKey nativeStateKey: String) -> Bool {
+        if activeWorkspaceIndexByNativeStateKey[nativeStateKey] != nil ||
+            activeWorkspaceIndexByDisplayKey[displayKeyComponent(of: nativeStateKey)] != nil {
+            return true
+        }
+        return workspaceNames().keys.contains { nameKey in
+            workspaceNameDisplayKey(from: nameKey) == displayKeyComponent(of: nativeStateKey)
+        }
+    }
+    private func workspaceNameDisplayKey(from nameKey: String) -> String? {
+        guard let separator = nameKey.lastIndex(of: ":") else { return nil }
+        return String(nameKey[..<separator])
+    }
+    private func targetNativeStateKeyForOrphanedDisplay(
+        _ sourceNativeStateKey: String,
+        currentScreens: [ScreenInfo],
+        windows: [ManagedWindow]?
+    ) -> String? {
+        if currentScreens.count == 1 {
+            return currentScreens.first?.nativeStateKey
+        }
+        let sourceWindowIDs = windowIDs(inNativeStateKey: sourceNativeStateKey)
+        if !sourceWindowIDs.isEmpty, let windows {
+            let countsByNativeStateKey = windows.reduce(into: [String: Int]()) { counts, window in
+                guard sourceWindowIDs.contains(window.id) else { return }
+                let physicalScreen = screenInfo(for: window.frame, screens: currentScreens)
+                counts[physicalScreen.nativeStateKey, default: 0] += 1
+            }
+            let rankedTargets = countsByNativeStateKey
+                .filter { nativeStateKey, _ in
+                    currentScreens.contains { $0.nativeStateKey == nativeStateKey }
+                }
+                .sorted { lhs, rhs in
+                    if lhs.value != rhs.value { return lhs.value > rhs.value }
+                    return lhs.key < rhs.key
+                }
+            if let first = rankedTargets.first,
+               rankedTargets.dropFirst().first?.value != first.value {
+                return first.key
+            }
+        }
+        if let cursorScreen = screenContainingCursor() {
+            let cursorInfo = screenInfo(forScreen: cursorScreen)
+            if currentScreens.contains(where: { $0.nativeStateKey == cursorInfo.nativeStateKey }) {
+                return cursorInfo.nativeStateKey
+            }
+        }
+        if let main = NSScreen.main {
+            let mainInfo = screenInfo(forScreen: main)
+            if currentScreens.contains(where: { $0.nativeStateKey == mainInfo.nativeStateKey }) {
+                return mainInfo.nativeStateKey
+            }
+        }
+        return currentScreens.first?.nativeStateKey
+    }
+    private func windowIDs(inNativeStateKey nativeStateKey: String) -> Set<WindowIdentity> {
+        var ids = Set(screenStates
+            .filter { key, _ in nativeStateKeyComponent(of: key) == nativeStateKey }
+            .values
+            .flatMap(\.windowIDs))
+        ids.formUnion(floatingWindowStateKeys.compactMap { id, stateKey in
+            nativeStateKeyComponent(of: stateKey) == nativeStateKey ? id : nil
+        })
+        return ids
+    }
+    private func migrateOrphanedWorkspaceStates(
+        fromNativeStateKey sourceNativeStateKey: String,
+        toNativeStateKey targetNativeStateKey: String,
+        focusedID: WindowIdentity?
+    ) -> Bool {
+        guard sourceNativeStateKey != targetNativeStateKey else { return false }
+        let targetHadState = nativeStateKeyHasAnyScreenState(targetNativeStateKey)
+        let sourceActiveIndex = storedActiveWorkspaceIndex(forNativeStateKey: sourceNativeStateKey)
+        var focusedWorkspaceIndex: Int?
+        var migrated = false
+        for index in 0..<workspaceCount {
+            let sourceKey = ScreenInfo.workspaceStateKey(nativeStateKey: sourceNativeStateKey, workspaceIndex: index)
+            let targetKey = ScreenInfo.workspaceStateKey(nativeStateKey: targetNativeStateKey, workspaceIndex: index)
+            if let focusedID, screenStates[sourceKey]?.contains(focusedID) == true {
+                focusedWorkspaceIndex = index
+            }
+            migrated = migrateScreenState(from: sourceKey, to: targetKey, focusedID: focusedID) || migrated
+            migrated = migratePersistedLayout(from: sourceKey, to: targetKey) || migrated
+        }
+        migrated = migrateFloatingWorkspaceStateKeys(
+            fromNativeStateKey: sourceNativeStateKey,
+            toNativeStateKey: targetNativeStateKey,
+            focusedWorkspaceIndex: &focusedWorkspaceIndex,
+            focusedID: focusedID
+        ) || migrated
+        migrated = migrateActiveWorkspaceIndex(
+            fromNativeStateKey: sourceNativeStateKey,
+            toNativeStateKey: targetNativeStateKey,
+            sourceActiveIndex: sourceActiveIndex,
+            focusedWorkspaceIndex: focusedWorkspaceIndex,
+            targetHadState: targetHadState
+        ) || migrated
+        migrated = migrateWorkspaceNames(fromNativeStateKey: sourceNativeStateKey, toNativeStateKey: targetNativeStateKey) || migrated
+        return migrated
+    }
+    private func nativeStateKeyHasAnyScreenState(_ nativeStateKey: String) -> Bool {
+        screenStates.contains { stateKey, state in
+            nativeStateKeyComponent(of: stateKey) == nativeStateKey && !state.isEmpty
+        }
+    }
+    private func storedActiveWorkspaceIndex(forNativeStateKey nativeStateKey: String) -> Int? {
+        let index = activeWorkspaceIndexByNativeStateKey[nativeStateKey]
+            ?? activeWorkspaceIndexByDisplayKey[displayKeyComponent(of: nativeStateKey)]
+        return index.map(clampedWorkspaceIndex)
+    }
+    private func migrateScreenState(from sourceKey: String, to targetKey: String, focusedID: WindowIdentity?) -> Bool {
+        guard let sourceState = screenStates.removeValue(forKey: sourceKey) else { return false }
+        guard !sourceState.isEmpty else { return true }
+        let preferSourceFocus = focusedID.map { sourceState.contains($0) } ?? false
+        if var targetState = screenStates[targetKey], !targetState.isEmpty {
+            targetState.merge(sourceState, preferSourceFocus: preferSourceFocus)
+            screenStates[targetKey] = targetState
+        } else {
+            screenStates[targetKey] = sourceState
+        }
+        return true
+    }
+    private func migratePersistedLayout(from sourceKey: String, to targetKey: String) -> Bool {
+        guard let sourceSnapshot = persistedLayoutsByStateKey.removeValue(forKey: sourceKey) else { return false }
+        if let targetSnapshot = persistedLayoutsByStateKey[targetKey] {
+            persistedLayoutsByStateKey[targetKey] = mergedPersistedLayout(
+                targetSnapshot,
+                with: sourceSnapshot,
+                targetKey: targetKey
+            )
+        } else {
+            persistedLayoutsByStateKey[targetKey] = PersistedScreenLayout(
+                stateKey: targetKey,
+                displayKey: displayKeyComponent(of: targetKey),
+                tree: sourceSnapshot.tree,
+                entriesByID: sourceSnapshot.entriesByID,
+                lastFocusedEntryID: sourceSnapshot.lastFocusedEntryID,
+                lastUpdated: sourceSnapshot.lastUpdated
+            )
+        }
+        return true
+    }
+    private func mergedPersistedLayout(
+        _ target: PersistedScreenLayout,
+        with source: PersistedScreenLayout,
+        targetKey: String
+    ) -> PersistedScreenLayout {
+        var tree = target.tree
+        var entriesByID = target.entriesByID
+        var nextEntryID = (entriesByID.keys.max() ?? 0) + 1
+        var sourceEntryIDReplacements: [Int: Int] = [:]
+        for sourceEntryID in source.tree.ids {
+            guard let sourceEntry = source.entriesByID[sourceEntryID] else { continue }
+            let replacementEntryID = nextEntryID
+            nextEntryID += 1
+            sourceEntryIDReplacements[sourceEntryID] = replacementEntryID
+            entriesByID[replacementEntryID] = PersistedWindowLayoutEntry(
+                id: replacementEntryID,
+                pid: sourceEntry.pid,
+                bundleIdentifier: sourceEntry.bundleIdentifier,
+                layoutIdentity: sourceEntry.layoutIdentity,
+                orderRank: sourceEntry.orderRank,
+                scanIndex: sourceEntry.scanIndex
+            )
+        }
+        if tree.isEmpty,
+           let sourceTree = source.tree.compactMapIDs({ sourceEntryIDReplacements[$0] }) {
+            tree = sourceTree
+        } else {
+            var insertionTarget = target.lastFocusedEntryID ?? tree.largestLeafID() ?? tree.firstID
+            for sourceEntryID in source.tree.ids {
+                guard let replacementEntryID = sourceEntryIDReplacements[sourceEntryID] else { continue }
+                tree.insert(replacementEntryID, near: insertionTarget, placement: .automatic)
+                insertionTarget = replacementEntryID
+            }
+        }
+        let sourceFocusedEntryID = source.lastFocusedEntryID.flatMap { sourceEntryIDReplacements[$0] }
+        return PersistedScreenLayout(
+            stateKey: targetKey,
+            displayKey: displayKeyComponent(of: targetKey),
+            tree: tree,
+            entriesByID: entriesByID,
+            lastFocusedEntryID: target.lastFocusedEntryID ?? sourceFocusedEntryID,
+            lastUpdated: max(target.lastUpdated, source.lastUpdated)
+        )
+    }
+    private func migrateFloatingWorkspaceStateKeys(
+        fromNativeStateKey sourceNativeStateKey: String,
+        toNativeStateKey targetNativeStateKey: String,
+        focusedWorkspaceIndex: inout Int?,
+        focusedID: WindowIdentity?
+    ) -> Bool {
+        var migrated = false
+        for (id, sourceKey) in floatingWindowStateKeys {
+            guard nativeStateKeyComponent(of: sourceKey) == sourceNativeStateKey,
+                  let workspaceIndex = ScreenInfo.workspaceIndex(from: sourceKey),
+                  workspaceIndex < workspaceCount else {
+                continue
+            }
+            if id == focusedID {
+                focusedWorkspaceIndex = workspaceIndex
+            }
+            floatingWindowStateKeys[id] = ScreenInfo.workspaceStateKey(
+                nativeStateKey: targetNativeStateKey,
+                workspaceIndex: workspaceIndex
+            )
+            migrated = true
+        }
+        return migrated
+    }
+    private func migrateActiveWorkspaceIndex(
+        fromNativeStateKey sourceNativeStateKey: String,
+        toNativeStateKey targetNativeStateKey: String,
+        sourceActiveIndex: Int?,
+        focusedWorkspaceIndex: Int?,
+        targetHadState: Bool
+    ) -> Bool {
+        var migrated = false
+        if activeWorkspaceIndexByNativeStateKey.removeValue(forKey: sourceNativeStateKey) != nil {
+            migrated = true
+        }
+        if activeWorkspaceIndexByDisplayKey.removeValue(forKey: displayKeyComponent(of: sourceNativeStateKey)) != nil {
+            migrated = true
+        }
+        if let focusedWorkspaceIndex {
+            setActiveWorkspaceIndex(focusedWorkspaceIndex, forNativeStateKey: targetNativeStateKey)
+            return true
+        }
+        if !targetHadState, let sourceActiveIndex {
+            setActiveWorkspaceIndex(sourceActiveIndex, forNativeStateKey: targetNativeStateKey)
+            return true
+        }
+        return migrated
+    }
+    private func migrateWorkspaceNames(fromNativeStateKey sourceNativeStateKey: String, toNativeStateKey targetNativeStateKey: String) -> Bool {
+        var names = workspaceNames()
+        var migrated = false
+        for index in 0..<workspaceCount {
+            let sourceKey = workspaceNameKey(forNativeStateKey: sourceNativeStateKey, workspaceIndex: index)
+            let targetKey = workspaceNameKey(forNativeStateKey: targetNativeStateKey, workspaceIndex: index)
+            guard let sourceName = names[sourceKey], names[targetKey] == nil else { continue }
+            names[targetKey] = sourceName
+            names.removeValue(forKey: sourceKey)
+            migrated = true
+        }
+        if migrated {
+            UserDefaults.standard.set(names, forKey: workspaceNamesDefaultsKey)
+        }
         return migrated
     }
     private func migrateWorkspaceStates(toNativeStateKey targetNativeStateKey: String) -> Bool {
@@ -2333,8 +2754,8 @@ final class WindowTiler {
         }
         return migrated
     }
-    private func tiledWindows(from windows: [ManagedWindow]) -> [ManagedWindow] {
-        guard tilingEnabled else { return [] }
+    private func tiledWindows(from windows: [ManagedWindow], respectingTilingEnabled: Bool = true) -> [ManagedWindow] {
+        guard !respectingTilingEnabled || tilingEnabled else { return [] }
         restoreFloatingLayoutIdentities(using: windows)
         let activeStateKeys = Set(currentScreenInfos().map(\.stateKey))
         return windows.filter { activeStateKeys.contains($0.screen.stateKey) && !floatingWindowIDs.contains($0.id) }
@@ -3844,6 +4265,27 @@ private struct ScreenTileState {
         let target = targetID.flatMap { tree.contains($0) ? $0 : nil } ?? lastFocusedOrLargestID
         tree.insert(id, near: target, placement: placement)
         markFocused(id)
+    }
+    mutating func merge(_ source: ScreenTileState, preferSourceFocus: Bool) {
+        guard !source.isEmpty else { return }
+        guard !isEmpty else {
+            self = source
+            return
+        }
+        let preservedFocus = focusedWindowID
+        var insertionTarget = lastFocusedOrLargestID
+        for item in source.slotList {
+            guard !tree.contains(item.id) else { continue }
+            tree.insert(item.id, near: insertionTarget, placement: .automatic)
+            insertionTarget = item.id
+        }
+        if preferSourceFocus, let sourceFocus = source.focusedWindowID ?? source.lastFocusedOrLargestID {
+            markFocusedIfKnown(sourceFocus)
+        } else if let preservedFocus {
+            markFocusedIfKnown(preservedFocus)
+        } else if let insertionTarget {
+            markFocusedIfKnown(insertionTarget)
+        }
     }
     mutating func remove(_ id: WindowIdentity) {
         tree.remove(id)
