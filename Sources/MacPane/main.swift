@@ -629,10 +629,12 @@ final class WindowTiler {
     private var pendingSystemUISettle: DispatchWorkItem?
     private var pendingWorkspaceSwitchApply: DispatchWorkItem?
     private var workspaceSwitchApplyGeneration = 0
+    private var windowDiscoveryReconcileGeneration = 0
     private var managedWindowCache: (windows: [ManagedWindow], createdAt: Date)?
     private let interactiveWindowCacheDuration: TimeInterval = 0.80
     private let defaultWindowCacheDuration: TimeInterval = 0.12
     private let workspaceSwitchApplyDelay: TimeInterval = 0.045
+    private let windowDiscoveryReconcileOffsets: [TimeInterval] = [0, 0.10, 0.28, 0.70, 1.50]
     private let accessibilityMessagingTimeout: Float = 0.15
     private let accessibilityPermissionCacheDuration: TimeInterval = 0.50
     private var cachedAccessibilityPermission: (granted: Bool, createdAt: Date)?
@@ -731,6 +733,7 @@ final class WindowTiler {
         pendingWorkspaceSwitchApply?.cancel()
         pendingWorkspaceSwitchApply = nil
         workspaceSwitchApplyGeneration += 1
+        windowDiscoveryReconcileGeneration += 1
         managedWindowCache = nil
         cachedAccessibilityPermission = nil
         permissionTimer?.invalidate()
@@ -945,7 +948,7 @@ final class WindowTiler {
         case kAXWindowCreatedNotification:
             invalidateManagedWindowCache(clearAppliedFrames: true)
             refreshWindowNotificationRegistrations()
-            scheduleReconcile(delay: 0.025)
+            scheduleWindowDiscoveryReconcileBurst(initialDelay: 0.025)
         case kAXUIElementDestroyedNotification:
             invalidateManagedWindowCache(clearAppliedFrames: true)
             removeFloatingWindowID(forDestroyedElement: element)
@@ -1012,7 +1015,7 @@ final class WindowTiler {
             queue: .main
         ) { [weak self] _ in
             self?.refreshAppObservers()
-            self?.scheduleReconcile(delay: 0.06)
+            self?.scheduleWindowDiscoveryReconcileBurst(initialDelay: 0.06)
         })
         workspaceObservers.append(workspaceCenter.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification,
@@ -1136,6 +1139,24 @@ final class WindowTiler {
         pendingReconcile = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
+    private func scheduleWindowDiscoveryReconcileBurst(initialDelay: TimeInterval) {
+        guard !isStopping else { return }
+        windowDiscoveryReconcileGeneration += 1
+        let generation = windowDiscoveryReconcileGeneration
+        for offset in windowDiscoveryReconcileOffsets {
+            DispatchQueue.main.asyncAfter(deadline: .now() + initialDelay + offset) { [weak self] in
+                guard let self,
+                      !self.isStopping,
+                      self.windowDiscoveryReconcileGeneration == generation else {
+                    return
+                }
+                // Some apps publish a new window before it appears in CGWindowList or
+                // before the AX element accepts frame writes, so retry through settle.
+                self.invalidateManagedWindowCache(clearAppliedFrames: false)
+                self.scheduleReconcile(delay: 0)
+            }
+        }
+    }
     private func scheduleReconcileIfWindowSetChanged(delay: TimeInterval) {
         guard !isStopping, tilingEnabled, frozenSystemUIScreenStates == nil, !shouldPauseLayoutForSystemUI() else { return }
         let windows = tiledWindows(from: managedWindows())
@@ -1166,7 +1187,7 @@ final class WindowTiler {
         guard signature != lastVisibleWindowSignature else { return }
         guard !shouldPauseLayoutForSystemUI() else { return }
         lastVisibleWindowSignature = signature
-        scheduleReconcile(delay: delay)
+        scheduleWindowDiscoveryReconcileBurst(initialDelay: delay)
     }
     private func scheduleFocusRemember(delay: TimeInterval) {
         guard !isStopping else { return }
@@ -1224,7 +1245,13 @@ final class WindowTiler {
         guard hasAccessibilityPermission(prompt: false) else { return }
         guard tilingEnabled else { return }
         guard !shouldPauseLayoutForSystemUI(), frozenSystemUIScreenStates == nil else { return }
-        let windows = managedWindows()
+        let snapshot = onScreenWindowSnapshot()
+        let visibleSignatureChanged = VisibleWindowSignature(snapshot: snapshot) != lastVisibleWindowSignature
+        let windows = managedWindows(snapshot: snapshot)
+        managedWindowCache = (windows, Date())
+        if visibleSignatureChanged {
+            scheduleWindowDiscoveryReconcileBurst(initialDelay: 0.01)
+        }
         let tiled = tiledWindows(from: windows)
         if hasWindowSetChanged(tiled) {
             scheduleReconcile(delay: 0.01)
