@@ -108,6 +108,9 @@ final class WindowTiler {
     var tilingEnabled: Bool {
         settings.tilingEnabled
     }
+    var workspaceSwitchAnimationsEnabled: Bool {
+        settings.workspaceSwitchAnimationsEnabled
+    }
 
     // MARK: - Lifecycle
 
@@ -299,6 +302,8 @@ final class WindowTiler {
             toggleFocusedFloating()
         case .toggleTiling:
             toggleTiling()
+        case .toggleWorkspaceSwitchAnimations:
+            toggleWorkspaceSwitchAnimations()
         case .balance:
             balanceFocusedTree()
         case .retile:
@@ -1218,6 +1223,7 @@ final class WindowTiler {
         direction: WorkspaceSlideDirection,
         generation: Int
     ) -> Bool {
+        guard workspaceSwitchAnimationsEnabled else { return false }
         guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return false }
         guard activeSlideChain == nil else { return false }
         guard let screen = currentScreenInfos().first(where: { $0.nativeStateKey == nativeStateKey }) else {
@@ -1279,6 +1285,8 @@ final class WindowTiler {
     /// Splices a new switch onto the in-flight chain instead of cancel+restart. Returns
     /// true on success; false means the caller should fall through to the cold path.
     private func reseatActiveSlideChain(toTargetIndex newTargetIndex: Int, directionHint: Int?) -> Bool {
+        guard workspaceSwitchAnimationsEnabled else { return false }
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return false }
         guard let chain = activeSlideChain, let animator = chain.animator else { return false }
         guard newTargetIndex != chain.targetIndex else { return false }
         let progress = animator.currentProgress
@@ -1578,6 +1586,12 @@ final class WindowTiler {
         if tilingEnabled {
             scheduleReconcile(delay: 0.01)
         }
+    }
+    private func toggleWorkspaceSwitchAnimations() {
+        if workspaceSwitchAnimationsEnabled {
+            cancelPendingWorkspaceSlideAnimation(finalize: true)
+        }
+        settings.toggleWorkspaceSwitchAnimations()
     }
     private func balanceFocusedTree() {
         _ = performHotKeyActionWithRetry { [weak self] allWindows, focusedID in

@@ -5,6 +5,7 @@ final class WindowTilerSettings {
         static let gapPixels = "gapPixels"
         static let workspaceCount = "virtualWorkspaceCount"
         static let tilingEnabled = "tilingEnabled"
+        static let workspaceSwitchAnimationsEnabled = "workspaceSwitchAnimationsEnabled"
         static let workspaceNamesByDisplay = "workspaceNamesByDisplay"
         static let accessibilityPrompted = "accessibilityPrompted"
     }
@@ -50,6 +51,17 @@ final class WindowTilerSettings {
 
     func toggleTiling() {
         defaults.set(!tilingEnabled, forKey: DefaultsKey.tilingEnabled)
+    }
+
+    var workspaceSwitchAnimationsEnabled: Bool {
+        if defaults.object(forKey: DefaultsKey.workspaceSwitchAnimationsEnabled) == nil {
+            return true
+        }
+        return defaults.bool(forKey: DefaultsKey.workspaceSwitchAnimationsEnabled)
+    }
+
+    func toggleWorkspaceSwitchAnimations() {
+        defaults.set(!workspaceSwitchAnimationsEnabled, forKey: DefaultsKey.workspaceSwitchAnimationsEnabled)
     }
 
     var hasPromptedForAccessibilityPermission: Bool {

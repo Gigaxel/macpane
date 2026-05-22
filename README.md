@@ -16,6 +16,7 @@ When MacPane launches, it immediately arranges the windows on each display. It w
 - `Cmd+Shift+Arrow`: swap the focused window with the nearest tiled neighbor in that direction.
 - `Cmd+Ctrl+Arrow`: resize the split containing the focused window.
 - `Cmd+Option+O`: rotate the focused fork between horizontal and vertical splits.
+- `Cmd+Option+A`: toggle workspace switch animations on or off.
 - `Cmd+Option+1...9`: switch MacPane's virtual workspace on the current display.
 - `Cmd+Ctrl+1...9`: move the focused tiled window to a MacPane virtual workspace.
 - `Cmd+Ctrl+Option+Left/Right` or `Cmd+Ctrl+Option+H/L`: switch to the previous or next MacPane virtual workspace.

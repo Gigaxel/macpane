@@ -68,12 +68,23 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         }
         let tilingEnabledBefore: Bool?
         let tilingIndicatorDisplayID: CGDirectDisplayID?
+        let workspaceSwitchAnimationsEnabledBefore: Bool?
+        let workspaceSwitchAnimationsIndicatorDisplayID: CGDirectDisplayID?
         if case .toggleTiling = action {
             tilingEnabledBefore = tiler.tilingEnabled
             tilingIndicatorDisplayID = tiler.currentDisplayID
+            workspaceSwitchAnimationsEnabledBefore = nil
+            workspaceSwitchAnimationsIndicatorDisplayID = nil
+        } else if case .toggleWorkspaceSwitchAnimations = action {
+            workspaceSwitchAnimationsEnabledBefore = tiler.workspaceSwitchAnimationsEnabled
+            workspaceSwitchAnimationsIndicatorDisplayID = tiler.currentDisplayID
+            tilingEnabledBefore = nil
+            tilingIndicatorDisplayID = nil
         } else {
             tilingEnabledBefore = nil
             tilingIndicatorDisplayID = nil
+            workspaceSwitchAnimationsEnabledBefore = nil
+            workspaceSwitchAnimationsIndicatorDisplayID = nil
         }
         tiler.handle(action: action)
         if shouldRebuildMenu {
@@ -84,6 +95,10 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         }
         if let tilingEnabledBefore, tiler.tilingEnabled != tilingEnabledBefore {
             showTilingStateIndicator(displayID: tilingIndicatorDisplayID)
+        }
+        if let workspaceSwitchAnimationsEnabledBefore,
+           tiler.workspaceSwitchAnimationsEnabled != workspaceSwitchAnimationsEnabledBefore {
+            showWorkspaceSwitchAnimationsStateIndicator(displayID: workspaceSwitchAnimationsIndicatorDisplayID)
         }
     }
     private func setupMenu() {
@@ -129,6 +144,13 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         let tilingItem = NSMenuItem(title: "Tiling: \(tiler.tilingEnabled ? "On" : "Off")", action: nil, keyEquivalent: "")
         tilingItem.isEnabled = false
         menu.addItem(tilingItem)
+        let workspaceAnimationsItem = NSMenuItem(
+            title: "Workspace Animations: \(tiler.workspaceSwitchAnimationsEnabled ? "On" : "Off")",
+            action: nil,
+            keyEquivalent: ""
+        )
+        workspaceAnimationsItem.isEnabled = false
+        menu.addItem(workspaceAnimationsItem)
         let workspaceMenuState = tiler.workspaceMenuState
         let workspaceItem = NSMenuItem(title: workspaceMenuState.statusText, action: nil, keyEquivalent: "")
         workspaceItem.isEnabled = false
@@ -180,6 +202,7 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
             "Cmd+Option+O: rotate focused split",
             "Cmd+Option+G: toggle focused window floating",
             "Cmd+Option+Y: toggle tiling",
+            "Cmd+Option+A: toggle workspace switch animations",
             "Cmd+Option+B: balance current BSP tree",
             "Cmd+Option+1...9: switch MacPane workspace",
             "Cmd+Ctrl+1...9: move focused window to workspace",
@@ -271,6 +294,12 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
     }
     private func showTilingStateIndicator(displayID: CGDirectDisplayID?) {
         workspaceSwitchIndicatorOverlay.show(text: tiler.tilingEnabled ? "On" : "Off", displayID: displayID)
+    }
+    private func showWorkspaceSwitchAnimationsStateIndicator(displayID: CGDirectDisplayID?) {
+        workspaceSwitchIndicatorOverlay.show(
+            text: tiler.workspaceSwitchAnimationsEnabled ? "On" : "Off",
+            displayID: displayID
+        )
     }
     @objc private func decreaseGap() {
         tiler.adjustGap(by: -2)

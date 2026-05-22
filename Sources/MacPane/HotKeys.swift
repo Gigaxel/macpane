@@ -21,6 +21,7 @@ enum HotKeyAction {
     case toggleOrientation
     case toggleFloating
     case toggleTiling
+    case toggleWorkspaceSwitchAnimations
     case balance
     case retile
     var shouldShowWorkspaceSwitchIndicator: Bool {
@@ -154,6 +155,7 @@ final class HotKeyManager {
         register(keyCode: UInt32(kVK_ANSI_O), modifiers: UInt32(cmdKey | optionKey), action: .toggleOrientation)
         register(keyCode: UInt32(kVK_ANSI_G), modifiers: UInt32(cmdKey | optionKey), action: .toggleFloating)
         register(keyCode: UInt32(kVK_ANSI_Y), modifiers: UInt32(cmdKey | optionKey), action: .toggleTiling)
+        register(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(cmdKey | optionKey), action: .toggleWorkspaceSwitchAnimations)
         register(keyCode: UInt32(kVK_ANSI_B), modifiers: UInt32(cmdKey | optionKey), action: .balance)
         register(keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(cmdKey | optionKey), action: .retile)
     }
