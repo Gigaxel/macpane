@@ -80,8 +80,8 @@ struct WindowDiscovery {
     ) -> ManagedWindowCandidate? {
         guard let position = AXReader.point(window, attribute: kAXPositionAttribute),
               let size = AXReader.size(window, attribute: kAXSizeAttribute),
-              size.width >= TileLayout.minimumWindowFrameSize.width,
-              size.height >= TileLayout.minimumWindowFrameSize.height else {
+              size.width > 0,
+              size.height > 0 else {
             return nil
         }
 
