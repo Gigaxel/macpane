@@ -607,6 +607,110 @@ private struct WorkspaceSwitchIndicatorState {
     let workspaceIndex: Int
     let displayID: CGDirectDisplayID?
 }
+private enum WorkspaceSlideDirection {
+    case forward
+    case backward
+}
+private enum WorkspaceSlideEdge {
+    case left
+    case right
+}
+private struct WorkspaceSlideTransition {
+    let window: ManagedWindow
+    let startFrame: CGRect
+    let endFrame: CGRect
+    let needsInitialFrame: Bool
+}
+private final class WorkspaceSlideAnimator: NSObject {
+    private let duration: TimeInterval
+    private let frameRate: Int
+    private let screen: NSScreen?
+    private let shouldContinue: () -> Bool
+    private let onFrame: (CGFloat) -> Void
+    private let onFinish: () -> Void
+    private var displayLink: NSObject?
+    private var timer: Timer?
+    private var startTime = CACurrentMediaTime()
+    private var didFinish = false
+    init(
+        duration: TimeInterval,
+        frameRate: Int,
+        screen: NSScreen?,
+        shouldContinue: @escaping () -> Bool,
+        onFrame: @escaping (CGFloat) -> Void,
+        onFinish: @escaping () -> Void
+    ) {
+        self.duration = duration
+        self.frameRate = frameRate
+        self.screen = screen
+        self.shouldContinue = shouldContinue
+        self.onFrame = onFrame
+        self.onFinish = onFinish
+    }
+    func start() {
+        startTime = CACurrentMediaTime()
+        if #available(macOS 14.0, *), let screen {
+            let displayLink = screen.displayLink(target: self, selector: #selector(displayLinkDidTick(_:)))
+            let rate = Float(max(frameRate, 1))
+            displayLink.preferredFrameRateRange = CAFrameRateRange(minimum: rate, maximum: rate, preferred: rate)
+            displayLink.add(to: .main, forMode: .common)
+            self.displayLink = displayLink
+            return
+        }
+        let interval = 1 / TimeInterval(max(frameRate, 1))
+        let timer = Timer(timeInterval: interval, target: self, selector: #selector(timerDidTick(_:)), userInfo: nil, repeats: true)
+        timer.tolerance = 0
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+    func finishImmediately() {
+        guard !didFinish else { return }
+        invalidate()
+        onFrame(1)
+        finish()
+    }
+    func cancel() {
+        guard !didFinish else { return }
+        didFinish = true
+        invalidate()
+    }
+    @available(macOS 14.0, *)
+    @objc private func displayLinkDidTick(_ displayLink: CADisplayLink) {
+        tick(now: CACurrentMediaTime())
+    }
+    @objc private func timerDidTick(_ timer: Timer) {
+        tick(now: CACurrentMediaTime())
+    }
+    private func tick(now: CFTimeInterval) {
+        guard !didFinish else { return }
+        guard shouldContinue() else {
+            cancel()
+            return
+        }
+        let progress = min(max((now - startTime) / duration, 0), 1)
+        onFrame(CGFloat(progress))
+        if progress >= 1 {
+            finish()
+        }
+    }
+    private func finish() {
+        guard !didFinish else { return }
+        didFinish = true
+        invalidate()
+        onFinish()
+    }
+    private func invalidate() {
+        if #available(macOS 14.0, *), let displayLink = displayLink as? CADisplayLink {
+            displayLink.invalidate()
+        }
+        displayLink = nil
+        timer?.invalidate()
+        timer = nil
+    }
+    deinit {
+        invalidate()
+    }
+}
 final class WindowTiler {
     private let gapDefaultsKey = "gapPixels"
     private let workspaceCountDefaultsKey = "virtualWorkspaceCount"
@@ -628,12 +732,16 @@ final class WindowTiler {
     private var pendingResize: DispatchWorkItem?
     private var pendingSystemUISettle: DispatchWorkItem?
     private var pendingWorkspaceSwitchApply: DispatchWorkItem?
+    private var workspaceSlideAnimator: WorkspaceSlideAnimator?
     private var workspaceSwitchApplyGeneration = 0
     private var windowDiscoveryReconcileGeneration = 0
     private var managedWindowCache: (windows: [ManagedWindow], createdAt: Date)?
     private let interactiveWindowCacheDuration: TimeInterval = 0.80
     private let defaultWindowCacheDuration: TimeInterval = 0.12
     private let workspaceSwitchApplyDelay: TimeInterval = 0.045
+    private let workspaceSlideAnimationDuration: TimeInterval = 0.18
+    private let maximumAnimatedWorkspaceTransitionWindows = 8
+    private let defaultWorkspaceSlideFrameRate = 60
     private let windowDiscoveryReconcileOffsets: [TimeInterval] = [0, 0.10, 0.28, 0.70, 1.50]
     private let accessibilityMessagingTimeout: Float = 0.15
     private let accessibilityPermissionCacheDuration: TimeInterval = 0.50
@@ -732,6 +840,7 @@ final class WindowTiler {
         pendingSystemUISettle = nil
         pendingWorkspaceSwitchApply?.cancel()
         pendingWorkspaceSwitchApply = nil
+        cancelPendingWorkspaceSlideAnimation(finalize: false)
         workspaceSwitchApplyGeneration += 1
         windowDiscoveryReconcileGeneration += 1
         managedWindowCache = nil
@@ -1225,6 +1334,10 @@ final class WindowTiler {
         guard !isStopping else { return }
         guard hasAccessibilityPermission(prompt: false) else { return }
         guard tilingEnabled else { return }
+        guard workspaceSlideAnimator == nil else {
+            scheduleReconcile(delay: workspaceSlideAnimationDuration + 0.05)
+            return
+        }
         guard !shouldPauseLayoutForSystemUI() else {
             scheduleReconcile(delay: 0.70)
             return
@@ -1749,7 +1862,8 @@ final class WindowTiler {
         }
         switchVirtualWorkspaceFast(
             to: wrappedWorkspaceIndex(context.activeWorkspaceIndex + delta),
-            context: context
+            context: context,
+            directionHint: delta
         )
     }
     private func switchVirtualWorkspace(to index: Int) {
@@ -1759,13 +1873,18 @@ final class WindowTiler {
         }
         switchVirtualWorkspaceFast(to: index, context: context)
     }
-    private func switchVirtualWorkspaceFast(to requestedIndex: Int, context: WorkspaceContext) {
+    private func switchVirtualWorkspaceFast(
+        to requestedIndex: Int,
+        context: WorkspaceContext,
+        directionHint: Int? = nil
+    ) {
         guard let targetIndex = availableWorkspaceIndex(requestedIndex) else {
             NSSound.beep()
             return
         }
         let currentIndex = activeWorkspaceIndex(forNativeStateKey: context.nativeStateKey)
         guard targetIndex != currentIndex else { return }
+        cancelPendingWorkspaceSwitchApply()
         let visibleIndex = lastAppliedWorkspaceIndexByNativeStateKey[context.nativeStateKey] ?? currentIndex
         setActiveWorkspaceIndex(targetIndex, forNativeStateKey: context.nativeStateKey)
         let activeScreen = ScreenInfo(
@@ -1783,21 +1902,36 @@ final class WindowTiler {
             workspaceIndex: targetIndex,
             displayID: context.screen.displayID
         )
-        cancelPendingWorkspaceSwitchApply()
         suppressExternalChanges(for: 0.20)
         guard targetIndex != visibleIndex else { return }
         let generation = workspaceSwitchApplyGeneration
+        let slideDirection = workspaceSlideDirection(
+            from: visibleIndex,
+            to: targetIndex,
+            directionHint: directionHint
+        )
         let workItem = DispatchWorkItem { [weak self] in
             self?.finishWorkspaceSwitchApply(
                 nativeStateKey: context.nativeStateKey,
                 displayID: context.screen.displayID,
                 visibleIndex: visibleIndex,
                 targetIndex: targetIndex,
+                slideDirection: slideDirection,
                 generation: generation
             )
         }
         pendingWorkspaceSwitchApply = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + workspaceSwitchApplyDelay, execute: workItem)
+    }
+    private func workspaceSlideDirection(
+        from visibleIndex: Int,
+        to targetIndex: Int,
+        directionHint: Int?
+    ) -> WorkspaceSlideDirection {
+        if let directionHint, directionHint != 0 {
+            return directionHint > 0 ? .forward : .backward
+        }
+        return targetIndex > visibleIndex ? .forward : .backward
     }
     private func workspaceSwitchContextFast() -> WorkspaceContext? {
         if let lastKnownFocusedWindowID,
@@ -1828,11 +1962,220 @@ final class WindowTiler {
             return context
         }
     }
+    private func completeWorkspaceSwitchApply(
+        allWindows: [ManagedWindow],
+        nativeStateKey: String,
+        targetStateKey: String,
+        targetIndex: Int,
+        stateKeys: Set<String>
+    ) {
+        suppressExternalChanges(for: 0.45)
+        applyLayout(to: allWindows, limitingToStateKeys: stateKeys)
+        lastAppliedWorkspaceIndexByNativeStateKey[nativeStateKey] = targetIndex
+        if let targetState = screenStates[targetStateKey],
+           let targetID = targetState.lastFocusedOrLargestID,
+           let targetWindow = allWindows.first(where: { $0.id == targetID }) {
+            focus(window: targetWindow, updateTreeFocus: true)
+        }
+        scheduleReconcile(delay: 0.18)
+    }
+    private func animateWorkspaceSwitchIfPossible(
+        allWindows: [ManagedWindow],
+        nativeStateKey: String,
+        visibleStateKey: String,
+        targetStateKey: String,
+        direction: WorkspaceSlideDirection,
+        generation: Int,
+        completion: @escaping () -> Void
+    ) -> Bool {
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return false }
+        guard workspaceSlideAnimator == nil else { return false }
+        guard let screen = currentScreenInfos().first(where: { $0.nativeStateKey == nativeStateKey }) else {
+            return false
+        }
+        let transitions = workspaceSlideTransitions(
+            allWindows: allWindows,
+            screen: screen,
+            visibleStateKey: visibleStateKey,
+            targetStateKey: targetStateKey,
+            direction: direction
+        )
+        guard !transitions.isEmpty,
+              transitions.count <= maximumAnimatedWorkspaceTransitionWindows else {
+            return false
+        }
+        suppressExternalChanges(for: workspaceSlideAnimationDuration + 0.55)
+        applyWorkspaceSlideInitialFrames(transitions)
+        let animator = WorkspaceSlideAnimator(
+            duration: workspaceSlideAnimationDuration,
+            frameRate: workspaceSlideFrameRate(for: screen),
+            screen: nsScreen(for: screen),
+            shouldContinue: { [weak self] in
+                guard let self else { return false }
+                return !self.isStopping && self.workspaceSwitchApplyGeneration == generation
+            },
+            onFrame: { [weak self] progress in
+                guard let self else { return }
+                self.applyWorkspaceSlideStep(transitions, progress: progress)
+            },
+            onFinish: { [weak self] in
+                self?.workspaceSlideAnimator = nil
+                completion()
+            }
+        )
+        workspaceSlideAnimator = animator
+        animator.start()
+        return true
+    }
+    private func workspaceSlideFrameRate(for screen: ScreenInfo) -> Int {
+        max(
+            nsScreen(for: screen)?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? defaultWorkspaceSlideFrameRate,
+            defaultWorkspaceSlideFrameRate
+        )
+    }
+    private func nsScreen(for screen: ScreenInfo) -> NSScreen? {
+        if let displayID = screen.displayID,
+           let matchingScreen = NSScreen.screens.first(where: { $0.displayID == displayID }) {
+            return matchingScreen
+        }
+        return NSScreen.screens.first { ScreenInfo.displayKey(for: $0.displayID, frame: $0.frame) == screen.key }
+    }
+    private func workspaceSlideTransitions(
+        allWindows: [ManagedWindow],
+        screen: ScreenInfo,
+        visibleStateKey: String,
+        targetStateKey: String,
+        direction: WorkspaceSlideDirection
+    ) -> [WorkspaceSlideTransition] {
+        let windowsByID = Dictionary(allWindows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let screens = currentScreenInfos()
+        var transitions: [WorkspaceSlideTransition] = []
+        if let visibleState = screenStates[visibleStateKey], !visibleState.isEmpty {
+            guard visibleState.windowIDs.allSatisfy({ windowsByID[$0] != nil || floatingWindowIDs.contains($0) }) else {
+                return []
+            }
+            for id in visibleState.windowIDs {
+                guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { continue }
+                let startFrame = sanitizedFrame(window.frame)
+                let endFrame = slideHiddenFrame(
+                    matching: startFrame,
+                    on: screen,
+                    edge: direction == .forward ? .left : .right
+                )
+                guard slideHiddenFrameDoesNotCoverAnotherScreen(endFrame, source: screen, screens: screens) else {
+                    return []
+                }
+                transitions.append(WorkspaceSlideTransition(
+                    window: window,
+                    startFrame: startFrame,
+                    endFrame: endFrame,
+                    needsInitialFrame: false
+                ))
+            }
+        }
+        if let targetState = screenStates[targetStateKey], !targetState.isEmpty {
+            guard targetState.windowIDs.allSatisfy({ windowsByID[$0] != nil || floatingWindowIDs.contains($0) }) else {
+                return []
+            }
+            for (id, slot) in targetState.slotList {
+                guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { continue }
+                let endFrame = sanitizedFrame(slot.frame(in: screen.frame, gap: CGFloat(gapPixels), smartOuterGap: true))
+                let startFrame = slideHiddenFrame(
+                    matching: endFrame,
+                    on: screen,
+                    edge: direction == .forward ? .right : .left
+                )
+                guard slideHiddenFrameDoesNotCoverAnotherScreen(startFrame, source: screen, screens: screens) else {
+                    return []
+                }
+                transitions.append(WorkspaceSlideTransition(
+                    window: window,
+                    startFrame: startFrame,
+                    endFrame: endFrame,
+                    needsInitialFrame: true
+                ))
+            }
+        }
+        return transitions
+    }
+    private func slideHiddenFrameDoesNotCoverAnotherScreen(
+        _ frame: CGRect,
+        source: ScreenInfo,
+        screens: [ScreenInfo]
+    ) -> Bool {
+        !screens.contains { screen in
+            screen.key != source.key && screen.frame.intersects(frame)
+        }
+    }
+    private func slideHiddenFrame(
+        matching frame: CGRect,
+        on screen: ScreenInfo,
+        edge: WorkspaceSlideEdge
+    ) -> CGRect {
+        let x: CGFloat
+        switch edge {
+        case .left:
+            x = screen.frame.minX - frame.width + 1
+        case .right:
+            x = screen.frame.maxX - 1
+        }
+        return sanitizedFrame(CGRect(
+            x: x,
+            y: frame.minY,
+            width: frame.width,
+            height: frame.height
+        ))
+    }
+    private func applyWorkspaceSlideInitialFrames(_ transitions: [WorkspaceSlideTransition]) {
+        let initialTransitions = transitions.filter(\.needsInitialFrame)
+        guard !initialTransitions.isEmpty else { return }
+        isApplyingLayout = true
+        var appliedFramesByID: [WindowIdentity: CGRect] = [:]
+        defer {
+            isApplyingLayout = false
+            updateManagedWindowCache(withAppliedFrames: appliedFramesByID)
+        }
+        for transition in initialTransitions {
+            applyFrame(transition.startFrame, to: transition.window.element)
+            lastAppliedFrameByWindowID[transition.window.id] = transition.startFrame
+            appliedFramesByID[transition.window.id] = transition.startFrame
+        }
+    }
+    private func applyWorkspaceSlideStep(_ transitions: [WorkspaceSlideTransition], progress: CGFloat) {
+        guard !transitions.isEmpty else { return }
+        isApplyingLayout = true
+        var appliedFramesByID: [WindowIdentity: CGRect] = [:]
+        defer {
+            isApplyingLayout = false
+            updateManagedWindowCache(withAppliedFrames: appliedFramesByID)
+            suppressExternalChanges(for: 0.45)
+        }
+        let easedProgress = easedWorkspaceSlideProgress(progress)
+        for transition in transitions {
+            let frame = interpolatedFrame(from: transition.startFrame, to: transition.endFrame, progress: easedProgress)
+            applyPosition(frame.origin, to: transition.window.element)
+            lastAppliedFrameByWindowID[transition.window.id] = frame
+            appliedFramesByID[transition.window.id] = frame
+        }
+    }
+    private func easedWorkspaceSlideProgress(_ progress: CGFloat) -> CGFloat {
+        let progress = min(max(progress, 0), 1)
+        return progress * progress * (3 - 2 * progress)
+    }
+    private func interpolatedFrame(from start: CGRect, to end: CGRect, progress: CGFloat) -> CGRect {
+        sanitizedFrame(CGRect(
+            x: start.minX + ((end.minX - start.minX) * progress),
+            y: start.minY + ((end.minY - start.minY) * progress),
+            width: start.width + ((end.width - start.width) * progress),
+            height: start.height + ((end.height - start.height) * progress)
+        ))
+    }
     private func finishWorkspaceSwitchApply(
         nativeStateKey: String,
         displayID: CGDirectDisplayID?,
         visibleIndex: Int,
         targetIndex: Int,
+        slideDirection: WorkspaceSlideDirection,
         generation: Int
     ) {
         guard !isStopping, workspaceSwitchApplyGeneration == generation else { return }
@@ -1847,14 +2190,27 @@ final class WindowTiler {
         let visibleStateKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: visibleIndex)
         let targetStateKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: targetIndex)
         suppressExternalChanges(for: 0.45)
-        applyLayout(to: allWindows, limitingToStateKeys: [visibleStateKey, targetStateKey])
-        lastAppliedWorkspaceIndexByNativeStateKey[nativeStateKey] = targetIndex
-        if let targetState = screenStates[targetStateKey],
-           let targetID = targetState.lastFocusedOrLargestID,
-           let targetWindow = allWindows.first(where: { $0.id == targetID }) {
-            focus(window: targetWindow, updateTreeFocus: true)
+        let completion: () -> Void = { [weak self] in
+            self?.completeWorkspaceSwitchApply(
+                allWindows: allWindows,
+                nativeStateKey: nativeStateKey,
+                targetStateKey: targetStateKey,
+                targetIndex: targetIndex,
+                stateKeys: [visibleStateKey, targetStateKey]
+            )
         }
-        scheduleReconcile(delay: 0.18)
+        guard animateWorkspaceSwitchIfPossible(
+            allWindows: allWindows,
+            nativeStateKey: nativeStateKey,
+            visibleStateKey: visibleStateKey,
+            targetStateKey: targetStateKey,
+            direction: slideDirection,
+            generation: generation,
+            completion: completion
+        ) else {
+            completion()
+            return
+        }
     }
     private func createVirtualWorkspace() {
         cancelPendingWorkspaceSwitchApply()
@@ -2236,7 +2592,16 @@ final class WindowTiler {
     private func cancelPendingWorkspaceSwitchApply() {
         pendingWorkspaceSwitchApply?.cancel()
         pendingWorkspaceSwitchApply = nil
+        cancelPendingWorkspaceSlideAnimation()
         workspaceSwitchApplyGeneration += 1
+    }
+    private func cancelPendingWorkspaceSlideAnimation(finalize: Bool = true) {
+        if finalize {
+            workspaceSlideAnimator?.finishImmediately()
+        } else {
+            workspaceSlideAnimator?.cancel()
+        }
+        workspaceSlideAnimator = nil
     }
     private func pauseLayoutForSystemUI(duration: TimeInterval, preserveLayout: Bool = true) {
         guard !isStopping else { return }
@@ -3835,6 +4200,14 @@ final class WindowTiler {
         if let sizeValue {
             AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue)
         }
+    }
+    private func applyPosition(_ origin: CGPoint, to window: AXUIElement) {
+        var origin = CGPoint(
+            x: origin.x.rounded(.toNearestOrAwayFromZero),
+            y: origin.y.rounded(.toNearestOrAwayFromZero)
+        )
+        guard let positionValue = AXValueCreate(.cgPoint, &origin) else { return }
+        AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, positionValue)
     }
     private func sanitizedFrame(_ frame: CGRect) -> CGRect {
         CGRect(
