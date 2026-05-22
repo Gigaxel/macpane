@@ -24,7 +24,7 @@ struct WindowMetadataReader {
     func isManageableWindow(
         _ window: AXUIElement,
         app _: NSRunningApplication,
-        frame: CGRect,
+        frame _: CGRect,
         title: String?
     ) -> Bool {
         guard AXReader.string(window, attribute: kAXRoleAttribute) == kAXWindowRole else { return false }
@@ -35,10 +35,6 @@ struct WindowMetadataReader {
         if AXReader.bool(window, attribute: kAXMinimizedAttribute) == true ||
             AXReader.bool(window, attribute: "AXFullScreen") == true ||
             AXReader.bool(window, attribute: "AXModal") == true {
-            return false
-        }
-        if frame.width < TileLayout.minimumWindowFrameSize.width ||
-            frame.height < TileLayout.minimumWindowFrameSize.height {
             return false
         }
         let windowTitle = title ?? ""

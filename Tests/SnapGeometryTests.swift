@@ -44,6 +44,7 @@ struct SnapGeometryTests {
         testWindowStateSyncPlannerDetectsUnchangedWindowSet()
         testWindowStateSyncPlannerDetectsWindowSetChanges()
         testWindowStateSyncPlannerRetainsOffscreenWindows()
+        testWindowLayoutPlannerTilesShrunkenWindow()
         print("SnapGeometryTests passed")
     }
     private static func testSnapGeometry() {
@@ -736,6 +737,52 @@ struct SnapGeometryTests {
         if retained != expected {
             fail("offscreen retention should include floating and non-active state keys, plus frozen state IDs")
         }
+    }
+    private static func testWindowLayoutPlannerTilesShrunkenWindow() {
+        // Regression: windows smaller than TileLayout.minimumWindowFrameSize used to be filtered out
+        // of discovery entirely, so a shrunken Ghostty never received a tile. After the discovery gate
+        // was relaxed, a tiny window must still be promoted to its full slot frame by the layout pass.
+        let screenFrame = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let screen = ScreenInfo(
+            key: "display:1",
+            frame: screenFrame,
+            displayID: nil,
+            workspaceIndex: 0
+        )
+        let id = windowID(1)
+        let tinyFrame = CGRect(x: 1850, y: 100, width: 60, height: 40)
+        if tinyFrame.width >= TileLayout.minimumWindowFrameSize.width ||
+            tinyFrame.height >= TileLayout.minimumWindowFrameSize.height {
+            fail("test setup must use a frame below TileLayout.minimumWindowFrameSize")
+        }
+        let window = ManagedWindow(
+            id: id,
+            windowNumber: nil,
+            element: AXUIElementCreateSystemWide(),
+            screen: screen,
+            layoutIdentity: nil,
+            frame: tinyFrame,
+            bundleIdentifier: nil,
+            title: nil,
+            orderRank: nil,
+            scanIndex: 0
+        )
+        let plan = WindowLayoutPlanner.plan(
+            windows: [window],
+            screenStates: [screen.stateKey: screenState([id], focused: id)],
+            currentScreens: [screen],
+            floatingWindowIDs: [],
+            stateKeyLimit: nil,
+            gapPixels: 0
+        )
+        if plan.assignments.count != 1 {
+            fail("tiny window should produce exactly one tile assignment, got \(plan.assignments.count)")
+        }
+        let assignment = plan.assignments[0]
+        if assignment.window.id != id {
+            fail("expected assignment for the tiny window, got a different id")
+        }
+        expectEqual(assignment.frame, screenFrame, "tiny window must be resized to its full slot frame instead of keeping its shrunken size")
     }
     private static func windowSignature(pid: pid_t, title: String, stateKey: String = "display-a") -> WindowSignature {
         WindowSignature(
