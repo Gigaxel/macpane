@@ -1,3 +1,4 @@
+import ApplicationServices
 import CoreGraphics
 import Foundation
 @main
@@ -38,6 +39,11 @@ struct SnapGeometryTests {
         testWindowLayoutIdentityMatchesStrongComponentWhenTitleChanges()
         testWindowLayoutIdentityRejectsDuplicateWeakMatches()
         testWindowLayoutIdentityRejectsWeakMatchWhenStrongComponentConflicts()
+        testWorkspaceStateMigratorMovesNativeDisplayState()
+        testWorkspaceStateMigratorMigratesLegacyDisplayState()
+        testWindowStateSyncPlannerDetectsUnchangedWindowSet()
+        testWindowStateSyncPlannerDetectsWindowSetChanges()
+        testWindowStateSyncPlannerRetainsOffscreenWindows()
         print("SnapGeometryTests passed")
     }
     private static func testSnapGeometry() {
@@ -594,6 +600,143 @@ struct SnapGeometryTests {
             fail("layout identity should not fall back to matching weak titles after stable documents conflict")
         }
     }
+    private static func testWorkspaceStateMigratorMovesNativeDisplayState() {
+        let first = windowID(1)
+        let second = windowID(2)
+        let floating = windowID(3)
+        let sourceZero = ScreenInfo.workspaceStateKey(nativeStateKey: "display-old", workspaceIndex: 0)
+        let sourceOne = ScreenInfo.workspaceStateKey(nativeStateKey: "display-old", workspaceIndex: 1)
+        let targetZero = ScreenInfo.workspaceStateKey(nativeStateKey: "display-new", workspaceIndex: 0)
+        let targetOne = ScreenInfo.workspaceStateKey(nativeStateKey: "display-new", workspaceIndex: 1)
+        var screenStates = [sourceZero: screenState([first, second], focused: second)]
+        var persistedLayouts = [sourceZero: persistedLayout(stateKey: sourceZero)]
+        var floatingStateKeys = [floating: sourceOne]
+        var focusedWorkspaceIndex: Int?
+
+        let migrated = WorkspaceStateMigrator.migrateNativeWorkspaceStates(
+            fromNativeStateKey: "display-old",
+            toNativeStateKey: "display-new",
+            workspaceCount: 2,
+            focusedID: second,
+            screenStates: &screenStates,
+            persistedLayoutsByStateKey: &persistedLayouts,
+            floatingWindowStateKeys: &floatingStateKeys,
+            focusedWorkspaceIndex: &focusedWorkspaceIndex
+        )
+
+        guard migrated else {
+            fail("native workspace migration should report moved state")
+        }
+        guard focusedWorkspaceIndex == 0 else {
+            fail("focused window should carry its workspace index to settings migration")
+        }
+        guard screenStates[sourceZero] == nil,
+              screenStates[targetZero]?.windowIDs == Set([first, second]),
+              screenStates[targetZero]?.focusedWindowID == second else {
+            fail("screen state should move to the matching target workspace")
+        }
+        guard persistedLayouts[sourceZero] == nil,
+              persistedLayouts[targetZero]?.stateKey == targetZero,
+              persistedLayouts[targetZero]?.displayKey == "display-new" else {
+            fail("persisted layout should move to the matching target workspace")
+        }
+        guard floatingStateKeys[floating] == targetOne else {
+            fail("floating window state should move to the matching target workspace")
+        }
+    }
+    private static func testWorkspaceStateMigratorMigratesLegacyDisplayState() {
+        let id = windowID(4)
+        let legacyKey = "display-a"
+        let targetKey = ScreenInfo.workspaceStateKey(nativeStateKey: legacyKey, workspaceIndex: 0)
+        var screenStates = [legacyKey: screenState([id], focused: id)]
+        var persistedLayouts = [legacyKey: persistedLayout(stateKey: legacyKey)]
+        var floatingStateKeys: [WindowIdentity: String] = [:]
+
+        let migrated = WorkspaceStateMigrator.migrateStates(
+            toNativeStateKey: legacyKey,
+            workspaceCount: 1,
+            screenStates: &screenStates,
+            persistedLayoutsByStateKey: &persistedLayouts,
+            floatingWindowStateKeys: &floatingStateKeys
+        )
+
+        guard migrated else {
+            fail("legacy display-key migration should report moved state")
+        }
+        guard screenStates[legacyKey] == nil,
+              screenStates[targetKey]?.windowIDs == [id],
+              screenStates[targetKey]?.focusedWindowID == id else {
+            fail("legacy screen state should move into workspace zero")
+        }
+        guard persistedLayouts[legacyKey] == nil,
+              persistedLayouts[targetKey]?.stateKey == targetKey else {
+            fail("legacy persisted layout should move into workspace zero")
+        }
+    }
+    private static func testWindowStateSyncPlannerDetectsUnchangedWindowSet() {
+        let key = ScreenInfo.workspaceStateKey(nativeStateKey: "display-a", workspaceIndex: 0)
+        let screen = ScreenInfo(
+            key: "display-a",
+            frame: CGRect(x: 0, y: 0, width: 100, height: 100),
+            displayID: nil,
+            workspaceIndex: 0
+        )
+        let first = windowID(10)
+        let windows = [testManagedWindow(id: first, screen: screen)]
+        let screenStates = [key: screenState([first], focused: first)]
+        let changed = WindowStateSyncPlanner.hasWindowSetChanged(
+            windows: windows,
+            activeStateKeys: [key],
+            screenStates: screenStates
+        )
+        if changed {
+            fail("identical window sets should not be considered changed")
+        }
+    }
+    private static func testWindowStateSyncPlannerDetectsWindowSetChanges() {
+        let key = ScreenInfo.workspaceStateKey(nativeStateKey: "display-a", workspaceIndex: 0)
+        let screen = ScreenInfo(
+            key: "display-a",
+            frame: CGRect(x: 0, y: 0, width: 100, height: 100),
+            displayID: nil,
+            workspaceIndex: 0
+        )
+        let first = windowID(10)
+        let second = windowID(11)
+        let windows = [testManagedWindow(id: first, screen: screen)]
+        let screenStates = [key: screenState([second], focused: second)]
+        let changed = WindowStateSyncPlanner.hasWindowSetChanged(
+            windows: windows,
+            activeStateKeys: [key],
+            screenStates: screenStates
+        )
+        if !changed {
+            fail("different window IDs should be considered a window-set change")
+        }
+    }
+    private static func testWindowStateSyncPlannerRetainsOffscreenWindows() {
+        let activeKey = ScreenInfo.workspaceStateKey(nativeStateKey: "display-a", workspaceIndex: 0)
+        let inactiveKey = ScreenInfo.workspaceStateKey(nativeStateKey: "display-a", workspaceIndex: 1)
+        let frozenKey = ScreenInfo.workspaceStateKey(nativeStateKey: "display-b", workspaceIndex: 0)
+        let activeID = windowID(1)
+        let inactiveID = windowID(2)
+        let frozenID = windowID(3)
+        let floatingID = windowID(4)
+
+        let retained = WindowStateSyncPlanner.retainedOffscreenWindowIDs(
+            activeStateKeys: [activeKey],
+            frozenSystemUIScreenStates: [frozenKey: screenState([frozenID], focused: frozenID)],
+            screenStates: [
+                activeKey: screenState([activeID], focused: activeID),
+                inactiveKey: screenState([inactiveID], focused: inactiveID)
+            ],
+            floatingWindowIDs: [floatingID]
+        )
+        let expected = Set([inactiveID, frozenID, floatingID])
+        if retained != expected {
+            fail("offscreen retention should include floating and non-active state keys, plus frozen state IDs")
+        }
+    }
     private static func windowSignature(pid: pid_t, title: String, stateKey: String = "display-a") -> WindowSignature {
         WindowSignature(
             pid: pid,
@@ -602,6 +745,53 @@ struct SnapGeometryTests {
             axIdentifier: nil,
             document: nil,
             title: title
+        )
+    }
+    private static func windowID(_ serial: Int, pid: pid_t = 42) -> WindowIdentity {
+        WindowIdentity(pid: pid, serial: serial)
+    }
+    private static func testManagedWindow(id: WindowIdentity, screen: ScreenInfo) -> ManagedWindow {
+        ManagedWindow(
+            id: id,
+            windowNumber: nil,
+            element: AXUIElementCreateSystemWide(),
+            screen: screen,
+            layoutIdentity: nil,
+            frame: screen.frame,
+            bundleIdentifier: nil,
+            title: nil,
+            orderRank: nil,
+            scanIndex: 0
+        )
+    }
+    private static func screenState(_ ids: [WindowIdentity], focused: WindowIdentity? = nil) -> ScreenTileState {
+        var tree = BSPTree<WindowIdentity>()
+        var target: WindowIdentity?
+        for id in ids {
+            tree.insert(id, near: target)
+            target = id
+        }
+        return ScreenTileState(tree: tree, lastFocusedID: focused)
+    }
+    private static func persistedLayout(stateKey: String) -> PersistedScreenLayout {
+        var tree = BSPTree<Int>()
+        tree.insert(1, near: nil)
+        return PersistedScreenLayout(
+            stateKey: stateKey,
+            displayKey: WorkspaceStateKeys.displayKeyComponent(of: stateKey),
+            tree: tree,
+            entriesByID: [
+                1: PersistedWindowLayoutEntry(
+                    id: 1,
+                    pid: 42,
+                    bundleIdentifier: nil,
+                    layoutIdentity: nil,
+                    orderRank: nil,
+                    scanIndex: 0
+                )
+            ],
+            lastFocusedEntryID: 1,
+            lastUpdated: Date(timeIntervalSince1970: 1)
         )
     }
     private static func layoutIdentity(

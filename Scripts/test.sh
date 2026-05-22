@@ -14,6 +14,12 @@ xcrun swiftc \
   "$ROOT_DIR/Sources/MacPane/TilingLayout.swift" \
   "$ROOT_DIR/Sources/MacPane/WindowIdentity.swift" \
   "$ROOT_DIR/Sources/MacPane/WindowLayoutIdentity.swift" \
+  "$ROOT_DIR/Sources/MacPane/ScreenGeometryExtensions.swift" \
+  "$ROOT_DIR/Sources/MacPane/WindowModels.swift" \
+  "$ROOT_DIR/Sources/MacPane/WorkspaceStateKeys.swift" \
+  "$ROOT_DIR/Sources/MacPane/WindowStateSyncPlanner.swift" \
+  "$ROOT_DIR/Sources/MacPane/LayoutRestorePlanner.swift" \
+  "$ROOT_DIR/Sources/MacPane/WorkspaceStateMigrator.swift" \
   "$ROOT_DIR/Tests/SnapGeometryTests.swift" \
   -o "$TEST_BIN"
 "$TEST_BIN"

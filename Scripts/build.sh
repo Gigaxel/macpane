@@ -12,6 +12,7 @@ TARGET_TRIPLE="$(uname -m)-apple-macosx$DEPLOYMENT_TARGET"
 export MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET"
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$MODULE_CACHE_DIR"
+SOURCES=("$ROOT_DIR"/Sources/MacPane/*.swift)
 xcrun swiftc \
   -O \
   -whole-module-optimization \
@@ -21,11 +22,7 @@ xcrun swiftc \
   -framework AppKit \
   -framework ApplicationServices \
   -framework Carbon \
-  "$ROOT_DIR/Sources/MacPane/SnapGeometry.swift" \
-  "$ROOT_DIR/Sources/MacPane/TilingLayout.swift" \
-  "$ROOT_DIR/Sources/MacPane/WindowIdentity.swift" \
-  "$ROOT_DIR/Sources/MacPane/WindowLayoutIdentity.swift" \
-  "$ROOT_DIR/Sources/MacPane/main.swift" \
+  "${SOURCES[@]}" \
   -o "$MACOS_DIR/MacPane"
 cp "$ROOT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"
 cp "$ROOT_DIR/Assets/MacPaneIcon.png" "$RESOURCES_DIR/MacPaneIcon.png"
