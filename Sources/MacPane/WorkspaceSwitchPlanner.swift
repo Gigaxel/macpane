@@ -54,7 +54,8 @@ enum WorkspaceSwitchPlanner {
     static func applyPlan(
         nativeStateKey: String,
         visibleIndex: Int,
-        targetIndex: Int
+        targetIndex: Int,
+        additionalWorkspaceIndices: Set<Int> = []
     ) -> WorkspaceSwitchApplyPlan {
         let visibleStateKey = ScreenInfo.workspaceStateKey(
             nativeStateKey: nativeStateKey,
@@ -64,12 +65,15 @@ enum WorkspaceSwitchPlanner {
             nativeStateKey: nativeStateKey,
             workspaceIndex: targetIndex
         )
+        let additionalStateKeys = Set(additionalWorkspaceIndices.map {
+            ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: $0)
+        })
         return WorkspaceSwitchApplyPlan(
             nativeStateKey: nativeStateKey,
             visibleStateKey: visibleStateKey,
             targetStateKey: targetStateKey,
             targetIndex: targetIndex,
-            stateKeys: [visibleStateKey, targetStateKey]
+            stateKeys: additionalStateKeys.union([visibleStateKey, targetStateKey])
         )
     }
 }

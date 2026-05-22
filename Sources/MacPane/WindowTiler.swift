@@ -22,7 +22,7 @@ final class WindowTiler {
     private var pendingResize: DispatchWorkItem?
     private var pendingSystemUISettle: DispatchWorkItem?
     private var pendingWorkspaceSwitchApply: DispatchWorkItem?
-    private var workspaceSlideAnimator: WorkspaceSlideAnimator?
+    private var activeSlideChain: SlideChain?
     private var workspaceSwitchApplyGeneration = 0
     private var windowDiscoveryReconcileGeneration = 0
     private var managedWindowCache: (windows: [ManagedWindow], createdAt: Date)?
@@ -30,6 +30,7 @@ final class WindowTiler {
     private let defaultWindowCacheDuration: TimeInterval = 0.12
     private let workspaceSwitchApplyDelay: TimeInterval = 0.045
     private let workspaceSlideAnimationDuration: TimeInterval = 0.18
+    private let workspaceSlideChainedDuration: TimeInterval = 0.14
     private let windowDiscoveryReconcileOffsets: [TimeInterval] = [0, 0.10, 0.28, 0.70, 1.50]
     private let accessibilityMessagingTimeout: Float = 0.15
     private let accessibilityPermissionCacheDuration: TimeInterval = 0.50
@@ -667,7 +668,7 @@ final class WindowTiler {
             scheduleReconcile(delay: workspaceSwitchApplyDelay + workspaceSlideAnimationDuration + 0.05)
             return
         }
-        guard workspaceSlideAnimator == nil else {
+        guard activeSlideChain == nil else {
             scheduleReconcile(delay: workspaceSlideAnimationDuration + 0.05)
             return
         }
@@ -1101,14 +1102,50 @@ final class WindowTiler {
             context: context,
             directionHint: directionHint
         )
-        guard case .planned(let plan) = planningResult else {
+        guard case .planned(var plan) = planningResult else {
             if case .unavailable = planningResult {
                 NSSound.beep()
             }
             return
         }
 
-        cancelPendingWorkspaceSwitchApply()
+        // Hot path: a slide is already animating on this screen. Splice the new target
+        // onto the in-flight animation so motion stays continuous and we skip the
+        // 45 ms apply-delay entirely. Works even when the new target equals the original
+        // visible workspace (direction reversal), because the reseat helper resolves the
+        // direction itself from chain.targetIndex -> newTargetIndex.
+        if let chain = activeSlideChain,
+           chain.nativeStateKey == context.nativeStateKey {
+            if reseatActiveSlideChain(toTargetIndex: plan.targetIndex, directionHint: directionHint) {
+                pendingReconcile?.cancel()
+                pendingReconcile = nil
+                settings.setActiveWorkspaceIndex(plan.targetIndex, forNativeStateKey: context.nativeStateKey)
+                lastWorkspaceSwitchContext = plan.activeContext
+                pendingWorkspaceSwitchIndicator = plan.indicator
+                return
+            }
+
+            let finalizedVisibleIndex = chain.targetIndex
+            cancelPendingWorkspaceSwitchApply()
+            let currentIndex = settings.activeWorkspaceIndex(forNativeStateKey: context.nativeStateKey)
+            let replanningResult = WorkspaceSwitchPlanner.switchPlan(
+                targetIndex: plan.targetIndex,
+                currentIndex: currentIndex,
+                visibleIndex: finalizedVisibleIndex,
+                context: context.withActiveWorkspaceIndex(currentIndex),
+                directionHint: directionHint
+            )
+            guard case .planned(let replannedPlan) = replanningResult else {
+                if case .unavailable = replanningResult {
+                    NSSound.beep()
+                }
+                return
+            }
+            plan = replannedPlan
+        } else {
+            cancelPendingWorkspaceSwitchApply()
+        }
+
         pendingReconcile?.cancel()
         pendingReconcile = nil
         settings.setActiveWorkspaceIndex(plan.targetIndex, forNativeStateKey: context.nativeStateKey)
@@ -1128,6 +1165,9 @@ final class WindowTiler {
             )
         }
         pendingWorkspaceSwitchApply = workItem
+        // The 45 ms delay only matters for the cold first press (it lets Mission Control
+        // settle — see commit b686597). Chained presses go through the reseat path above
+        // and never hit this branch.
         DispatchQueue.main.asyncAfter(deadline: .now() + workspaceSwitchApplyDelay, execute: workItem)
     }
     private func workspaceSwitchContextFast() -> WorkspaceContext? {
@@ -1173,17 +1213,18 @@ final class WindowTiler {
     private func animateWorkspaceSwitchIfPossible(
         allWindows: [ManagedWindow],
         nativeStateKey: String,
-        visibleStateKey: String,
-        targetStateKey: String,
+        visibleIndex: Int,
+        targetIndex: Int,
         direction: WorkspaceSlideDirection,
-        generation: Int,
-        completion: @escaping () -> Void
+        generation: Int
     ) -> Bool {
         guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return false }
-        guard workspaceSlideAnimator == nil else { return false }
+        guard activeSlideChain == nil else { return false }
         guard let screen = currentScreenInfos().first(where: { $0.nativeStateKey == nativeStateKey }) else {
             return false
         }
+        let visibleStateKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: visibleIndex)
+        let targetStateKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: targetIndex)
         let transitions = WorkspaceSlidePlanner.transitions(
             allWindows: allWindows,
             screen: screen,
@@ -1198,63 +1239,155 @@ final class WindowTiler {
               transitions.count <= WorkspaceSlidePlanner.maximumTransitionCount else {
             return false
         }
+        let chain = SlideChain(
+            nativeStateKey: nativeStateKey,
+            screen: screen,
+            visibleIndex: visibleIndex,
+            targetIndex: targetIndex,
+            direction: direction,
+            transitions: transitions,
+            generation: generation
+        )
+        activeSlideChain = chain
         suppressExternalChanges(for: workspaceSlideAnimationDuration + 0.55)
+        isApplyingLayout = true
         applyWorkspaceSlideInitialFrames(transitions)
+        prestampEndFrames(for: transitions)
         let animator = WorkspaceSlideAnimator(
             duration: workspaceSlideAnimationDuration,
             frameRate: WorkspaceSlidePlanner.frameRate(for: screen),
             screen: WorkspaceSlidePlanner.nsScreen(for: screen),
-            shouldContinue: { [weak self] in
-                guard let self else { return false }
-                return !self.isStopping && self.workspaceSwitchApplyGeneration == generation
+            shouldContinue: { [weak self, weak chain] in
+                guard let self, let chain else { return false }
+                return !self.isStopping
+                    && self.activeSlideChain === chain
+                    && self.workspaceSwitchApplyGeneration == chain.generation
             },
-            onFrame: { [weak self] progress in
-                guard let self else { return }
-                self.applyWorkspaceSlideStep(transitions, progress: progress)
+            onFrame: { [weak self, weak chain] progress in
+                guard let self, let chain, self.activeSlideChain === chain else { return }
+                self.applyChainSlideStep(chain: chain, progress: progress)
             },
-            onFinish: { [weak self] in
-                self?.workspaceSlideAnimator = nil
-                completion()
+            onFinish: { [weak self, weak chain] in
+                guard let self, let chain, self.activeSlideChain === chain else { return }
+                self.handleSlideChainFinished(chain: chain)
             }
         )
-        workspaceSlideAnimator = animator
+        chain.animator = animator
         animator.start()
         return true
     }
-    private func applyWorkspaceSlideInitialFrames(_ transitions: [WorkspaceSlideTransition]) {
-        let initialTransitions = transitions.filter(\.needsInitialFrame)
-        guard !initialTransitions.isEmpty else { return }
-        isApplyingLayout = true
-        var appliedFramesByID: [WindowIdentity: CGRect] = [:]
-        defer {
-            isApplyingLayout = false
-            updateManagedWindowCache(withAppliedFrames: appliedFramesByID)
-        }
-        for transition in initialTransitions {
-            WindowFrameApplier.applyFrame(transition.startFrame, to: transition.window.element)
-            lastAppliedFrameByWindowID[transition.window.id] = transition.startFrame
-            appliedFramesByID[transition.window.id] = transition.startFrame
-        }
-    }
-    private func applyWorkspaceSlideStep(_ transitions: [WorkspaceSlideTransition], progress: CGFloat) {
-        guard !transitions.isEmpty else { return }
-        isApplyingLayout = true
-        var appliedFramesByID: [WindowIdentity: CGRect] = [:]
-        defer {
-            isApplyingLayout = false
-            updateManagedWindowCache(withAppliedFrames: appliedFramesByID)
-            suppressExternalChanges(for: 0.45)
-        }
-        for transition in transitions {
-            let frame = WorkspaceSlidePlanner.interpolatedFrame(
+    /// Splices a new switch onto the in-flight chain instead of cancel+restart. Returns
+    /// true on success; false means the caller should fall through to the cold path.
+    private func reseatActiveSlideChain(toTargetIndex newTargetIndex: Int, directionHint: Int?) -> Bool {
+        guard let chain = activeSlideChain, let animator = chain.animator else { return false }
+        guard newTargetIndex != chain.targetIndex else { return false }
+        let progress = animator.currentProgress
+        let direction = WorkspaceSlidePlanner.direction(
+            from: chain.targetIndex,
+            to: newTargetIndex,
+            hint: directionHint
+        )
+        var currentOriginsByID: [WindowIdentity: CGPoint] = [:]
+        currentOriginsByID.reserveCapacity(chain.transitions.count)
+        for transition in chain.transitions {
+            let origin = WorkspaceSlidePlanner.interpolatedOrigin(
                 from: transition.startFrame,
                 to: transition.endFrame,
                 progress: progress
             )
-            WindowFrameApplier.applyPosition(frame.origin, to: transition.window.element)
-            lastAppliedFrameByWindowID[transition.window.id] = frame
-            appliedFramesByID[transition.window.id] = frame
+            currentOriginsByID[transition.window.id] = origin
         }
+        let newTargetStateKey = ScreenInfo.workspaceStateKey(
+            nativeStateKey: chain.nativeStateKey,
+            workspaceIndex: newTargetIndex
+        )
+        let allWindows = interactiveManagedWindows()
+        let newTransitions = WorkspaceSlidePlanner.chainedTransitions(
+            previousTransitions: chain.transitions,
+            currentOriginsByID: currentOriginsByID,
+            allWindows: allWindows,
+            screen: chain.screen,
+            newTargetState: screenStates[newTargetStateKey],
+            direction: direction,
+            floatingWindowIDs: floatingWindowIDs,
+            screens: currentScreenInfos(),
+            gapPixels: CGFloat(gapPixels)
+        )
+        guard !newTransitions.isEmpty,
+              newTransitions.count <= WorkspaceSlidePlanner.maximumTransitionCount else {
+            return false
+        }
+        chain.workspaceIndicesToApply.insert(chain.targetIndex)
+        chain.workspaceIndicesToApply.insert(newTargetIndex)
+        chain.visibleIndex = chain.targetIndex
+        chain.targetIndex = newTargetIndex
+        chain.direction = direction
+        chain.transitions = newTransitions
+        suppressExternalChanges(for: workspaceSlideChainedDuration + 0.55)
+        applyWorkspaceSlideInitialFrames(newTransitions)
+        prestampEndFrames(for: newTransitions)
+        animator.reseat(progress: 0, duration: workspaceSlideChainedDuration)
+        return true
+    }
+    private func prestampEndFrames(for transitions: [WorkspaceSlideTransition]) {
+        for transition in transitions {
+            lastAppliedFrameByWindowID[transition.window.id] = transition.endFrame
+        }
+    }
+    private func applyWorkspaceSlideInitialFrames(_ transitions: [WorkspaceSlideTransition]) {
+        let initialTransitions = transitions.filter(\.needsInitialFrame)
+        guard !initialTransitions.isEmpty else { return }
+        let previousIsApplyingLayout = isApplyingLayout
+        isApplyingLayout = true
+        defer { isApplyingLayout = previousIsApplyingLayout }
+        for transition in initialTransitions {
+            WindowFrameApplier.applyFrame(transition.startFrame, to: transition.window.element)
+        }
+    }
+    private func applyChainSlideStep(chain: SlideChain, progress: CGFloat) {
+        let transitions = chain.transitions
+        guard !transitions.isEmpty else { return }
+        // AXUIElementSetAttributeValue must be called from the main thread (per Apple),
+        // so we can't fan out across queues. We still avoid the previous per-frame defer
+        // work (suppressExternalChanges / updateManagedWindowCache) — those are paid
+        // once at chain start/end. With messaging timeouts already at 150 ms and the
+        // typical app responding in <1 ms, eight sequential writes still fit in a 8 ms
+        // 120Hz frame budget.
+        for transition in transitions {
+            let origin = WorkspaceSlidePlanner.interpolatedOrigin(
+                from: transition.startFrame,
+                to: transition.endFrame,
+                progress: progress
+            )
+            WindowFrameApplier.applyPosition(origin, to: transition.window.element)
+        }
+    }
+    private func handleSlideChainFinished(chain: SlideChain) {
+        guard activeSlideChain === chain else { return }
+        activeSlideChain = nil
+        isApplyingLayout = false
+        finalizeWorkspaceSwitch(
+            nativeStateKey: chain.nativeStateKey,
+            visibleIndex: chain.visibleIndex,
+            targetIndex: chain.targetIndex,
+            additionalWorkspaceIndices: chain.workspaceIndicesToApply
+        )
+    }
+    private func finalizeWorkspaceSwitch(
+        nativeStateKey: String,
+        visibleIndex: Int,
+        targetIndex: Int,
+        additionalWorkspaceIndices: Set<Int> = []
+    ) {
+        guard !isStopping, hasAccessibilityPermission(prompt: false), tilingEnabled else { return }
+        let allWindows = interactiveManagedWindows()
+        let applyPlan = WorkspaceSwitchPlanner.applyPlan(
+            nativeStateKey: nativeStateKey,
+            visibleIndex: visibleIndex,
+            targetIndex: targetIndex,
+            additionalWorkspaceIndices: additionalWorkspaceIndices
+        )
+        completeWorkspaceSwitchApply(allWindows: allWindows, plan: applyPlan)
     }
     private func finishWorkspaceSwitchApply(
         nativeStateKey: String,
@@ -1273,30 +1406,22 @@ final class WindowTiler {
         let allWindows = interactiveManagedWindows()
         let focusedID = focusTracker.focusedWindowIDForHotKey(in: allWindows)
         syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
-        let applyPlan = WorkspaceSwitchPlanner.applyPlan(
+        suppressExternalChanges(for: 0.45)
+        if animateWorkspaceSwitchIfPossible(
+            allWindows: allWindows,
+            nativeStateKey: nativeStateKey,
+            visibleIndex: visibleIndex,
+            targetIndex: targetIndex,
+            direction: slideDirection,
+            generation: generation
+        ) {
+            return
+        }
+        finalizeWorkspaceSwitch(
             nativeStateKey: nativeStateKey,
             visibleIndex: visibleIndex,
             targetIndex: targetIndex
         )
-        suppressExternalChanges(for: 0.45)
-        let completion: () -> Void = { [weak self] in
-            self?.completeWorkspaceSwitchApply(
-                allWindows: allWindows,
-                plan: applyPlan
-            )
-        }
-        guard animateWorkspaceSwitchIfPossible(
-            allWindows: allWindows,
-            nativeStateKey: nativeStateKey,
-            visibleStateKey: applyPlan.visibleStateKey,
-            targetStateKey: applyPlan.targetStateKey,
-            direction: slideDirection,
-            generation: generation,
-            completion: completion
-        ) else {
-            completion()
-            return
-        }
     }
     private func createVirtualWorkspace() {
         cancelPendingWorkspaceSwitchApply()
@@ -1625,12 +1750,18 @@ final class WindowTiler {
         workspaceSwitchApplyGeneration += 1
     }
     private func cancelPendingWorkspaceSlideAnimation(finalize: Bool = true) {
+        guard let chain = activeSlideChain else { return }
+        let animator = chain.animator
         if finalize {
-            workspaceSlideAnimator?.finishImmediately()
+            // finishImmediately drives onFrame(1) which writes the final endFrames and then
+            // fires onFinish which we wire to `handleSlideChainFinished`. That clears
+            // `activeSlideChain` and runs the completion that applies the layout properly.
+            animator?.finishImmediately()
         } else {
-            workspaceSlideAnimator?.cancel()
+            animator?.cancel()
+            activeSlideChain = nil
+            isApplyingLayout = false
         }
-        workspaceSlideAnimator = nil
     }
 
     // MARK: - System UI Settling
@@ -2304,5 +2435,37 @@ final class WindowTiler {
         CGEventSource.buttonState(.combinedSessionState, button: .left) ||
             CGEventSource.buttonState(.combinedSessionState, button: .right) ||
             CGEventSource.buttonState(.combinedSessionState, button: .center)
+    }
+}
+
+/// Mutable state for an in-flight workspace slide so it can absorb rapid chained presses
+/// without restarting from rest.
+final class SlideChain {
+    let nativeStateKey: String
+    let screen: ScreenInfo
+    var visibleIndex: Int
+    var targetIndex: Int
+    var direction: WorkspaceSlideDirection
+    var transitions: [WorkspaceSlideTransition]
+    var workspaceIndicesToApply: Set<Int>
+    let generation: Int
+    var animator: WorkspaceSlideAnimator?
+    init(
+        nativeStateKey: String,
+        screen: ScreenInfo,
+        visibleIndex: Int,
+        targetIndex: Int,
+        direction: WorkspaceSlideDirection,
+        transitions: [WorkspaceSlideTransition],
+        generation: Int
+    ) {
+        self.nativeStateKey = nativeStateKey
+        self.screen = screen
+        self.visibleIndex = visibleIndex
+        self.targetIndex = targetIndex
+        self.direction = direction
+        self.transitions = transitions
+        workspaceIndicesToApply = [visibleIndex, targetIndex]
+        self.generation = generation
     }
 }

@@ -45,6 +45,8 @@ struct SnapGeometryTests {
         testWindowStateSyncPlannerDetectsWindowSetChanges()
         testWindowStateSyncPlannerRetainsOffscreenWindows()
         testWindowLayoutPlannerTilesShrunkenWindow()
+        testChainedSlideSkipsAlreadyHiddenNonTargetWindows()
+        testWorkspaceSwitchApplyPlanIncludesAdditionalChainedStates()
         print("SnapGeometryTests passed")
     }
     private static func testSnapGeometry() {
@@ -54,6 +56,67 @@ struct SnapGeometryTests {
         expectEqual(SnapGeometry.targetRect(for: .right, current: full, screen: screen), CGRect(x: 720, y: 25, width: 720, height: 827), "right snap")
         expectEqual(SnapGeometry.targetRect(for: .up, current: full, screen: screen), CGRect(x: 0, y: 25, width: 1440, height: 414), "up snap")
         expectEqual(SnapGeometry.targetRect(for: .down, current: full, screen: screen), CGRect(x: 0, y: 439, width: 1440, height: 414), "down snap")
+    }
+    private static func testChainedSlideSkipsAlreadyHiddenNonTargetWindows() {
+        let screen = ScreenInfo(
+            key: "display:test",
+            frame: CGRect(x: 0, y: 0, width: 1000, height: 800),
+            displayID: nil,
+            workspaceIndex: 0
+        )
+        let hiddenLeftFrame = CGRect(x: -199, y: 100, width: 200, height: 300)
+        let oldWorkspaceWindow = testManagedWindow(
+            serial: 1,
+            frame: hiddenLeftFrame,
+            screen: screen
+        )
+        let targetWindow = testManagedWindow(
+            serial: 2,
+            frame: CGRect(x: 1000, y: 100, width: 200, height: 300),
+            screen: screen
+        )
+        var targetTree = BSPTree<WindowIdentity>()
+        targetTree.insert(targetWindow.id, near: nil)
+        let transitions = WorkspaceSlidePlanner.chainedTransitions(
+            previousTransitions: [
+                WorkspaceSlideTransition(
+                    window: oldWorkspaceWindow,
+                    startFrame: CGRect(x: 20, y: 100, width: 200, height: 300),
+                    endFrame: hiddenLeftFrame,
+                    needsInitialFrame: false
+                )
+            ],
+            currentOriginsByID: [oldWorkspaceWindow.id: hiddenLeftFrame.origin],
+            allWindows: [oldWorkspaceWindow, targetWindow],
+            screen: screen,
+            newTargetState: ScreenTileState(tree: targetTree),
+            direction: .backward,
+            floatingWindowIDs: [],
+            screens: [screen],
+            gapPixels: 0
+        )
+        guard !transitions.contains(where: { $0.window.id == oldWorkspaceWindow.id }) else {
+            fail("already-hidden non-target window should stay hidden instead of crossing the screen")
+        }
+        guard transitions.count == 1, transitions.first?.window.id == targetWindow.id else {
+            fail("expected only the new target window to animate, got \(transitions.count) transitions")
+        }
+    }
+    private static func testWorkspaceSwitchApplyPlanIncludesAdditionalChainedStates() {
+        let plan = WorkspaceSwitchPlanner.applyPlan(
+            nativeStateKey: "display:test",
+            visibleIndex: 1,
+            targetIndex: 2,
+            additionalWorkspaceIndices: [0]
+        )
+        let expectedStateKeys: Set<String> = [
+            "display:test:workspace:0",
+            "display:test:workspace:1",
+            "display:test:workspace:2"
+        ]
+        guard plan.stateKeys == expectedStateKeys else {
+            fail("chained workspace apply plan should include every participated state key, got \(plan.stateKeys)")
+        }
     }
     private static func testTreeInsertionSplitsFocusedTile() {
         var tree = BSPTree<String>()
@@ -797,19 +860,27 @@ struct SnapGeometryTests {
     private static func windowID(_ serial: Int, pid: pid_t = 42) -> WindowIdentity {
         WindowIdentity(pid: pid, serial: serial)
     }
-    private static func testManagedWindow(id: WindowIdentity, screen: ScreenInfo) -> ManagedWindow {
+    private static func testManagedWindow(
+        id: WindowIdentity,
+        screen: ScreenInfo,
+        frame: CGRect? = nil,
+        scanIndex: Int = 0
+    ) -> ManagedWindow {
         ManagedWindow(
             id: id,
             windowNumber: nil,
             element: AXUIElementCreateSystemWide(),
             screen: screen,
             layoutIdentity: nil,
-            frame: screen.frame,
+            frame: frame ?? screen.frame,
             bundleIdentifier: nil,
             title: nil,
             orderRank: nil,
-            scanIndex: 0
+            scanIndex: scanIndex
         )
+    }
+    private static func testManagedWindow(serial: Int, frame: CGRect, screen: ScreenInfo) -> ManagedWindow {
+        testManagedWindow(id: windowID(serial), screen: screen, frame: frame, scanIndex: serial)
     }
     private static func screenState(_ ids: [WindowIdentity], focused: WindowIdentity? = nil) -> ScreenTileState {
         var tree = BSPTree<WindowIdentity>()

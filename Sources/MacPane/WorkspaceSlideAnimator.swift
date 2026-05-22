@@ -2,7 +2,7 @@ import AppKit
 import QuartzCore
 
 final class WorkspaceSlideAnimator: NSObject {
-    private let duration: TimeInterval
+    private var duration: TimeInterval
     private let frameRate: Int
     private let screen: NSScreen?
     private let shouldContinue: () -> Bool
@@ -12,6 +12,7 @@ final class WorkspaceSlideAnimator: NSObject {
     private var timer: Timer?
     private var startTime = CACurrentMediaTime()
     private var didFinish = false
+    private(set) var currentProgress: CGFloat = 0
     init(
         duration: TimeInterval,
         frameRate: Int,
@@ -29,6 +30,7 @@ final class WorkspaceSlideAnimator: NSObject {
     }
     func start() {
         startTime = CACurrentMediaTime()
+        currentProgress = 0
         if #available(macOS 14.0, *), let screen {
             let displayLink = screen.displayLink(target: self, selector: #selector(displayLinkDidTick(_:)))
             let rate = Float(max(frameRate, 1))
@@ -54,6 +56,18 @@ final class WorkspaceSlideAnimator: NSObject {
         didFinish = true
         invalidate()
     }
+    /// Splice the animation onto a new transition set without stopping the run loop tick.
+    /// `progress` becomes the new logical start point (windows' interpolation will resume
+    /// from here). When `duration` is supplied, the remaining motion uses the new duration.
+    func reseat(progress: CGFloat, duration: TimeInterval? = nil) {
+        guard !didFinish else { return }
+        let clamped = min(max(progress, 0), 1)
+        if let duration {
+            self.duration = max(duration, 0.001)
+        }
+        startTime = CACurrentMediaTime() - TimeInterval(clamped) * self.duration
+        currentProgress = clamped
+    }
     @available(macOS 14.0, *)
     @objc private func displayLinkDidTick(_ displayLink: CADisplayLink) {
         tick(now: CACurrentMediaTime())
@@ -68,6 +82,7 @@ final class WorkspaceSlideAnimator: NSObject {
             return
         }
         let progress = min(max((now - startTime) / duration, 0), 1)
+        currentProgress = CGFloat(progress)
         onFrame(CGFloat(progress))
         if progress >= 1 {
             finish()
