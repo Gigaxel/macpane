@@ -2,6 +2,29 @@ import ApplicationServices
 import CoreGraphics
 
 enum WindowSnapshotReader {
+    // Mission Control / App Exposé makes the Dock process post a full-screen-wide window with
+    // bounds y == -1. This is the most reliable signal we can read without private APIs.
+    static func isMissionControlActive() -> Bool {
+        guard let infoList = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return false
+        }
+        for info in infoList {
+            guard let ownerName = info[kCGWindowOwnerName as String] as? String,
+                  ownerName == "Dock",
+                  let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary) else {
+                continue
+            }
+            if bounds.minY == -1 {
+                return true
+            }
+        }
+        return false
+    }
+
     static func readOnScreenWindows() -> OnScreenWindowSnapshot {
         guard let infoList = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],

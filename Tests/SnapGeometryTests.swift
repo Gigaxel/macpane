@@ -733,9 +733,9 @@ struct SnapGeometryTests {
             ],
             floatingWindowIDs: [floatingID]
         )
-        let expected = Set([inactiveID, frozenID, floatingID])
+        let expected = Set([activeID, inactiveID, frozenID, floatingID])
         if retained != expected {
-            fail("offscreen retention should include floating and non-active state keys, plus frozen state IDs")
+            fail("offscreen retention should include floating, frozen, and every tracked state key (active included)")
         }
     }
     private static func testWindowLayoutPlannerTilesShrunkenWindow() {

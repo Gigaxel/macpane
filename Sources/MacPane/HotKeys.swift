@@ -31,6 +31,14 @@ enum HotKeyAction {
             return false
         }
     }
+    var isWorkspaceMutation: Bool {
+        switch self {
+        case .createWorkspace, .deleteWorkspace, .switchWorkspace, .cycleWorkspace, .moveWindowToWorkspace:
+            return true
+        default:
+            return false
+        }
+    }
     var shouldDropWhenStale: Bool {
         switch self {
         case .focus, .overviewSwitchWorkspace:

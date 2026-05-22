@@ -32,11 +32,12 @@ enum WindowStateSyncPlanner {
         if let frozenSystemUIScreenStates {
             retainedIDs.formUnion(frozenSystemUIScreenStates.values.flatMap(\.windowIDs))
         }
-        let inactiveStateIDs = screenStates
-            .filter { !activeStateKeys.contains($0.key) }
-            .values
-            .flatMap(\.windowIDs)
-        retainedIDs.formUnion(inactiveStateIDs)
+        // Retain every tracked window ID, not just inactive workspaces. Active-workspace windows
+        // can briefly fail `windowCandidate` checks during Mission Control / App Exposé animations,
+        // and dropping their identity aliases here causes them to be re-discovered as fresh
+        // identities under the wrong workspace on the next scan.
+        let trackedStateIDs = screenStates.values.flatMap(\.windowIDs)
+        retainedIDs.formUnion(trackedStateIDs)
         retainedIDs.formUnion(floatingWindowIDs)
         return retainedIDs
     }
