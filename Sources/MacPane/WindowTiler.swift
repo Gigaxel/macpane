@@ -60,6 +60,8 @@ final class WindowTiler {
     private var isWatching = false
     private var isApplyingLayout = false
     private var isStopping = false
+    private var lastSystemDrivenAXEventAt = Date.distantPast
+    private let systemDrivenAXSettleGrace: TimeInterval = 0.25
     private var screenCatalog: ScreenCatalog {
         ScreenCatalog { [settings] nativeStateKey in
             settings.activeWorkspaceIndex(forNativeStateKey: nativeStateKey)
@@ -187,6 +189,7 @@ final class WindowTiler {
         focusTracker.reset()
         lastObserverRefresh = Date.distantPast
         knownNonObservablePIDs.removeAll()
+        lastSystemDrivenAXEventAt = .distantPast
     }
     private func restoreAllWorkspacesBeforeStopping() {
         guard hasAccessibilityPermission(prompt: false) else { return }
@@ -252,6 +255,16 @@ final class WindowTiler {
         pendingWorkspaceSwitchIndicator = nil
         guard hasAccessibilityPermission(prompt: false) else {
             startPermissionPolling()
+            NSSound.beep()
+            return
+        }
+        if action.isWorkspaceMutation, isSystemUIUnsettled() {
+            // Mission Control / App Exposé dismiss animations can still be in-flight even after
+            // the overview UI is gone. Running a workspace switch now risks (a) the slide
+            // animation fighting macOS' residual animation visually, and (b) window identities
+            // being reassigned mid-flight, which manifests as "windows transferred to the next
+            // workspace". Freeze layout updates until things quiesce, and drop this action.
+            pauseLayoutForSystemUI(duration: 0.6, preserveLayout: true)
             NSSound.beep()
             return
         }
@@ -377,10 +390,12 @@ final class WindowTiler {
             scheduleFocusRemember(delay: 0.01)
         case kAXMovedNotification:
             guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
+            recordSystemDrivenAXEventIfApplicable(element: element)
             invalidateManagedWindowCache(clearAppliedFrames: true)
             scheduleExternalMove(element: element, userInitiated: isPointerButtonDown)
         case kAXResizedNotification:
             guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
+            recordSystemDrivenAXEventIfApplicable(element: element)
             invalidateManagedWindowCache(clearAppliedFrames: true)
             scheduleExternalResize(element: element, userInitiated: isPointerButtonDown)
         default:
@@ -1643,6 +1658,33 @@ final class WindowTiler {
     }
     private func shouldPauseLayoutForSystemUI() -> Bool {
         systemUISettleTracker.isPaused
+    }
+    private func isMissionControlActive() -> Bool {
+        WindowSnapshotReader.isMissionControlActive()
+    }
+    private func isSystemDrivenAXActivityRecent(now: Date = Date()) -> Bool {
+        now.timeIntervalSince(lastSystemDrivenAXEventAt) < systemDrivenAXSettleGrace
+    }
+    private func isSystemUIUnsettled() -> Bool {
+        shouldPauseLayoutForSystemUI() ||
+            frozenSystemUIScreenStates != nil ||
+            isMissionControlActive() ||
+            isSystemDrivenAXActivityRecent()
+    }
+    private func recordSystemDrivenAXEventIfApplicable(element: AXUIElement) {
+        // We only care about events that look like they came from macOS itself (Mission Control,
+        // App Exposé, Spaces transitions, etc.). Skip when the user is dragging with the mouse
+        // or when the element matches a frame we just wrote.
+        guard !isPointerButtonDown else { return }
+        guard AXReader.string(element, attribute: kAXRoleAttribute) == kAXWindowRole else { return }
+        if let position = AXReader.point(element, attribute: kAXPositionAttribute),
+           let size = AXReader.size(element, attribute: kAXSizeAttribute) {
+            let frame = CGRect(origin: position, size: size)
+            if lastAppliedFrameByWindowID.values.contains(where: { WindowFrameApplier.approximatelyEqual($0, frame) }) {
+                return
+            }
+        }
+        lastSystemDrivenAXEventAt = Date()
     }
     private func scheduleSystemUISettleCheck(delay: TimeInterval = 1.30) {
         guard !isStopping else { return }
