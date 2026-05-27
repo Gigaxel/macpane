@@ -34,7 +34,7 @@ Use the menu bar item to increase, decrease, or reset the configurable gap aroun
 
 ```bash
 ./Scripts/test.sh
-./Scripts/build.sh
+./Scripts/build-app.sh
 ```
 
 The app bundle is written to `build/MacPane.app`.
@@ -45,7 +45,7 @@ For a stable local install, use:
 ./Scripts/install.sh
 ```
 
-That writes the app to `~/Applications/MacPane.app` by default. You can override the destination with `MACPANE_INSTALL_DIR=/Applications ./Scripts/install.sh`.
+That builds and writes the app to `~/Applications/MacPane.app` by default. You can override the destination with `INSTALL_DIR=/Applications ./Scripts/install.sh`.
 
 ## Run
 
