@@ -61,11 +61,24 @@ final class WindowTiler {
     private var isWatching = false
     private var isApplyingLayout = false
     private var isStopping = false
+    private var isSystemSessionSuspended = false
+    private var isUserSessionInactive = false
     private var lastSystemDrivenAXEventAt = Date.distantPast
     private let systemDrivenAXSettleGrace: TimeInterval = 0.25
     private var screenCatalog: ScreenCatalog {
+        makeScreenCatalog()
+    }
+    private func makeScreenCatalog(
+        assumingWorkspaceIndex assumedWorkspaceIndex: Int? = nil,
+        forNativeStateKey assumedNativeStateKey: String? = nil
+    ) -> ScreenCatalog {
         ScreenCatalog { [settings] nativeStateKey in
-            settings.activeWorkspaceIndex(forNativeStateKey: nativeStateKey)
+            if let assumedWorkspaceIndex,
+               let assumedNativeStateKey,
+               nativeStateKey == assumedNativeStateKey {
+                return assumedWorkspaceIndex
+            }
+            return settings.activeWorkspaceIndex(forNativeStateKey: nativeStateKey)
         }
     }
 
@@ -193,6 +206,8 @@ final class WindowTiler {
         focusTracker.reset()
         lastObserverRefresh = Date.distantPast
         knownNonObservablePIDs.removeAll()
+        isSystemSessionSuspended = false
+        isUserSessionInactive = false
         lastSystemDrivenAXEventAt = .distantPast
     }
     private func restoreAllWorkspacesBeforeStopping() {
@@ -466,6 +481,44 @@ final class WindowTiler {
             self?.refreshAppObservers()
             self?.scheduleReconcile(delay: 0.04)
         })
+        for notificationName in [
+            NSWorkspace.willSleepNotification,
+            NSWorkspace.screensDidSleepNotification
+        ] {
+            workspaceObservers.append(workspaceCenter.addObserver(
+                forName: notificationName,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.handleSystemWillSleepOrScreensSleep()
+            })
+        }
+        workspaceObservers.append(workspaceCenter.addObserver(
+            forName: NSWorkspace.sessionDidResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleSessionDidResignActive()
+        })
+        for notificationName in [
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.screensDidWakeNotification
+        ] {
+            workspaceObservers.append(workspaceCenter.addObserver(
+                forName: notificationName,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.handleSystemDidWakeOrScreensWake()
+            })
+        }
+        workspaceObservers.append(workspaceCenter.addObserver(
+            forName: NSWorkspace.sessionDidBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleSessionDidBecomeActive()
+        })
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
@@ -607,7 +660,7 @@ final class WindowTiler {
     // Recovery polling should stay cheap; AX/workspace notifications are the primary update path.
     private func performPeriodicVisibilityScan() {
         guard !isStopping, tilingEnabled, frozenSystemUIScreenStates == nil else { return }
-        guard !systemUISettleTracker.isPaused else { return }
+        guard !shouldPauseLayoutForSystemUI() else { return }
         let snapshot = WindowSnapshotReader.readOnScreenWindows()
         refreshAppObserversIfNeeded(visiblePIDs: Set(snapshot.visibleNumbersByPID.keys))
         scheduleReconcileIfVisibleWindowSetChanged(snapshot: snapshot, delay: 0.01)
@@ -1411,9 +1464,14 @@ final class WindowTiler {
             scheduleReconcile(delay: 0.08)
             return
         }
-        let allWindows = interactiveManagedWindows()
+        let allWindows = managedWindowsAssumingWorkspaceIndex(visibleIndex, forNativeStateKey: nativeStateKey)
         let focusedID = focusTracker.focusedWindowIDForHotKey(in: allWindows)
-        syncStatesForHotKeyIfNeeded(with: allWindows, focusedID: focusedID)
+        syncVisibleWorkspaceBeforeSwitch(
+            allWindows: allWindows,
+            nativeStateKey: nativeStateKey,
+            visibleIndex: visibleIndex,
+            focusedID: focusedID
+        )
         suppressExternalChanges(for: 0.45)
         if animateWorkspaceSwitchIfPossible(
             allWindows: allWindows,
@@ -1708,6 +1766,57 @@ final class WindowTiler {
         state.markFocusedIfKnown(focusedID)
         screenStates[key] = state
     }
+    private func syncVisibleWorkspaceBeforeSwitch(
+        allWindows: [ManagedWindow],
+        nativeStateKey: String,
+        visibleIndex: Int,
+        focusedID: WindowIdentity?
+    ) {
+        let visibleStateKey = ScreenInfo.workspaceStateKey(
+            nativeStateKey: nativeStateKey,
+            workspaceIndex: visibleIndex
+        )
+        _ = restoreFloatingLayoutIdentities(using: allWindows)
+        let visibleWindows = stronglyVisibleTiledWindows(from: allWindows, stateKey: visibleStateKey)
+        guard !visibleWindows.isEmpty else { return }
+        if let existingState = screenStates[visibleStateKey],
+           !existingState.isEmpty,
+           visibleWindows.count < existingState.windowIDs.count {
+            scheduleReconcile(delay: 0.08)
+            return
+        }
+        if let existingState = screenStates[visibleStateKey] {
+            _ = restoreKnownLayoutIdentities(
+                using: visibleWindows,
+                sourceStates: [visibleStateKey: existingState]
+            )
+        }
+        syncSingleWorkspaceState(
+            visibleStateKey,
+            windows: visibleWindows,
+            focusedID: focusedID
+        )
+    }
+    private func syncSingleWorkspaceState(
+        _ stateKey: String,
+        windows: [ManagedWindow],
+        focusedID: WindowIdentity?
+    ) {
+        let stateWindows = windows.filter { $0.screen.stateKey == stateKey && !floatingWindowIDs.contains($0.id) }
+        let ids = stateWindows.map(\.id)
+        guard !ids.isEmpty else { return }
+        var state = screenStates[stateKey] ?? ScreenTileState()
+        let screenFocusedID = focusedID.flatMap { ids.contains($0) ? $0 : nil }
+        state.sync(windowIDs: ids, focusedID: screenFocusedID)
+        screenStates[stateKey] = state
+        rememberLayoutIdentities(using: stateWindows)
+        pruneLayoutIdentityCache(retainingVisibleIDs: Set(windows.map(\.id)))
+        rememberPersistedLayouts(using: stateWindows, limitingToStateKeys: [stateKey])
+        if let screenFocusedID {
+            focusTracker.remember(screenFocusedID)
+        }
+        lastSyncedVisibleWindowSignature = lastVisibleWindowSignature
+    }
     private func applyLayout(
         to windows: [ManagedWindow],
         limitingToStateKeys stateKeyLimit: Set<String>? = nil,
@@ -1780,7 +1889,11 @@ final class WindowTiler {
 
     // MARK: - System UI Settling
 
-    private func pauseLayoutForSystemUI(duration: TimeInterval, preserveLayout: Bool = true) {
+    private func pauseLayoutForSystemUI(
+        duration: TimeInterval,
+        preserveLayout: Bool = true,
+        scheduleSettleCheck: Bool = true
+    ) {
         guard !isStopping else { return }
         if preserveLayout {
             if frozenSystemUIScreenStates == nil {
@@ -1796,13 +1909,15 @@ final class WindowTiler {
         pendingFocusRemember?.cancel()
         pendingMove?.cancel()
         pendingResize?.cancel()
+        pendingSystemUISettle?.cancel()
+        pendingSystemUISettle = nil
         cancelPendingWorkspaceSwitchApply()
-        if preserveLayout {
+        if preserveLayout, scheduleSettleCheck {
             scheduleSystemUISettleCheck(delay: max(0.35, duration + 0.10))
         }
     }
     private func shouldPauseLayoutForSystemUI() -> Bool {
-        systemUISettleTracker.isPaused
+        isSystemSessionSuspended || systemUISettleTracker.isPaused
     }
     private func isMissionControlActive() -> Bool {
         WindowSnapshotReader.isMissionControlActive()
@@ -1831,18 +1946,48 @@ final class WindowTiler {
         }
         lastSystemDrivenAXEventAt = Date()
     }
-    private func scheduleSystemUISettleCheck(delay: TimeInterval = 1.30) {
+    private func handleSystemWillSleepOrScreensSleep() {
         guard !isStopping else { return }
+        suspendSystemSessionLayout()
+    }
+    private func handleSessionDidResignActive() {
+        guard !isStopping else { return }
+        isUserSessionInactive = true
+        suspendSystemSessionLayout()
+    }
+    private func suspendSystemSessionLayout() {
+        isSystemSessionSuspended = true
+        pauseLayoutForSystemUI(duration: 0.75, preserveLayout: true, scheduleSettleCheck: false)
+    }
+    private func handleSystemDidWakeOrScreensWake() {
+        guard !isStopping else { return }
+        guard !isUserSessionInactive else { return }
+        resumeSystemSessionLayoutAfterWakeOrUnlock()
+    }
+    private func handleSessionDidBecomeActive() {
+        guard !isStopping else { return }
+        isUserSessionInactive = false
+        resumeSystemSessionLayoutAfterWakeOrUnlock()
+    }
+    private func resumeSystemSessionLayoutAfterWakeOrUnlock() {
+        isSystemSessionSuspended = false
+        cachedAccessibilityPermission = nil
+        invalidateManagedWindowCache(clearAppliedFrames: true)
+        refreshAppObservers()
+        pauseLayoutForSystemUI(duration: 1.80, preserveLayout: true)
+    }
+    private func scheduleSystemUISettleCheck(delay: TimeInterval = 1.30) {
+        guard !isStopping, !isSystemSessionSuspended else { return }
         pendingSystemUISettle?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
-            guard let self, !self.isStopping else { return }
+            guard let self, !self.isStopping, !self.isSystemSessionSuspended else { return }
             self.handleSystemUISettled()
         }
         pendingSystemUISettle = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
     private func handleSystemUISettled() {
-        guard !isStopping else { return }
+        guard !isStopping, !isSystemSessionSuspended else { return }
         guard hasAccessibilityPermission(prompt: false), tilingEnabled else {
             frozenSystemUIScreenStates = nil
             frozenSystemUIActiveStateKeys = nil
@@ -2045,6 +2190,20 @@ final class WindowTiler {
         restoreFloatingLayoutIdentities(using: windows)
         let activeStateKeys = Set(currentScreenInfos().map(\.stateKey))
         return windows.filter { activeStateKeys.contains($0.screen.stateKey) && !floatingWindowIDs.contains($0.id) }
+    }
+    private func stronglyVisibleTiledWindows(from windows: [ManagedWindow], stateKey: String) -> [ManagedWindow] {
+        windows.filter { window in
+            window.screen.stateKey == stateKey &&
+                !floatingWindowIDs.contains(window.id) &&
+                occupiesVisibleScreenArea(window)
+        }
+    }
+    private func occupiesVisibleScreenArea(_ window: ManagedWindow) -> Bool {
+        let intersection = window.frame.intersection(window.screen.frame)
+        guard !intersection.isNull else { return false }
+        let visibleArea = max(0, intersection.width) * max(0, intersection.height)
+        let minimumVisibleArea = max(64, min(window.frame.area, window.screen.frame.area) * 0.05)
+        return visibleArea >= minimumVisibleArea
     }
     private func updateVisibleFloatingWindowStateKeys(using windows: [ManagedWindow]) {
         for window in windows where floatingWindowIDs.contains(window.id) {
@@ -2319,9 +2478,13 @@ final class WindowTiler {
             isFocused: id == focusedID || id == stateFocusedID
         )
     }
-    private func screenInfo(forKnownStateKey stateKey: String, fallback: ScreenInfo) -> ScreenInfo {
+    private func screenInfo(
+        forKnownStateKey stateKey: String,
+        fallback: ScreenInfo,
+        catalog: ScreenCatalog? = nil
+    ) -> ScreenInfo {
         let nativeStateKey = WorkspaceStateKeys.nativeStateKeyComponent(of: stateKey)
-        let screens = currentScreenInfos()
+        let screens = (catalog ?? screenCatalog).currentInfos()
         if let screen = screens.first(where: { $0.nativeStateKey == nativeStateKey }) {
             return screen.withStateKeyOverride(stateKey)
         }
@@ -2357,6 +2520,16 @@ final class WindowTiler {
         managedWindowCache = (windows, now)
         return windows
     }
+    private func managedWindowsAssumingWorkspaceIndex(_ workspaceIndex: Int, forNativeStateKey nativeStateKey: String) -> [ManagedWindow] {
+        let catalog = makeScreenCatalog(
+            assumingWorkspaceIndex: workspaceIndex,
+            forNativeStateKey: nativeStateKey
+        )
+        return managedWindows(
+            snapshot: WindowSnapshotReader.readOnScreenWindows(),
+            catalog: catalog
+        )
+    }
     private func invalidateManagedWindowCache(clearAppliedFrames: Bool = false) {
         managedWindowCache = nil
         if clearAppliedFrames {
@@ -2381,9 +2554,10 @@ final class WindowTiler {
             lastAppliedFrameByWindowID.removeValue(forKey: window.id)
         }
     }
-    private func managedWindows(snapshot: OnScreenWindowSnapshot) -> [ManagedWindow] {
+    private func managedWindows(snapshot: OnScreenWindowSnapshot, catalog: ScreenCatalog? = nil) -> [ManagedWindow] {
         lastVisibleWindowSignature = VisibleWindowSignature(snapshot: snapshot)
-        let screens = currentScreenInfos()
+        let catalog = catalog ?? screenCatalog
+        let screens = catalog.currentInfos()
         let activeStateKeys = Set(screens.map(\.stateKey))
         let retainedOffscreenIDs = WindowStateSyncPlanner.retainedOffscreenWindowIDs(
             activeStateKeys: activeStateKeys,
@@ -2395,7 +2569,7 @@ final class WindowTiler {
         var registry = identityRegistry
         let discovery = WindowDiscovery(
             metadataReader: metadataReader,
-            screenCatalog: screenCatalog,
+            screenCatalog: catalog,
             accessibilityMessagingTimeout: accessibilityMessagingTimeout
         )
         let result = discovery.managedWindows(
@@ -2404,7 +2578,7 @@ final class WindowTiler {
             retainedOffscreenIDs: retainedOffscreenIDs,
             identityRegistry: &registry,
             knownStateKey: { self.stateKey(containing: $0, activeStateKeys: activeStateKeys) },
-            screenForKnownStateKey: { self.screenInfo(forKnownStateKey: $0, fallback: $1) }
+            screenForKnownStateKey: { self.screenInfo(forKnownStateKey: $0, fallback: $1, catalog: catalog) }
         )
         identityRegistry = registry
 
