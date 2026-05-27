@@ -22,6 +22,7 @@ xcrun swiftc \
   -framework AppKit \
   -framework ApplicationServices \
   -framework Carbon \
+  -framework SwiftUI \
   "${SOURCES[@]}" \
   -o "$MACOS_DIR/MacPane"
 cp "$ROOT_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"

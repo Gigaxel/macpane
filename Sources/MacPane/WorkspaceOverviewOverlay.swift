@@ -1,5 +1,33 @@
 import AppKit
 
+final class WorkspaceDotView: NSView {
+    private let isActive: Bool
+    init(isActive: Bool) {
+        self.isActive = isActive
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        widthAnchor.constraint(equalToConstant: 8).isActive = true
+        heightAnchor.constraint(equalToConstant: 8).isActive = true
+    }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not available")
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        let inset: CGFloat = isActive ? 0 : 1
+        let rect = bounds.insetBy(dx: inset, dy: inset)
+        let path = NSBezierPath(ovalIn: rect)
+        if isActive {
+            NSColor.controlAccentColor.setFill()
+            path.fill()
+        } else {
+            NSColor.tertiaryLabelColor.setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        }
+    }
+}
+
 private final class WorkspaceOverviewPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
@@ -45,7 +73,13 @@ final class WorkspaceOverviewOverlay {
         view.autoresizingMask = [.width, .height]
         panel.contentView = view
         panel.ignoresMouseEvents = true
+        panel.alphaValue = 0
         panel.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            panel.animator().alphaValue = 1
+        }
         scheduleAutoHide()
     }
     @discardableResult
@@ -119,7 +153,7 @@ final class WorkspaceOverviewOverlay {
         panel.level = .statusBar
         panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle, .transient]
         panel.hidesOnDeactivate = false
-        panel.hasShadow = true
+        panel.hasShadow = false
         self.panel = panel
         return panel
     }
@@ -130,10 +164,10 @@ final class WorkspaceOverviewOverlay {
         let visibleFrame = screen?.visibleFrame ?? CGRect(x: 0, y: 0, width: 760, height: 520)
         let columns = min(3, max(1, overview.items.count))
         let rows = max(1, Int(ceil(Double(max(1, overview.items.count)) / Double(columns))))
-        let idealWidth = CGFloat(columns) * 184 + CGFloat(max(0, columns - 1)) * 10 + 48
-        let idealHeight = 86 + CGFloat(rows) * 116 + CGFloat(max(0, rows - 1)) * 10 + 40
-        let width = min(max(380, idealWidth), max(320, visibleFrame.width - 56))
-        let height = min(max(240, idealHeight), max(200, visibleFrame.height - 56))
+        let idealWidth = CGFloat(columns) * 200 + CGFloat(max(0, columns - 1)) * 14 + 56
+        let idealHeight = 110 + CGFloat(rows) * 156 + CGFloat(max(0, rows - 1)) * 14 + 56
+        let width = min(max(420, idealWidth), max(360, visibleFrame.width - 64))
+        let height = min(max(260, idealHeight), max(220, visibleFrame.height - 64))
         return CGRect(
             x: visibleFrame.midX - width / 2,
             y: visibleFrame.midY - height / 2,
@@ -142,7 +176,7 @@ final class WorkspaceOverviewOverlay {
         )
     }
 }
-private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
+private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelegate {
     private let overview: WorkspaceOverview
     private weak var activeHeaderLabel: NSTextField?
     private weak var activeRenameField: NSTextField?
@@ -160,10 +194,13 @@ private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
     }
     private func buildView() {
         activeDetailViews.removeAll()
+        material = .hudWindow
+        blendingMode = .behindWindow
+        state = .active
         wantsLayer = true
-        layer?.cornerRadius = 12
-        layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.65).cgColor
+        layer?.cornerRadius = 16
+        layer?.masksToBounds = true
+        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.55).cgColor
         layer?.borderWidth = 1
         let contentView = NSView()
         contentView.translatesAutoresizingMaskIntoConstraints = false
@@ -171,7 +208,7 @@ private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
         let root = NSStackView()
         root.orientation = .vertical
         root.alignment = .width
-        root.spacing = 14
+        root.spacing = 16
         root.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(root)
         let title = label(
@@ -180,36 +217,54 @@ private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
             color: .labelColor
         )
         let subtitle = label(
-            "\(overview.displayName) - Workspace \(overview.activeWorkspaceIndex + 1)/\(overview.workspaceCount)",
+            "\(overview.displayName) · Workspace \(overview.activeWorkspaceIndex + 1) of \(overview.workspaceCount)",
             font: .systemFont(ofSize: 12, weight: .regular),
             color: .secondaryLabelColor
         )
-        let titleStack = NSStackView(views: [title, subtitle])
-        titleStack.orientation = .vertical
-        titleStack.alignment = .leading
-        titleStack.spacing = 2
-        root.addArrangedSubview(titleStack)
+        let titleColumn = NSStackView(views: [title, subtitle])
+        titleColumn.orientation = .vertical
+        titleColumn.alignment = .leading
+        titleColumn.spacing = 2
+        let dotsRow = workspaceDotsRow()
+        let headerRow = NSStackView(views: [titleColumn, NSView(), dotsRow])
+        headerRow.orientation = .horizontal
+        headerRow.alignment = .centerY
+        headerRow.spacing = 12
+        headerRow.distribution = .fill
+        root.addArrangedSubview(headerRow)
         let grid = workspaceGrid()
         root.addArrangedSubview(grid)
         NSLayoutConstraint.activate([
-            contentView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
-            contentView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -24),
-            contentView.topAnchor.constraint(equalTo: topAnchor, constant: 20),
-            contentView.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -20),
+            contentView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 28),
+            contentView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -28),
+            contentView.topAnchor.constraint(equalTo: topAnchor, constant: 24),
+            contentView.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -24),
             root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             root.topAnchor.constraint(equalTo: contentView.topAnchor),
             root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            titleStack.widthAnchor.constraint(equalTo: root.widthAnchor),
+            headerRow.widthAnchor.constraint(equalTo: root.widthAnchor),
             grid.widthAnchor.constraint(equalTo: root.widthAnchor)
         ])
+    }
+    private func workspaceDotsRow() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        for item in overview.items {
+            let dot = WorkspaceDotView(isActive: item.isActive)
+            stack.addArrangedSubview(dot)
+        }
+        return stack
     }
     private func workspaceGrid() -> NSStackView {
         let columns = min(3, max(1, overview.items.count))
         let grid = NSStackView()
         grid.orientation = .vertical
         grid.alignment = .width
-        grid.spacing = 10
+        grid.spacing = 14
         grid.translatesAutoresizingMaskIntoConstraints = false
         var index = 0
         while index < overview.items.count {
@@ -217,7 +272,7 @@ private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
             row.orientation = .horizontal
             row.alignment = .top
             row.distribution = .fillEqually
-            row.spacing = 10
+            row.spacing = 14
             row.translatesAutoresizingMaskIntoConstraints = false
             for _ in 0..<columns {
                 if index < overview.items.count {
@@ -235,14 +290,14 @@ private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
     private func card(for item: WorkspaceOverviewItem) -> NSView {
         let card = NSView()
         card.wantsLayer = true
-        card.layer?.cornerRadius = 8
+        card.layer?.cornerRadius = 10
         card.layer?.borderWidth = item.isActive ? 2 : 1
-        card.layer?.borderColor = (item.isActive ? NSColor.controlAccentColor : NSColor.separatorColor).cgColor
+        card.layer?.borderColor = (item.isActive ? NSColor.controlAccentColor : NSColor.separatorColor.withAlphaComponent(0.5)).cgColor
         card.layer?.backgroundColor = (item.isActive
-            ? NSColor.controlAccentColor.withAlphaComponent(0.16)
-            : NSColor.controlBackgroundColor.withAlphaComponent(0.72)).cgColor
+            ? NSColor.controlAccentColor.withAlphaComponent(0.18)
+            : NSColor.controlBackgroundColor.withAlphaComponent(0.55)).cgColor
         card.translatesAutoresizingMaskIntoConstraints = false
-        card.heightAnchor.constraint(equalToConstant: 116).isActive = true
+        card.heightAnchor.constraint(equalToConstant: 156).isActive = true
         let numberBackdrop = workspaceNumberBackdrop(for: item)
         card.addSubview(numberBackdrop)
         let stack = NSStackView()
@@ -377,7 +432,7 @@ private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
         field.isSelectable = true
         field.isBordered = false
         field.drawsBackground = true
-        field.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.22)
+        field.backgroundColor = NSColor.quaternaryLabelColor.withAlphaComponent(0.6)
         field.focusRingType = .none
         field.wantsLayer = true
         field.layer?.cornerRadius = 5
@@ -391,14 +446,33 @@ private final class WorkspaceOverviewView: NSView, NSTextFieldDelegate {
         field.heightAnchor.constraint(equalToConstant: 22).isActive = true
         return field
     }
-    private func windowLabel(for window: WorkspaceOverviewWindow) -> NSTextField {
-        let prefix = window.isFocused ? "> " : "- "
+    private func windowLabel(for window: WorkspaceOverviewWindow) -> NSView {
         let detail = window.detail.map { " (\($0))" } ?? ""
-        return label(
-            "\(prefix)\(window.title)\(detail)",
+        let textColor: NSColor = window.isFocused ? .labelColor : .secondaryLabelColor
+        let textField = label(
+            "\(window.title)\(detail)",
             font: .systemFont(ofSize: 11, weight: window.isFocused ? .semibold : .regular),
-            color: window.isFocused ? .labelColor : .secondaryLabelColor
+            color: textColor
         )
+        let symbolName = window.isFocused ? "chevron.forward.circle.fill" : "app"
+        let glyph = NSImageView()
+        glyph.translatesAutoresizingMaskIntoConstraints = false
+        if let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) {
+            glyph.image = image
+        }
+        glyph.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 10, weight: window.isFocused ? .semibold : .regular)
+        glyph.contentTintColor = window.isFocused ? NSColor.controlAccentColor : NSColor.tertiaryLabelColor
+        glyph.imageScaling = .scaleProportionallyDown
+        let row = NSStackView(views: [glyph, textField])
+        row.orientation = .horizontal
+        row.alignment = .firstBaseline
+        row.spacing = 5
+        row.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            glyph.widthAnchor.constraint(equalToConstant: 13),
+            glyph.heightAnchor.constraint(equalToConstant: 13)
+        ])
+        return row
     }
     private func label(_ text: String, font: NSFont, color: NSColor) -> NSTextField {
         let label = NSTextField(labelWithString: text)

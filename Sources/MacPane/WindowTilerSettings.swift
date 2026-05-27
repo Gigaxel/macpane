@@ -8,6 +8,7 @@ final class WindowTilerSettings {
         static let workspaceSwitchAnimationsEnabled = "workspaceSwitchAnimationsEnabled"
         static let workspaceNamesByDisplay = "workspaceNamesByDisplay"
         static let accessibilityPrompted = "accessibilityPrompted"
+        static let onboardingCompleted = "onboardingCompleted"
     }
 
     private let defaults: UserDefaults
@@ -70,6 +71,14 @@ final class WindowTilerSettings {
 
     func markAccessibilityPrompted() {
         defaults.set(true, forKey: DefaultsKey.accessibilityPrompted)
+    }
+
+    var hasCompletedOnboarding: Bool {
+        defaults.bool(forKey: DefaultsKey.onboardingCompleted)
+    }
+
+    func markOnboardingCompleted() {
+        defaults.set(true, forKey: DefaultsKey.onboardingCompleted)
     }
 
     func resetRuntimeState() {

@@ -8,6 +8,9 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
     private let tiler = WindowTiler()
     private let workspaceOverviewOverlay = WorkspaceOverviewOverlay()
     private let workspaceSwitchIndicatorOverlay = WorkspaceSwitchIndicatorOverlay()
+    private lazy var settingsStore = SettingsStore(tiler: tiler)
+    private lazy var settingsWindowController = SettingsWindowController(store: settingsStore)
+    private var onboardingWindowController: OnboardingWindowController?
     private var isRebuildingMenu = false
     private var isPreparingToTerminate = false
     static func main() {
@@ -21,6 +24,16 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         HotKeyManager.shared.delegate = self
         HotKeyManager.shared.start()
         tiler.start()
+        if !tiler.hasCompletedOnboarding {
+            DispatchQueue.main.async { [weak self] in
+                self?.showOnboardingWindow()
+            }
+        }
+    }
+    private func showOnboardingWindow() {
+        let controller = onboardingWindowController ?? OnboardingWindowController(store: settingsStore)
+        onboardingWindowController = controller
+        controller.present()
     }
     func applicationWillTerminate(_ notification: Notification) {
         prepareForTermination()
@@ -45,6 +58,18 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
                 rebuildMenu()
             }
             showWorkspaceSwitchIndicatorIfNeeded()
+            return
+        case .openSettings:
+            openSettingsWindow()
+            return
+        case .decreaseGap:
+            decreaseGap()
+            return
+        case .increaseGap:
+            increaseGap()
+            return
+        case .resetGap:
+            resetGap()
             return
         case .overviewRenameStart:
             HotKeyManager.shared.unregisterWorkspaceOverviewHotKeys()
@@ -109,7 +134,16 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
     }
     private func configureStatusButton(_ button: NSStatusBarButton?) {
         guard let button else { return }
-        if let icon = Bundle.main.image(forResource: "MacPaneIcon") {
+        if let glyph = NSImage(systemSymbolName: "square.split.2x2", accessibilityDescription: "MacPane") {
+            let configured = glyph.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+            ) ?? glyph
+            configured.isTemplate = true
+            button.image = configured
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+            button.title = ""
+        } else if let icon = Bundle.main.image(forResource: "MacPaneIcon") {
             icon.size = NSSize(width: 18, height: 18)
             icon.isTemplate = false
             button.image = icon
@@ -135,30 +169,30 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         defer { isRebuildingMenu = false }
         menu.delegate = self
         menu.removeAllItems()
-        let permissionTitle = tiler.hasAccessibilityPermission(prompt: false)
-            ? "Accessibility: Enabled"
-            : "Accessibility: Needed"
-        let permissionItem = NSMenuItem(title: permissionTitle, action: nil, keyEquivalent: "")
-        permissionItem.isEnabled = false
-        menu.addItem(permissionItem)
-        let tilingItem = NSMenuItem(title: "Tiling: \(tiler.tilingEnabled ? "On" : "Off")", action: nil, keyEquivalent: "")
-        tilingItem.isEnabled = false
-        menu.addItem(tilingItem)
-        let workspaceAnimationsItem = NSMenuItem(
-            title: "Workspace Animations: \(tiler.workspaceSwitchAnimationsEnabled ? "On" : "Off")",
-            action: nil,
-            keyEquivalent: ""
-        )
-        workspaceAnimationsItem.isEnabled = false
-        menu.addItem(workspaceAnimationsItem)
+
         let workspaceMenuState = tiler.workspaceMenuState
-        let workspaceItem = NSMenuItem(title: workspaceMenuState.statusText, action: nil, keyEquivalent: "")
-        workspaceItem.isEnabled = false
-        menu.addItem(workspaceItem)
+        let statusItem = NSMenuItem(title: workspaceMenuState.statusText, action: nil, keyEquivalent: "")
+        statusItem.isEnabled = false
+        menu.addItem(statusItem)
+        if !tiler.hasAccessibilityPermission(prompt: false) {
+            let permissionItem = NSMenuItem(
+                title: "Accessibility access required",
+                action: #selector(openSettingsFromMenu),
+                keyEquivalent: ""
+            )
+            permissionItem.target = self
+            menu.addItem(permissionItem)
+        }
+        menu.addItem(NSMenuItem.separator())
+
         let switchWorkspaceItem = NSMenuItem(title: "Switch Workspace", action: nil, keyEquivalent: "")
         let switchWorkspaceMenu = NSMenu()
         for index in 0..<workspaceMenuState.count {
-            let item = NSMenuItem(title: "Workspace \(index + 1)", action: #selector(switchWorkspaceFromMenu), keyEquivalent: "")
+            let item = NSMenuItem(
+                title: "Workspace \(index + 1)",
+                action: #selector(switchWorkspaceFromMenu),
+                keyEquivalent: ""
+            )
             item.target = self
             item.representedObject = index
             item.state = workspaceMenuState.activeIndex == index ? .on : .off
@@ -166,100 +200,50 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         }
         switchWorkspaceItem.submenu = switchWorkspaceMenu
         menu.addItem(switchWorkspaceItem)
-        let moveToWorkspaceItem = NSMenuItem(title: "Move Focused Window To", action: nil, keyEquivalent: "")
+
+        let moveToWorkspaceItem = NSMenuItem(title: "Move Window To", action: nil, keyEquivalent: "")
         let moveToWorkspaceMenu = NSMenu()
         for index in 0..<workspaceMenuState.count {
-            let item = NSMenuItem(title: "Workspace \(index + 1)", action: #selector(moveFocusedWindowToWorkspaceFromMenu), keyEquivalent: "")
+            let item = NSMenuItem(
+                title: "Workspace \(index + 1)",
+                action: #selector(moveFocusedWindowToWorkspaceFromMenu),
+                keyEquivalent: ""
+            )
             item.target = self
             item.representedObject = index
             moveToWorkspaceMenu.addItem(item)
         }
         moveToWorkspaceItem.submenu = moveToWorkspaceMenu
         menu.addItem(moveToWorkspaceItem)
-        let createWorkspaceTitle = workspaceMenuState.canCreateMore
-            ? "Create Workspace"
-            : "Create Workspace (Max \(workspaceMenuState.maximumCount))"
-        let createWorkspaceItem = NSMenuItem(title: createWorkspaceTitle, action: #selector(createWorkspace), keyEquivalent: "")
-        createWorkspaceItem.target = self
-        createWorkspaceItem.isEnabled = workspaceMenuState.canCreateMore
-        menu.addItem(createWorkspaceItem)
-        let deleteWorkspaceItem = NSMenuItem(
-            title: workspaceMenuState.deleteWorkspaceTitle,
-            action: #selector(deleteWorkspace),
+
+        let overviewItem = NSMenuItem(
+            title: "Show Overview",
+            action: #selector(showWorkspaceOverviewFromMenu),
             keyEquivalent: ""
         )
-        deleteWorkspaceItem.target = self
-        deleteWorkspaceItem.isEnabled = workspaceMenuState.canDeleteActive
-        menu.addItem(deleteWorkspaceItem)
-        let overviewItem = NSMenuItem(title: "Show Workspace Overview", action: #selector(showWorkspaceOverviewFromMenu), keyEquivalent: "")
         overviewItem.target = self
         menu.addItem(overviewItem)
+
         menu.addItem(NSMenuItem.separator())
-        let shortcuts = [
-            "Cmd+Option+Arrow/HJKL: focus neighbor",
-            "Cmd+Shift+Arrow/HJKL: swap with neighbor",
-            "Cmd+Ctrl+Arrow/HJKL: resize focused split",
-            "Cmd+Option+O: rotate focused split",
-            "Cmd+Option+G: toggle focused window floating",
-            "Cmd+Option+Y: toggle tiling",
-            "Cmd+Option+A: toggle workspace switch animations",
-            "Cmd+Option+B: balance current BSP tree",
-            "Cmd+Option+1...9: switch MacPane workspace",
-            "Cmd+Ctrl+1...9: move focused window to workspace",
-            "Cmd+Ctrl+Option+Left/Right or H/L: previous/next workspace",
-            "Cmd+Ctrl+Option+=: create MacPane workspace",
-            "Cmd+Ctrl+Option+-: delete current empty workspace",
-            "Cmd+Ctrl+Option+V: show workspace overview",
-            "Mouse drop on edge: split target; center: swap target"
-        ]
-        for shortcut in shortcuts {
-            let item = NSMenuItem(title: shortcut, action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        }
-        menu.addItem(NSMenuItem.separator())
-        let gapItem = NSMenuItem(title: "Gap: \(tiler.gapPixels) px", action: nil, keyEquivalent: "")
-        gapItem.isEnabled = false
-        menu.addItem(gapItem)
-        let decreaseGapItem = NSMenuItem(title: "Decrease Gap", action: #selector(decreaseGap), keyEquivalent: "[")
-        decreaseGapItem.target = self
-        menu.addItem(decreaseGapItem)
-        let increaseGapItem = NSMenuItem(title: "Increase Gap", action: #selector(increaseGap), keyEquivalent: "]")
-        increaseGapItem.target = self
-        menu.addItem(increaseGapItem)
-        let resetGapItem = NSMenuItem(title: "Reset Gap", action: #selector(resetGap), keyEquivalent: "0")
-        resetGapItem.target = self
-        menu.addItem(resetGapItem)
-        menu.addItem(NSMenuItem.separator())
-        let retileItem = NSMenuItem(title: "Retile Now", action: #selector(retileNow), keyEquivalent: "r")
-        retileItem.target = self
-        menu.addItem(retileItem)
-        let accessibilityItem = NSMenuItem(
-            title: "Open Accessibility Settings",
-            action: #selector(openAccessibilitySettings),
-            keyEquivalent: ""
+
+        let settingsItem = NSMenuItem(
+            title: "Settings…",
+            action: #selector(openSettingsFromMenu),
+            keyEquivalent: ","
         )
-        accessibilityItem.target = self
-        menu.addItem(accessibilityItem)
-        let refreshItem = NSMenuItem(title: "Refresh Status", action: #selector(refreshStatus), keyEquivalent: "")
-        refreshItem.target = self
-        menu.addItem(refreshItem)
-        menu.addItem(NSMenuItem.separator())
+        settingsItem.keyEquivalentModifierMask = [.command, .option]
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
         let quitItem = NSMenuItem(title: "Quit MacPane", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
-    @objc private func openAccessibilitySettings() {
-        _ = tiler.requestAccessibilityPermission()
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
+    @objc private func openSettingsFromMenu() {
+        openSettingsWindow()
     }
-    @objc private func refreshStatus() {
-        rebuildMenu()
-    }
-    @objc private func retileNow() {
-        tiler.retileNow()
+    private func openSettingsWindow() {
+        settingsWindowController.present()
     }
     @objc private func switchWorkspaceFromMenu(_ sender: NSMenuItem) {
         guard let index = sender.representedObject as? Int else { return }
@@ -268,12 +252,6 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
     @objc private func moveFocusedWindowToWorkspaceFromMenu(_ sender: NSMenuItem) {
         guard let index = sender.representedObject as? Int else { return }
         perform(action: .moveWindowToWorkspace(index), rebuildMenu: true)
-    }
-    @objc private func createWorkspace() {
-        perform(action: .createWorkspace, rebuildMenu: true)
-    }
-    @objc private func deleteWorkspace() {
-        perform(action: .deleteWorkspace, rebuildMenu: true)
     }
     @objc private func showWorkspaceOverviewFromMenu() {
         showWorkspaceOverview()
@@ -290,7 +268,11 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
     }
     private func showWorkspaceSwitchIndicatorIfNeeded() {
         guard let indicator = tiler.consumeWorkspaceSwitchIndicator() else { return }
-        workspaceSwitchIndicatorOverlay.show(workspaceNumber: indicator.workspaceIndex + 1, displayID: indicator.displayID)
+        workspaceSwitchIndicatorOverlay.show(
+            workspaceNumber: indicator.workspaceIndex + 1,
+            workspaceCount: tiler.workspaceCount,
+            displayID: indicator.displayID
+        )
     }
     private func showTilingStateIndicator(displayID: CGDirectDisplayID?) {
         workspaceSwitchIndicatorOverlay.show(text: tiler.tilingEnabled ? "On" : "Off", displayID: displayID)

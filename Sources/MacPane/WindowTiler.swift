@@ -323,6 +323,11 @@ final class WindowTiler {
             balanceFocusedTree()
         case .retile:
             retileNow()
+        case .openSettings,
+             .decreaseGap,
+             .increaseGap,
+             .resetGap:
+            break
         }
     }
     func consumeWorkspaceSwitchIndicator() -> WorkspaceSwitchIndicatorState? {
@@ -333,6 +338,18 @@ final class WindowTiler {
         guard !isStopping else { return }
         setGap(gapPixels + delta)
     }
+    func setTilingEnabled(_ value: Bool) {
+        guard !isStopping else { return }
+        guard tilingEnabled != value else { return }
+        toggleTiling()
+    }
+    func setWorkspaceSwitchAnimationsEnabled(_ value: Bool) {
+        guard !isStopping else { return }
+        guard workspaceSwitchAnimationsEnabled != value else { return }
+        toggleWorkspaceSwitchAnimations()
+    }
+    var hasCompletedOnboarding: Bool { settings.hasCompletedOnboarding }
+    func markOnboardingCompleted() { settings.markOnboardingCompleted() }
     func setGap(_ value: Int) {
         guard !isStopping else { return }
         settings.setGap(value)

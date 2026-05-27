@@ -24,6 +24,10 @@ enum HotKeyAction {
     case toggleWorkspaceSwitchAnimations
     case balance
     case retile
+    case openSettings
+    case decreaseGap
+    case increaseGap
+    case resetGap
     var shouldShowWorkspaceSwitchIndicator: Bool {
         switch self {
         case .createWorkspace, .deleteWorkspace, .switchWorkspace, .cycleWorkspace:
@@ -64,11 +68,13 @@ private struct RegisteredHotKey {
 final class HotKeyManager {
     static let shared = HotKeyManager()
     weak var delegate: HotKeyHandling?
+    let bindingStore = HotKeyBindingStore()
     private var eventHandler: EventHandlerRef?
     private var hotKeyRefs: [EventHotKeyRef?] = []
     private var overviewHotKeyRefs: [EventHotKeyRef?] = []
     private var overviewActionIDs: Set<UInt32> = []
     private var hotKeysByID: [UInt32: RegisteredHotKey] = [:]
+    private var recordingSuppressionCount = 0
     private var nextID: UInt32 = 1
     private let signature = fourCharCode("MCPN")
     private init() {}
@@ -90,27 +96,39 @@ final class HotKeyManager {
             NSLog("MacPane failed to install hotkey handler: \(handlerStatus)")
             return
         }
-        registerHotKeys()
+        registerMainHotKeys()
     }
     func stop() {
         delegate = nil
         unregisterWorkspaceOverviewHotKeys()
-        for hotKeyRef in hotKeyRefs {
-            if let hotKeyRef {
-                UnregisterEventHotKey(hotKeyRef)
-            }
-        }
-        hotKeyRefs.removeAll()
-        hotKeysByID.removeAll()
+        unregisterMainHotKeys()
+        recordingSuppressionCount = 0
         nextID = 1
         if let eventHandler {
             RemoveEventHandler(eventHandler)
             self.eventHandler = nil
         }
     }
+    func reregisterMainHotKeys() {
+        unregisterMainHotKeys()
+        guard recordingSuppressionCount == 0 else { return }
+        registerMainHotKeys()
+    }
+    func beginShortcutRecording() {
+        guard eventHandler != nil else { return }
+        recordingSuppressionCount += 1
+        guard recordingSuppressionCount == 1 else { return }
+        unregisterMainHotKeys()
+    }
+    func endShortcutRecording() {
+        guard recordingSuppressionCount > 0 else { return }
+        recordingSuppressionCount -= 1
+        guard recordingSuppressionCount == 0, eventHandler != nil else { return }
+        registerMainHotKeys()
+    }
     func registerWorkspaceOverviewHotKeys(workspaceCount: Int) {
         unregisterWorkspaceOverviewHotKeys()
-        for item in workspaceKeyCodes().prefix(min(max(workspaceCount, 0), 9)) {
+        for item in workspaceKeyCodes.prefix(min(max(workspaceCount, 0), 9)) {
             registerOverviewHotKey(keyCode: item.keyCode, modifiers: 0, action: .overviewSwitchWorkspace(item.index))
         }
         registerOverviewHotKey(keyCode: UInt32(kVK_ANSI_R), modifiers: 0, action: .overviewRenameStart)
@@ -134,30 +152,22 @@ final class HotKeyManager {
         let triggerKeyIsDown = CGEventSource.keyState(.hidSystemState, key: CGKeyCode(hotKey.keyCode))
         delegate?.handle(action: hotKey.action, eventAge: eventAge, triggerKeyIsDown: triggerKeyIsDown)
     }
-    private func registerHotKeys() {
-        for item in directionalKeyCodes() {
-            register(keyCode: item.keyCode, modifiers: UInt32(cmdKey | optionKey), action: .focus(item.direction))
-            register(keyCode: item.keyCode, modifiers: UInt32(cmdKey | shiftKey), action: .swap(item.direction))
-            register(keyCode: item.keyCode, modifiers: UInt32(cmdKey | controlKey), action: .resize(item.direction))
+    private func registerMainHotKeys() {
+        for binding in bindingStore.effectiveBindings() {
+            register(keyCode: binding.keyCode, modifiers: binding.modifiers, action: binding.entry.action)
         }
-        for item in workspaceKeyCodes() {
-            register(keyCode: item.keyCode, modifiers: UInt32(cmdKey | optionKey), action: .switchWorkspace(item.index))
-            register(keyCode: item.keyCode, modifiers: UInt32(cmdKey | controlKey), action: .moveWindowToWorkspace(item.index))
-            register(keyCode: item.keyCode, modifiers: UInt32(cmdKey | optionKey | controlKey), action: .moveWindowToWorkspace(item.index))
+    }
+    private func unregisterMainHotKeys() {
+        for hotKeyRef in hotKeyRefs {
+            if let hotKeyRef {
+                UnregisterEventHotKey(hotKeyRef)
+            }
         }
-        register(keyCode: UInt32(kVK_LeftArrow), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .cycleWorkspace(-1))
-        register(keyCode: UInt32(kVK_RightArrow), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .cycleWorkspace(1))
-        register(keyCode: UInt32(kVK_ANSI_H), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .cycleWorkspace(-1))
-        register(keyCode: UInt32(kVK_ANSI_L), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .cycleWorkspace(1))
-        register(keyCode: UInt32(kVK_ANSI_Equal), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .createWorkspace)
-        register(keyCode: UInt32(kVK_ANSI_Minus), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .deleteWorkspace)
-        register(keyCode: UInt32(kVK_ANSI_V), modifiers: UInt32(cmdKey | optionKey | controlKey), action: .showWorkspaceOverview)
-        register(keyCode: UInt32(kVK_ANSI_O), modifiers: UInt32(cmdKey | optionKey), action: .toggleOrientation)
-        register(keyCode: UInt32(kVK_ANSI_G), modifiers: UInt32(cmdKey | optionKey), action: .toggleFloating)
-        register(keyCode: UInt32(kVK_ANSI_Y), modifiers: UInt32(cmdKey | optionKey), action: .toggleTiling)
-        register(keyCode: UInt32(kVK_ANSI_A), modifiers: UInt32(cmdKey | optionKey), action: .toggleWorkspaceSwitchAnimations)
-        register(keyCode: UInt32(kVK_ANSI_B), modifiers: UInt32(cmdKey | optionKey), action: .balance)
-        register(keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(cmdKey | optionKey), action: .retile)
+        hotKeyRefs.removeAll()
+        let mainIDs = Set(hotKeysByID.keys).subtracting(overviewActionIDs)
+        for id in mainIDs {
+            hotKeysByID.removeValue(forKey: id)
+        }
     }
     private func register(keyCode: UInt32, modifiers: UInt32, action: HotKeyAction) {
         let id = nextID
@@ -199,35 +209,6 @@ final class HotKeyManager {
         } else {
             NSLog("MacPane failed to register overview hotkey id=\(id) key=\(keyCode) modifiers=\(modifiers): \(status)")
         }
-    }
-    private func arrowKeyCodes() -> [(keyCode: UInt32, direction: SnapDirection)] {
-        [
-            (UInt32(kVK_LeftArrow), .left),
-            (UInt32(kVK_DownArrow), .down),
-            (UInt32(kVK_UpArrow), .up),
-            (UInt32(kVK_RightArrow), .right)
-        ]
-    }
-    private func workspaceKeyCodes() -> [(keyCode: UInt32, index: Int)] {
-        [
-            (UInt32(kVK_ANSI_1), 0),
-            (UInt32(kVK_ANSI_2), 1),
-            (UInt32(kVK_ANSI_3), 2),
-            (UInt32(kVK_ANSI_4), 3),
-            (UInt32(kVK_ANSI_5), 4),
-            (UInt32(kVK_ANSI_6), 5),
-            (UInt32(kVK_ANSI_7), 6),
-            (UInt32(kVK_ANSI_8), 7),
-            (UInt32(kVK_ANSI_9), 8)
-        ]
-    }
-    private func directionalKeyCodes() -> [(keyCode: UInt32, direction: SnapDirection)] {
-        arrowKeyCodes() + [
-            (UInt32(kVK_ANSI_H), .left),
-            (UInt32(kVK_ANSI_J), .down),
-            (UInt32(kVK_ANSI_K), .up),
-            (UInt32(kVK_ANSI_L), .right)
-        ]
     }
 }
 private let hotKeyEventHandler: EventHandlerUPP = { _, event, _ in
