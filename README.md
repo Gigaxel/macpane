@@ -1,6 +1,6 @@
 # MacPane
 
-> **Pre-alpha:** MacPane is a work in progress. Bugs, rough edges, and behavior changes are expected.
+> **Early release:** MacPane is reasonably stable for daily use. Rough edges and behavior changes are still possible. There are no official releases yet; build the app yourself using the instructions below.
 
 MacPane is a tiny macOS menu bar window manager. It auto-tiles regular app windows with the macOS Accessibility API, then lets you focus, swap, resize, and rotate tiles with global keyboard shortcuts.
 
