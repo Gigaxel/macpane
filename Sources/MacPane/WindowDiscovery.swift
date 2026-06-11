@@ -20,7 +20,10 @@ struct WindowDiscovery {
         knownStateKey: (WindowIdentity) -> String?,
         screenForKnownStateKey: (String, ScreenInfo) -> ScreenInfo
     ) -> WindowDiscoveryResult {
-        var candidates = windowCandidates(screens: screens)
+        var candidates = windowCandidates(
+            screens: screens,
+            visiblePIDs: Set(snapshot.visibleNumbersByPID.keys)
+        )
         candidates = visibleCandidates(from: candidates, snapshot: snapshot)
 
         let stronglyVisibleIDs = stronglyVisibleIDs(from: candidates, identityRegistry: identityRegistry)
@@ -43,9 +46,9 @@ struct WindowDiscovery {
         )
     }
 
-    private func windowCandidates(screens: [ScreenInfo]) -> [ManagedWindowCandidate] {
+    private func windowCandidates(screens: [ScreenInfo], visiblePIDs: Set<pid_t>) -> [ManagedWindowCandidate] {
         let apps = NSWorkspace.shared.runningApplications
-            .filter(metadataReader.isManageableApp)
+            .filter { visiblePIDs.contains($0.processIdentifier) && metadataReader.isManageableApp($0) }
             .sorted { lhs, rhs in
                 (lhs.localizedName ?? lhs.bundleIdentifier ?? "") < (rhs.localizedName ?? rhs.bundleIdentifier ?? "")
             }
@@ -93,13 +96,14 @@ struct WindowDiscovery {
         }
 
         let screen = screenCatalog.info(for: frame, screens: screens)
+        let descriptors = metadataReader.descriptors(for: window, app: app, title: title, stateKey: screen.stateKey)
         return ManagedWindowCandidate(
             pid: app.processIdentifier,
             windowNumber: AXReader.int(window, attribute: "AXWindowNumber")
                 ?? AXReader.int(window, attribute: "_AXWindowNumber"),
             elementKey: WindowElementKey(pid: app.processIdentifier, hash: CFHash(window)),
-            signature: metadataReader.signature(for: window, app: app, title: title, stateKey: screen.stateKey),
-            layoutIdentity: metadataReader.layoutIdentity(for: window, app: app, title: title),
+            signature: descriptors.signature,
+            layoutIdentity: descriptors.layoutIdentity,
             element: window,
             screen: screen,
             frame: frame,

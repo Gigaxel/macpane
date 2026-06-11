@@ -1,4 +1,42 @@
+import Foundation
+
+struct DepartedScreenLayout {
+    let state: ScreenTileState
+    let createdAt: Date
+}
+
 enum WindowStateSyncPlanner {
+    static let departedLayoutExpiry: TimeInterval = 6 * 60 * 60
+
+    static func restoredDepartedLayout(
+        memory: DepartedScreenLayout,
+        visibleIDs: Set<WindowIdentity>,
+        currentState: ScreenTileState?,
+        now: Date = Date()
+    ) -> ScreenTileState? {
+        guard now.timeIntervalSince(memory.createdAt) <= departedLayoutExpiry else { return nil }
+        let currentIDs = currentState?.windowIDs ?? []
+        let returningIDs = memory.state.windowIDs.intersection(visibleIDs).subtracting(currentIDs)
+        guard !returningIDs.isEmpty else { return nil }
+        return memory.state
+    }
+
+    static func shouldRememberDepartedLayout(
+        previousState: ScreenTileState,
+        visibleIDs: Set<WindowIdentity>,
+        existingMemory: DepartedScreenLayout?,
+        now: Date = Date()
+    ) -> Bool {
+        let departingIDs = previousState.windowIDs.subtracting(visibleIDs)
+        guard !departingIDs.isEmpty else { return false }
+        if let existingMemory,
+           now.timeIntervalSince(existingMemory.createdAt) <= departedLayoutExpiry,
+           existingMemory.state.windowIDs.isSuperset(of: previousState.windowIDs) {
+            return false
+        }
+        return true
+    }
+
     static func hasWindowSetChanged(
         windows: [ManagedWindow],
         activeStateKeys: Set<String>,
@@ -26,7 +64,8 @@ enum WindowStateSyncPlanner {
         activeStateKeys: Set<String>,
         frozenSystemUIScreenStates: [String: ScreenTileState]?,
         screenStates: [String: ScreenTileState],
-        floatingWindowIDs: Set<WindowIdentity>
+        floatingWindowIDs: Set<WindowIdentity>,
+        departedWindowIDs: Set<WindowIdentity> = []
     ) -> Set<WindowIdentity> {
         var retainedIDs: Set<WindowIdentity> = []
         if let frozenSystemUIScreenStates {
@@ -39,6 +78,7 @@ enum WindowStateSyncPlanner {
         let trackedStateIDs = screenStates.values.flatMap(\.windowIDs)
         retainedIDs.formUnion(trackedStateIDs)
         retainedIDs.formUnion(floatingWindowIDs)
+        retainedIDs.formUnion(departedWindowIDs)
         return retainedIDs
     }
 }

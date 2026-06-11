@@ -20,6 +20,7 @@ final class WindowTilerSettings {
 
     private var activeWorkspaceIndexByNativeStateKey: [String: Int] = [:]
     private var activeWorkspaceIndexByDisplayKey: [String: Int] = [:]
+    private(set) var workspaceConfigurationVersion = 0
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -41,6 +42,7 @@ final class WindowTilerSettings {
 
     func setWorkspaceCount(_ value: Int) {
         defaults.set(min(max(value, 1), maximumWorkspaceCount), forKey: DefaultsKey.workspaceCount)
+        workspaceConfigurationVersion += 1
     }
 
     var tilingEnabled: Bool {
@@ -84,6 +86,7 @@ final class WindowTilerSettings {
     func resetRuntimeState() {
         activeWorkspaceIndexByNativeStateKey.removeAll()
         activeWorkspaceIndexByDisplayKey.removeAll()
+        workspaceConfigurationVersion += 1
     }
 
     func availableWorkspaceIndex(_ index: Int) -> Int? {
@@ -112,6 +115,7 @@ final class WindowTilerSettings {
         activeWorkspaceIndexByDisplayKey = activeWorkspaceIndexByDisplayKey.mapValues {
             shiftedActiveWorkspaceIndex($0, deletingWorkspaceIndex: index, newWorkspaceCount: newWorkspaceCount)
         }
+        workspaceConfigurationVersion += 1
     }
 
     func activeWorkspaceIndex(forNativeStateKey nativeStateKey: String) -> Int {
@@ -134,8 +138,13 @@ final class WindowTilerSettings {
 
     func setActiveWorkspaceIndex(_ index: Int, forNativeStateKey nativeStateKey: String) {
         let index = clampedWorkspaceIndex(index)
+        let displayKey = displayKeyComponent(of: nativeStateKey)
+        if activeWorkspaceIndexByNativeStateKey[nativeStateKey] != index ||
+            activeWorkspaceIndexByDisplayKey[displayKey] != index {
+            workspaceConfigurationVersion += 1
+        }
         activeWorkspaceIndexByNativeStateKey[nativeStateKey] = index
-        activeWorkspaceIndexByDisplayKey[displayKeyComponent(of: nativeStateKey)] = index
+        activeWorkspaceIndexByDisplayKey[displayKey] = index
     }
 
     func hasWorkspaceMetadata(forNativeStateKey nativeStateKey: String) -> Bool {
@@ -218,6 +227,9 @@ final class WindowTilerSettings {
         }
         if activeWorkspaceIndexByDisplayKey.removeValue(forKey: displayKeyComponent(of: sourceNativeStateKey)) != nil {
             migrated = true
+        }
+        if migrated {
+            workspaceConfigurationVersion += 1
         }
         if let focusedWorkspaceIndex {
             setActiveWorkspaceIndex(focusedWorkspaceIndex, forNativeStateKey: targetNativeStateKey)

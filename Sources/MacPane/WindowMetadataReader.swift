@@ -53,27 +53,36 @@ struct WindowMetadataReader {
         return true
     }
 
-    func signature(for window: AXUIElement, app: NSRunningApplication, title: String?, stateKey: String) -> WindowSignature? {
+    func descriptors(
+        for window: AXUIElement,
+        app: NSRunningApplication,
+        title: String?,
+        stateKey: String
+    ) -> (signature: WindowSignature?, layoutIdentity: WindowLayoutIdentity?) {
+        let pid = app.processIdentifier
+        let bundleIdentifier = normalizedWindowString(app.bundleIdentifier)
+        let axIdentifier = normalizedWindowString(AXReader.string(window, attribute: "AXIdentifier"))
+        let document = normalizedWindowString(AXReader.string(window, attribute: kAXDocumentAttribute))
+        let normalizedTitle = normalizedWindowString(title)
         let signature = WindowSignature(
-            pid: app.processIdentifier,
+            pid: pid,
             stateKey: stateKey,
-            bundleIdentifier: normalizedWindowString(app.bundleIdentifier),
-            axIdentifier: normalizedWindowString(AXReader.string(window, attribute: "AXIdentifier")),
-            document: normalizedWindowString(AXReader.string(window, attribute: kAXDocumentAttribute)),
-            title: normalizedWindowString(title)
+            bundleIdentifier: bundleIdentifier,
+            axIdentifier: axIdentifier,
+            document: document,
+            title: normalizedTitle
         )
-        return signature.hasStableComponent ? signature : nil
-    }
-
-    func layoutIdentity(for window: AXUIElement, app: NSRunningApplication, title: String?) -> WindowLayoutIdentity? {
-        let identity = WindowLayoutIdentity(
-            pid: app.processIdentifier,
-            bundleIdentifier: normalizedWindowString(app.bundleIdentifier),
-            axIdentifier: normalizedWindowString(AXReader.string(window, attribute: "AXIdentifier")),
-            document: normalizedWindowString(AXReader.string(window, attribute: kAXDocumentAttribute)),
-            title: normalizedWindowString(title)
+        let layoutIdentity = WindowLayoutIdentity(
+            pid: pid,
+            bundleIdentifier: bundleIdentifier,
+            axIdentifier: axIdentifier,
+            document: document,
+            title: normalizedTitle
         )
-        return identity.hasStableComponent ? identity : nil
+        return (
+            signature.hasStableComponent ? signature : nil,
+            layoutIdentity.hasStableComponent ? layoutIdentity : nil
+        )
     }
 
     func notificationToken(for window: AXUIElement, fallbackIndex: Int) -> String {

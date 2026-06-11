@@ -50,6 +50,11 @@ final class WindowTiler {
     private var identityRegistry = WindowIdentityRegistry()
     private var layoutIdentityByWindowID: [WindowIdentity: WindowLayoutIdentity] = [:]
     private var persistedLayoutsByStateKey: [String: PersistedScreenLayout] = [:]
+    private var departedLayoutsByStateKey: [String: DepartedScreenLayout] = [:]
+    private var cachedScreenInfos: (infos: [ScreenInfo], settingsVersion: Int, createdAt: Date)?
+    private let screenInfoCacheDuration: TimeInterval = 0.25
+    private var lastWindowNotificationSweep = Date.distantPast
+    private let windowNotificationSweepInterval: TimeInterval = 1.0
     private let visibilityScanInterval: TimeInterval = 2.0
     private let observerRecoveryInterval: TimeInterval = 15.0
     private var lastVisibleWindowSignature = VisibleWindowSignature()
@@ -200,6 +205,9 @@ final class WindowTiler {
         floatingWindowStateKeys.removeAll()
         layoutIdentityByWindowID.removeAll()
         persistedLayoutsByStateKey.removeAll()
+        departedLayoutsByStateKey.removeAll()
+        cachedScreenInfos = nil
+        lastWindowNotificationSweep = .distantPast
         lastVisibleWindowSignature = VisibleWindowSignature()
         lastSyncedVisibleWindowSignature = VisibleWindowSignature()
         lastAppliedFrameByWindowID.removeAll()
@@ -415,11 +423,11 @@ final class WindowTiler {
         switch notification {
         case kAXWindowCreatedNotification:
             invalidateManagedWindowCache(clearAppliedFrames: true)
-            refreshWindowNotificationRegistrations()
+            registerWindowNotifications(forCreatedElement: element)
             scheduleWindowDiscoveryReconcileBurst(initialDelay: 0.025)
         case kAXUIElementDestroyedNotification:
             invalidateManagedWindowCache(clearAppliedFrames: true)
-            removeFloatingWindowID(forDestroyedElement: element)
+            removeDestroyedWindowState(forElement: element)
             scheduleReconcile(delay: 0.015)
         case kAXFocusedWindowChangedNotification,
              kAXApplicationActivatedNotification,
@@ -541,6 +549,7 @@ final class WindowTiler {
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            self?.invalidateScreenInfoCache()
             self?.recordScreenParameterChangeForWorkspaceMigration()
             self?.pauseLayoutForSystemUI(duration: 1.20, preserveLayout: true)
             self?.scheduleReconcile(delay: 1.35)
@@ -571,6 +580,7 @@ final class WindowTiler {
             removeObserver(for: pid)
         }
         removeFloatingWindowIDs(forTerminatedPIDs: stalePIDs)
+        pruneDepartedLayouts(forTerminatedPIDs: stalePIDs)
         for app in runningApps where appObservers[app.processIdentifier] == nil {
             installObserver(for: app)
         }
@@ -610,8 +620,34 @@ final class WindowTiler {
     }
     private func refreshWindowNotificationRegistrations() {
         guard !isStopping else { return }
+        lastWindowNotificationSweep = Date()
         for app in NSWorkspace.shared.runningApplications.filter(metadataReader.isObservableApp) {
             registerWindowNotifications(for: app)
+        }
+    }
+    private func refreshWindowNotificationRegistrationsIfStale() {
+        guard Date().timeIntervalSince(lastWindowNotificationSweep) >= windowNotificationSweepInterval else { return }
+        refreshWindowNotificationRegistrations()
+    }
+    private func registerWindowNotifications(forCreatedElement element: AXUIElement) {
+        guard !isStopping else { return }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success,
+              let registration = appObservers[pid] else {
+            return
+        }
+        let token = metadataReader.notificationToken(for: element, fallbackIndex: registration.observedWindowTokens.count)
+        guard !registration.observedWindowTokens.contains(token) else { return }
+        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        var registered = false
+        for notification in [kAXMovedNotification, kAXResizedNotification, kAXUIElementDestroyedNotification] {
+            let error = AXObserverAddNotification(registration.observer, element, notification as CFString, refcon)
+            if error == .success || error == .notificationAlreadyRegistered {
+                registered = true
+            }
+        }
+        if registered {
+            registration.observedWindowTokens.insert(token)
         }
     }
     private func registerWindowNotifications(for app: NSRunningApplication) {
@@ -712,10 +748,10 @@ final class WindowTiler {
     }
     private func scheduleExternalMove(element: AXUIElement, userInitiated: Bool) {
         guard !isStopping, tilingEnabled, userInitiated, frozenSystemUIScreenStates == nil else { return }
-        guard AXReader.string(element, attribute: kAXRoleAttribute) == kAXWindowRole else { return }
         pendingMove?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, !self.isStopping else { return }
+            guard AXReader.string(element, attribute: kAXRoleAttribute) == kAXWindowRole else { return }
             self.handleExternalMove(element: element, userInitiated: userInitiated)
         }
         pendingMove = workItem
@@ -723,10 +759,10 @@ final class WindowTiler {
     }
     private func scheduleExternalResize(element: AXUIElement, userInitiated: Bool) {
         guard !isStopping, tilingEnabled, userInitiated, frozenSystemUIScreenStates == nil else { return }
-        guard AXReader.string(element, attribute: kAXRoleAttribute) == kAXWindowRole else { return }
         pendingResize?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, !self.isStopping else { return }
+            guard AXReader.string(element, attribute: kAXRoleAttribute) == kAXWindowRole else { return }
             self.handleExternalResize(element: element, userInitiated: userInitiated)
         }
         pendingResize = workItem
@@ -755,7 +791,7 @@ final class WindowTiler {
             handleSystemUISettled()
             return
         }
-        refreshWindowNotificationRegistrations()
+        refreshWindowNotificationRegistrationsIfStale()
         let allWindows = managedWindows()
         let tiled = tiledWindows(from: allWindows)
         let focusedID = focusTracker.focusedWindowID(in: allWindows)
@@ -823,6 +859,7 @@ final class WindowTiler {
         let observedSlot = TileSlot.normalized(from: changedWindow.frame, in: screen.frame)
         if state.reflectResize(focusedID: changedWindow.id, observedSlot: observedSlot) {
             screenStates[key] = state
+            invalidateDepartedLayout(forStateKey: key)
         }
         applyLayout(to: allWindows)
         focus(window: changedWindow, updateTreeFocus: true)
@@ -846,6 +883,8 @@ final class WindowTiler {
         destinationState.insertExisting(changedWindow.id, near: destinationState.lastFocusedOrLargestID, placement: .automatic)
         destinationState.markFocused(changedWindow.id)
         screenStates[destinationKey] = destinationState
+        invalidateDepartedLayout(forStateKey: sourceKey)
+        invalidateDepartedLayout(forStateKey: destinationKey)
         applyLayout(to: allWindows)
         focus(window: changedWindow, updateTreeFocus: true)
         return true
@@ -886,6 +925,8 @@ final class WindowTiler {
                 screenStates[targetKey] = targetState
             }
         }
+        invalidateDepartedLayout(forStateKey: sourceKey)
+        invalidateDepartedLayout(forStateKey: targetKey)
         applyLayout(to: allWindows)
         focus(window: moving, updateTreeFocus: true)
         return true
@@ -1106,6 +1147,7 @@ final class WindowTiler {
                 return false
             }
             self.screenStates[key] = state
+            self.invalidateDepartedLayout(forStateKey: key)
             self.applyLayout(to: allWindows, limitingToStateKeys: [key])
             return true
         }
@@ -1120,6 +1162,7 @@ final class WindowTiler {
                 return false
             }
             self.screenStates[key] = state
+            self.invalidateDepartedLayout(forStateKey: key)
             self.applyLayout(to: allWindows, limitingToStateKeys: [key])
             if let focusedWindow = allWindows.first(where: { $0.id == focusedID }) {
                 self.focus(window: focusedWindow, updateTreeFocus: false)
@@ -1138,6 +1181,7 @@ final class WindowTiler {
                 return false
             }
             self.screenStates[key] = state
+            self.invalidateDepartedLayout(forStateKey: key)
             self.applyLayout(to: allWindows, limitingToStateKeys: [key])
             return true
         }
@@ -1559,6 +1603,7 @@ final class WindowTiler {
             screenStates,
             deletingWorkspaceIndex: deletingIndex
         )
+        departedLayoutsByStateKey.removeAll()
         persistedLayoutsByStateKey = WorkspaceStatePlanner.shiftedPersistedLayouts(
             persistedLayoutsByStateKey,
             deletingWorkspaceIndex: deletingIndex
@@ -1617,6 +1662,8 @@ final class WindowTiler {
         targetState.insertExisting(focusedID, near: targetState.lastFocusedOrLargestID, placement: .automatic)
         targetState.markFocused(focusedID)
         screenStates[targetKey] = targetState
+        invalidateDepartedLayout(forStateKey: sourceKey)
+        invalidateDepartedLayout(forStateKey: targetKey)
         suppressExternalChanges(for: 0.65)
         applyLayout(to: allWindows)
         let activeTargetKey = ScreenInfo.workspaceStateKey(
@@ -1652,6 +1699,7 @@ final class WindowTiler {
                 state.remove(focusedID)
                 screenStates[key] = state
             }
+            invalidateDepartedLayout(forStateKey: key)
         }
         scheduleReconcile(delay: 0.01)
     }
@@ -1679,6 +1727,7 @@ final class WindowTiler {
             state.balance()
             state.markFocused(focusedID)
             self.screenStates[key] = state
+            self.invalidateDepartedLayout(forStateKey: key)
             self.applyLayout(to: allWindows, limitingToStateKeys: [key])
             return true
         }
@@ -1692,6 +1741,8 @@ final class WindowTiler {
         let grouped = Dictionary(grouping: windows, by: { $0.screen.stateKey })
         let idsByScreen = grouped.mapValues { Set($0.map(\.id)) }
         let activeStateKeys = Set(currentScreenInfos().map(\.stateKey))
+        restoreDepartedLayouts(idsByScreen: idsByScreen)
+        rememberDepartedLayouts(idsByScreen: idsByScreen, activeStateKeys: activeStateKeys)
         for key in Array(screenStates.keys) where activeStateKeys.contains(key) {
             var state = screenStates[key] ?? ScreenTileState()
             state.removeMissing(keeping: idsByScreen[key] ?? [])
@@ -1727,6 +1778,77 @@ final class WindowTiler {
             }
         }
     }
+
+    // MARK: - Departed Layout Memory
+
+    private func restoreDepartedLayouts(idsByScreen: [String: Set<WindowIdentity>]) {
+        for (key, visibleIDs) in idsByScreen {
+            guard let memory = departedLayoutsByStateKey[key],
+                  let restored = WindowStateSyncPlanner.restoredDepartedLayout(
+                      memory: memory,
+                      visibleIDs: visibleIDs,
+                      currentState: screenStates[key]
+                  ) else {
+                continue
+            }
+            screenStates[key] = restored
+            departedLayoutsByStateKey.removeValue(forKey: key)
+        }
+    }
+    private func rememberDepartedLayouts(idsByScreen: [String: Set<WindowIdentity>], activeStateKeys: Set<String>) {
+        for (key, state) in screenStates where activeStateKeys.contains(key) && !state.isEmpty {
+            guard WindowStateSyncPlanner.shouldRememberDepartedLayout(
+                previousState: state,
+                visibleIDs: idsByScreen[key] ?? [],
+                existingMemory: departedLayoutsByStateKey[key]
+            ) else {
+                continue
+            }
+            departedLayoutsByStateKey[key] = DepartedScreenLayout(state: state, createdAt: Date())
+        }
+    }
+    private var departedWindowIDs: Set<WindowIdentity> {
+        Set(departedLayoutsByStateKey.values.flatMap(\.state.windowIDs))
+    }
+    private func invalidateDepartedLayout(forStateKey key: String?) {
+        guard let key else { return }
+        departedLayoutsByStateKey.removeValue(forKey: key)
+    }
+    private func pruneDepartedLayouts(forTerminatedPIDs pids: Set<pid_t>) {
+        guard !pids.isEmpty else { return }
+        pruneDepartedLayouts { pids.contains($0.pid) }
+    }
+    private func pruneDepartedLayouts(removing shouldRemove: (WindowIdentity) -> Bool) {
+        for (key, memory) in departedLayoutsByStateKey {
+            let removedIDs = memory.state.windowIDs.filter(shouldRemove)
+            guard !removedIDs.isEmpty else { continue }
+            var state = memory.state
+            for id in removedIDs {
+                state.remove(id)
+            }
+            if state.isEmpty {
+                departedLayoutsByStateKey.removeValue(forKey: key)
+            } else {
+                departedLayoutsByStateKey[key] = DepartedScreenLayout(state: state, createdAt: memory.createdAt)
+            }
+        }
+    }
+    private func removeDestroyedWindowState(forElement element: AXUIElement) {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success else { return }
+        let windowKey = AXReader.int(element, attribute: "AXWindowNumber")
+            .map { WindowOrderKey(pid: pid, number: $0) }
+            ?? AXReader.int(element, attribute: "_AXWindowNumber")
+            .map { WindowOrderKey(pid: pid, number: $0) }
+        let elementKey = WindowElementKey(pid: pid, hash: CFHash(element))
+        guard let id = identityRegistry.identityForStrongAlias(windowKey: windowKey, elementKey: elementKey) else {
+            return
+        }
+        if floatingWindowIDs.contains(id) {
+            removeFloatingWindowIDs([id])
+        }
+        pruneDepartedLayouts { $0 == id }
+    }
     private func mergeAllWorkspaceStatesIntoActiveWorkspaces(focusedID: WindowIdentity?) -> Bool {
         let screens = currentScreenInfos()
         guard !screens.isEmpty else { return false }
@@ -1748,6 +1870,9 @@ final class WindowTiler {
                 to: targetKey,
                 floatingWindowStateKeys: &floatingWindowStateKeys
             ) || merged
+        }
+        if merged {
+            departedLayoutsByStateKey.removeAll()
         }
         return merged
     }
@@ -1989,6 +2114,7 @@ final class WindowTiler {
     private func resumeSystemSessionLayoutAfterWakeOrUnlock() {
         isSystemSessionSuspended = false
         cachedAccessibilityPermission = nil
+        invalidateScreenInfoCache()
         invalidateManagedWindowCache(clearAppliedFrames: true)
         refreshAppObservers()
         pauseLayoutForSystemUI(duration: 1.80, preserveLayout: true)
@@ -2096,6 +2222,9 @@ final class WindowTiler {
             ) || migrated
         }
         shouldMigrateWorkspaceStatesAfterScreenChange = false
+        if migrated {
+            departedLayoutsByStateKey.removeAll()
+        }
         return migrated
     }
     private func migrateOrphanedWorkspaceStatesAfterScreenChange(
@@ -2227,20 +2356,6 @@ final class WindowTiler {
             floatingWindowStateKeys[window.id] = window.screen.stateKey
         }
     }
-    private func removeFloatingWindowID(forDestroyedElement element: AXUIElement) {
-        var pid: pid_t = 0
-        guard AXUIElementGetPid(element, &pid) == .success else { return }
-        let windowKey = AXReader.int(element, attribute: "AXWindowNumber")
-            .map { WindowOrderKey(pid: pid, number: $0) }
-            ?? AXReader.int(element, attribute: "_AXWindowNumber")
-            .map { WindowOrderKey(pid: pid, number: $0) }
-        let elementKey = WindowElementKey(pid: pid, hash: CFHash(element))
-        guard let id = identityRegistry.identityForStrongAlias(windowKey: windowKey, elementKey: elementKey),
-              floatingWindowIDs.contains(id) else {
-            return
-        }
-        removeFloatingWindowIDs([id])
-    }
     private func removeFloatingWindowIDs(forTerminatedPIDs pids: Set<pid_t>) {
         guard !pids.isEmpty else { return }
         removeFloatingWindowIDs(Set(floatingWindowIDs.filter { pids.contains($0.pid) }))
@@ -2355,6 +2470,12 @@ final class WindowTiler {
                 screenStates[key] = state
             }
         }
+        for (key, memory) in departedLayoutsByStateKey {
+            var state = memory.state
+            if state.replaceWindowIDs(replacements) {
+                departedLayoutsByStateKey[key] = DepartedScreenLayout(state: state, createdAt: memory.createdAt)
+            }
+        }
         for (storedID, visibleID) in replacements {
             if floatingWindowIDs.remove(storedID) != nil {
                 floatingWindowIDs.insert(visibleID)
@@ -2382,6 +2503,7 @@ final class WindowTiler {
             retainedIDs.formUnion(frozenSystemUIScreenStates.values.flatMap(\.windowIDs))
         }
         retainedIDs.formUnion(floatingWindowIDs)
+        retainedIDs.formUnion(departedWindowIDs)
         layoutIdentityByWindowID = layoutIdentityByWindowID.filter { retainedIDs.contains($0.key) }
     }
     @discardableResult
@@ -2498,10 +2620,9 @@ final class WindowTiler {
     private func screenInfo(
         forKnownStateKey stateKey: String,
         fallback: ScreenInfo,
-        catalog: ScreenCatalog? = nil
+        screens: [ScreenInfo]
     ) -> ScreenInfo {
         let nativeStateKey = WorkspaceStateKeys.nativeStateKeyComponent(of: stateKey)
-        let screens = (catalog ?? screenCatalog).currentInfos()
         if let screen = screens.first(where: { $0.nativeStateKey == nativeStateKey }) {
             return screen.withStateKeyOverride(stateKey)
         }
@@ -2521,6 +2642,20 @@ final class WindowTiler {
     private func stateKey(containing id: WindowIdentity, activeStateKeys: Set<String>) -> String? {
         screenStates.first { activeStateKeys.contains($0.key) && $0.value.contains(id) }?.key
             ?? screenStates.first { $0.value.contains(id) }?.key
+    }
+    private func stateKeyIndex(activeStateKeys: Set<String>) -> [WindowIdentity: String] {
+        var index: [WindowIdentity: String] = [:]
+        for (key, state) in screenStates where !activeStateKeys.contains(key) {
+            for id in state.windowIDs where index[id] == nil {
+                index[id] = key
+            }
+        }
+        for (key, state) in screenStates where activeStateKeys.contains(key) {
+            for id in state.windowIDs {
+                index[id] = key
+            }
+        }
+        return index
     }
 
     // MARK: - Window Discovery
@@ -2573,14 +2708,15 @@ final class WindowTiler {
     }
     private func managedWindows(snapshot: OnScreenWindowSnapshot, catalog: ScreenCatalog? = nil) -> [ManagedWindow] {
         lastVisibleWindowSignature = VisibleWindowSignature(snapshot: snapshot)
+        let screens = catalog?.currentInfos() ?? currentScreenInfos()
         let catalog = catalog ?? screenCatalog
-        let screens = catalog.currentInfos()
         let activeStateKeys = Set(screens.map(\.stateKey))
         let retainedOffscreenIDs = WindowStateSyncPlanner.retainedOffscreenWindowIDs(
             activeStateKeys: activeStateKeys,
             frozenSystemUIScreenStates: frozenSystemUIScreenStates,
             screenStates: screenStates,
-            floatingWindowIDs: floatingWindowIDs
+            floatingWindowIDs: floatingWindowIDs,
+            departedWindowIDs: departedWindowIDs
         )
 
         var registry = identityRegistry
@@ -2589,13 +2725,14 @@ final class WindowTiler {
             screenCatalog: catalog,
             accessibilityMessagingTimeout: accessibilityMessagingTimeout
         )
+        let stateKeyByWindowID = stateKeyIndex(activeStateKeys: activeStateKeys)
         let result = discovery.managedWindows(
             snapshot: snapshot,
             screens: screens,
             retainedOffscreenIDs: retainedOffscreenIDs,
             identityRegistry: &registry,
-            knownStateKey: { self.stateKey(containing: $0, activeStateKeys: activeStateKeys) },
-            screenForKnownStateKey: { self.screenInfo(forKnownStateKey: $0, fallback: $1, catalog: catalog) }
+            knownStateKey: { stateKeyByWindowID[$0] },
+            screenForKnownStateKey: { self.screenInfo(forKnownStateKey: $0, fallback: $1, screens: screens) }
         )
         identityRegistry = registry
 
@@ -2628,10 +2765,22 @@ final class WindowTiler {
         return frame
     }
     private func currentScreenInfosByKey() -> [String: ScreenInfo] {
-        screenCatalog.infosByKey()
+        Dictionary(currentScreenInfos().map { ($0.stateKey, $0) }, uniquingKeysWith: { first, _ in first })
     }
     private func currentScreenInfos() -> [ScreenInfo] {
-        screenCatalog.currentInfos()
+        let version = settings.workspaceConfigurationVersion
+        let now = Date()
+        if let cachedScreenInfos,
+           cachedScreenInfos.settingsVersion == version,
+           now.timeIntervalSince(cachedScreenInfos.createdAt) <= screenInfoCacheDuration {
+            return cachedScreenInfos.infos
+        }
+        let infos = screenCatalog.currentInfos()
+        cachedScreenInfos = (infos, version, now)
+        return infos
+    }
+    private func invalidateScreenInfoCache() {
+        cachedScreenInfos = nil
     }
     private func currentCursorPoint() -> CGPoint {
         CGEvent(source: nil)?.location ?? NSEvent.mouseLocation

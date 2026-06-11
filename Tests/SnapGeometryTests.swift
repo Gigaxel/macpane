@@ -44,6 +44,9 @@ struct SnapGeometryTests {
         testWindowStateSyncPlannerDetectsUnchangedWindowSet()
         testWindowStateSyncPlannerDetectsWindowSetChanges()
         testWindowStateSyncPlannerRetainsOffscreenWindows()
+        testDepartedLayoutRestoresWhenWindowReturns()
+        testDepartedLayoutDoesNotRestoreWithoutReturningWindow()
+        testDepartedLayoutCaptureRules()
         testWindowLayoutPlannerTilesShrunkenWindow()
         testChainedSlideSkipsAlreadyHiddenNonTargetWindows()
         testWorkspaceSwitchApplyPlanIncludesAdditionalChainedStates()
@@ -786,6 +789,7 @@ struct SnapGeometryTests {
         let inactiveID = windowID(2)
         let frozenID = windowID(3)
         let floatingID = windowID(4)
+        let departedID = windowID(5)
 
         let retained = WindowStateSyncPlanner.retainedOffscreenWindowIDs(
             activeStateKeys: [activeKey],
@@ -794,11 +798,98 @@ struct SnapGeometryTests {
                 activeKey: screenState([activeID], focused: activeID),
                 inactiveKey: screenState([inactiveID], focused: inactiveID)
             ],
-            floatingWindowIDs: [floatingID]
+            floatingWindowIDs: [floatingID],
+            departedWindowIDs: [departedID]
         )
-        let expected = Set([activeID, inactiveID, frozenID, floatingID])
+        let expected = Set([activeID, inactiveID, frozenID, floatingID, departedID])
         if retained != expected {
-            fail("offscreen retention should include floating, frozen, and every tracked state key (active included)")
+            fail("offscreen retention should include floating, frozen, departed, and every tracked state key (active included)")
+        }
+    }
+    private static func testDepartedLayoutRestoresWhenWindowReturns() {
+        let first = windowID(1)
+        let second = windowID(2)
+        let third = windowID(3)
+        let fullState = screenState([first, second, third], focused: second)
+        let memory = DepartedScreenLayout(state: fullState, createdAt: Date())
+        let remainingState = screenState([first, third], focused: first)
+
+        guard let restored = WindowStateSyncPlanner.restoredDepartedLayout(
+            memory: memory,
+            visibleIDs: [first, second, third],
+            currentState: remainingState
+        ) else {
+            fail("departed layout should restore when a departed window becomes visible again")
+        }
+        if restored.windowIDs != fullState.windowIDs {
+            fail("restored departed layout should contain the full pre-departure window set")
+        }
+        if restored.slots != fullState.slots {
+            fail("restored departed layout should preserve the pre-departure slots exactly")
+        }
+    }
+    private static func testDepartedLayoutDoesNotRestoreWithoutReturningWindow() {
+        let first = windowID(1)
+        let second = windowID(2)
+        let memory = DepartedScreenLayout(state: screenState([first, second]), createdAt: Date())
+
+        if WindowStateSyncPlanner.restoredDepartedLayout(
+            memory: memory,
+            visibleIDs: [first],
+            currentState: screenState([first])
+        ) != nil {
+            fail("departed layout must not restore while the departed window is still away")
+        }
+        let expired = DepartedScreenLayout(
+            state: screenState([first, second]),
+            createdAt: Date().addingTimeInterval(-WindowStateSyncPlanner.departedLayoutExpiry - 1)
+        )
+        if WindowStateSyncPlanner.restoredDepartedLayout(
+            memory: expired,
+            visibleIDs: [first, second],
+            currentState: screenState([first])
+        ) != nil {
+            fail("expired departed layout must not restore")
+        }
+    }
+    private static func testDepartedLayoutCaptureRules() {
+        let first = windowID(1)
+        let second = windowID(2)
+        let third = windowID(3)
+        let fullState = screenState([first, second, third])
+
+        if !WindowStateSyncPlanner.shouldRememberDepartedLayout(
+            previousState: fullState,
+            visibleIDs: [first, third],
+            existingMemory: nil
+        ) {
+            fail("a state losing a window should be remembered as a departed layout")
+        }
+        if WindowStateSyncPlanner.shouldRememberDepartedLayout(
+            previousState: fullState,
+            visibleIDs: [first, second, third],
+            existingMemory: nil
+        ) {
+            fail("a state losing nothing should not be remembered")
+        }
+        let supersetMemory = DepartedScreenLayout(state: fullState, createdAt: Date())
+        if WindowStateSyncPlanner.shouldRememberDepartedLayout(
+            previousState: screenState([first, third]),
+            visibleIDs: [first],
+            existingMemory: supersetMemory
+        ) {
+            fail("an existing superset memory should be kept over a smaller departing state")
+        }
+        let expiredMemory = DepartedScreenLayout(
+            state: fullState,
+            createdAt: Date().addingTimeInterval(-WindowStateSyncPlanner.departedLayoutExpiry - 1)
+        )
+        if !WindowStateSyncPlanner.shouldRememberDepartedLayout(
+            previousState: screenState([first, third]),
+            visibleIDs: [first],
+            existingMemory: expiredMemory
+        ) {
+            fail("an expired memory should be replaced by the new departing state")
         }
     }
     private static func testWindowLayoutPlannerTilesShrunkenWindow() {
