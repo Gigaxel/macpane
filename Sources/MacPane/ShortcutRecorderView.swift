@@ -31,20 +31,26 @@ struct ShortcutRecorderView: NSViewRepresentable {
 }
 
 final class ShortcutRecorderNSView: NSView {
-    var displayText: String = "" { didSet { needsDisplay = true } }
+    private final class PassthroughTextField: NSTextField {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+
+    private let label = PassthroughTextField(labelWithString: "")
+
+    var displayText: String = "" { didSet { refreshAppearance() } }
     var mode: ShortcutRecorderView.Mode = .atomic {
         didSet {
             if mode == .fixed {
                 endRecording()
             }
-            needsDisplay = true
+            refreshAppearance()
         }
     }
     var onCapture: ((UInt32, UInt32) -> Void)?
     private var windowObserverTokens: [NSObjectProtocol] = []
 
     private(set) var isRecording: Bool = false {
-        didSet { needsDisplay = true }
+        didSet { refreshAppearance() }
     }
 
     deinit {
@@ -58,6 +64,19 @@ final class ShortcutRecorderNSView: NSView {
         super.init(frame: frame)
         wantsLayer = true
         focusRingType = .none
+
+        label.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6)
+        ])
+        refreshAppearance()
     }
 
     @available(*, unavailable)
@@ -155,7 +174,9 @@ final class ShortcutRecorderNSView: NSView {
         stroke.setStroke()
         path.lineWidth = strokeWidth
         path.stroke()
+    }
 
+    private func refreshAppearance() {
         let text: String
         if mode == .fixed {
             text = displayText.isEmpty ? "—" : displayText
@@ -170,20 +191,9 @@ final class ShortcutRecorderNSView: NSView {
         case (_, true): textColor = .secondaryLabelColor
         default: textColor = .labelColor
         }
-        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: textColor
-        ]
-        let attrString = NSAttributedString(string: text, attributes: attrs)
-        let textSize = attrString.size()
-        let textRect = NSRect(
-            x: (bounds.width - textSize.width) / 2,
-            y: (bounds.height - textSize.height) / 2,
-            width: textSize.width,
-            height: textSize.height
-        )
-        attrString.draw(in: textRect)
+        label.stringValue = text
+        label.textColor = textColor
+        needsDisplay = true
     }
 
     private func endRecording() {
