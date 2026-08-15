@@ -261,9 +261,15 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
             NSSound.beep()
             return
         }
-        workspaceOverviewOverlay.show(overview) {
-            HotKeyManager.shared.unregisterWorkspaceOverviewHotKeys()
-        }
+        workspaceOverviewOverlay.show(
+            overview,
+            onSelect: { [weak self] index in
+                self?.perform(action: .overviewSwitchWorkspace(index), rebuildMenu: true)
+            },
+            onDismiss: {
+                HotKeyManager.shared.unregisterWorkspaceOverviewHotKeys()
+            }
+        )
         HotKeyManager.shared.registerWorkspaceOverviewHotKeys(workspaceCount: overview.workspaceCount)
     }
     private func showWorkspaceSwitchIndicatorIfNeeded() {

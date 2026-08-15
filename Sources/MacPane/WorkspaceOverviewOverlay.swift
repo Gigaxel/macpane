@@ -55,24 +55,23 @@ private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
 }
 final class WorkspaceOverviewOverlay {
     private var panel: WorkspaceOverviewPanel?
-    private var hideWorkItem: DispatchWorkItem?
     private var onDismiss: (() -> Void)?
     private var overview: WorkspaceOverview?
     var workspaceCount: Int? {
         overview?.workspaceCount
     }
-    func show(_ overview: WorkspaceOverview, onDismiss: @escaping () -> Void) {
+    func show(_ overview: WorkspaceOverview, onSelect: @escaping (Int) -> Void, onDismiss: @escaping () -> Void) {
         hide(notify: true)
         self.overview = overview
         self.onDismiss = onDismiss
         let panel = ensurePanel()
         let frame = Self.panelFrame(for: overview)
         panel.setFrame(frame, display: true)
-        let view = WorkspaceOverviewView(overview: overview)
+        let view = WorkspaceOverviewView(overview: overview, onWorkspaceSelected: onSelect)
         view.frame = CGRect(origin: .zero, size: frame.size)
         view.autoresizingMask = [.width, .height]
         panel.contentView = view
-        panel.ignoresMouseEvents = true
+        panel.ignoresMouseEvents = false
         panel.alphaValue = 0
         panel.orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { context in
@@ -80,13 +79,10 @@ final class WorkspaceOverviewOverlay {
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().alphaValue = 1
         }
-        scheduleAutoHide()
     }
     @discardableResult
     func beginRename(onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) -> Bool {
         guard let overview, let view = overviewView else { return false }
-        hideWorkItem?.cancel()
-        hideWorkItem = nil
         let panel = ensurePanel()
         panel.ignoresMouseEvents = false
         panel.makeKeyAndOrderFront(nil)
@@ -109,22 +105,11 @@ final class WorkspaceOverviewOverlay {
     }
     private func finishRenameMode() {
         overviewView?.endRenaming()
-        panel?.ignoresMouseEvents = true
-        scheduleAutoHide()
-    }
-    private func scheduleAutoHide() {
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.hide()
-        }
-        hideWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.8, execute: workItem)
     }
     func hide() {
         hide(notify: true)
     }
     private func hide(notify: Bool) {
-        hideWorkItem?.cancel()
-        hideWorkItem = nil
         overviewView?.endRenaming()
         panel?.ignoresMouseEvents = true
         panel?.orderOut(nil)
@@ -153,7 +138,7 @@ final class WorkspaceOverviewOverlay {
         panel.level = .statusBar
         panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle, .transient]
         panel.hidesOnDeactivate = false
-        panel.hasShadow = false
+        panel.hasShadow = true
         self.panel = panel
         return panel
     }
@@ -176,15 +161,108 @@ final class WorkspaceOverviewOverlay {
         )
     }
 }
+private final class WorkspaceCardView: NSView {
+    private let onSelect: () -> Void
+    private let isActive: Bool
+    private var isHovered = false
+    private var isRenaming = false
+    private var trackingArea: NSTrackingArea?
+    init(title: String, isActive: Bool, onSelect: @escaping () -> Void) {
+        self.onSelect = onSelect
+        self.isActive = isActive
+        super.init(frame: .zero)
+        wantsLayer = true
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(title)
+        setAccessibilityValue(isActive ? "Current workspace" : nil)
+        updateStyle()
+    }
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not available")
+    }
+    override func updateTrackingAreas() {
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        super.updateTrackingAreas()
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+        updateStyle()
+    }
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+        updateStyle()
+    }
+    override func mouseDown(with event: NSEvent) {
+        select()
+    }
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: isRenaming ? .arrow : .pointingHand)
+    }
+    func setRenaming(_ renaming: Bool) {
+        isRenaming = renaming
+        setAccessibilityEnabled(!renaming)
+        updateStyle()
+        window?.invalidateCursorRects(for: self)
+    }
+    override func accessibilityPerformPress() -> Bool {
+        guard !isRenaming else { return false }
+        select()
+        return true
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+    private func updateStyle() {
+        let hover = isHovered && !isRenaming
+        let border: NSColor
+        let borderWidth: CGFloat
+        let background: NSColor
+        if isActive {
+            border = NSColor.controlAccentColor.withAlphaComponent(hover ? 1.0 : 0.9)
+            borderWidth = 2
+            background = NSColor.controlAccentColor.withAlphaComponent(hover ? 0.26 : 0.18)
+        } else if hover {
+            border = NSColor.controlAccentColor.withAlphaComponent(0.55)
+            borderWidth = 1.5
+            background = NSColor.controlBackgroundColor.withAlphaComponent(0.75)
+        } else {
+            border = NSColor.separatorColor.withAlphaComponent(0.5)
+            borderWidth = 1
+            background = NSColor.controlBackgroundColor.withAlphaComponent(0.55)
+        }
+        layer?.borderWidth = borderWidth
+        layer?.borderColor = border.cgColor
+        layer?.backgroundColor = background.cgColor
+    }
+    private func select() {
+        guard !isRenaming else { return }
+        onSelect()
+    }
+}
 private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelegate {
     private let overview: WorkspaceOverview
+    private let onWorkspaceSelected: (Int) -> Void
     private weak var activeHeaderLabel: NSTextField?
     private weak var activeRenameField: NSTextField?
     private var activeDetailViews: [NSView] = []
     private var onRenameCommit: ((String) -> Void)?
     private var onRenameCancel: (() -> Void)?
-    init(overview: WorkspaceOverview) {
+    private var workspaceCards: [WorkspaceCardView] = []
+    init(overview: WorkspaceOverview, onWorkspaceSelected: @escaping (Int) -> Void) {
         self.overview = overview
+        self.onWorkspaceSelected = onWorkspaceSelected
         super.init(frame: .zero)
         buildView()
     }
@@ -200,8 +278,8 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
         wantsLayer = true
         layer?.cornerRadius = 16
         layer?.masksToBounds = true
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.55).cgColor
-        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.controlAccentColor.withAlphaComponent(0.8).cgColor
+        layer?.borderWidth = 1.5
         let contentView = NSView()
         contentView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(contentView)
@@ -287,17 +365,18 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
         }
         return grid
     }
-    private func card(for item: WorkspaceOverviewItem) -> NSView {
-        let card = NSView()
-        card.wantsLayer = true
+    private func card(for item: WorkspaceOverviewItem) -> WorkspaceCardView {
+        let card = WorkspaceCardView(
+            title: workspaceTitle(for: item),
+            isActive: item.isActive,
+            onSelect: { [weak self] in
+                self?.onWorkspaceSelected(item.index)
+            }
+        )
         card.layer?.cornerRadius = 10
-        card.layer?.borderWidth = item.isActive ? 2 : 1
-        card.layer?.borderColor = (item.isActive ? NSColor.controlAccentColor : NSColor.separatorColor.withAlphaComponent(0.5)).cgColor
-        card.layer?.backgroundColor = (item.isActive
-            ? NSColor.controlAccentColor.withAlphaComponent(0.18)
-            : NSColor.controlBackgroundColor.withAlphaComponent(0.55)).cgColor
         card.translatesAutoresizingMaskIntoConstraints = false
         card.heightAnchor.constraint(equalToConstant: 156).isActive = true
+        workspaceCards.append(card)
         let numberBackdrop = workspaceNumberBackdrop(for: item)
         card.addSubview(numberBackdrop)
         let stack = NSStackView()
@@ -363,6 +442,7 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
     }
     func beginRenaming(text: String, onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
         guard let activeRenameField else { return }
+        workspaceCards.forEach { $0.setRenaming(true) }
         onRenameCommit = onCommit
         onRenameCancel = onCancel
         activeHeaderLabel?.isHidden = true
@@ -376,6 +456,7 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
         }
     }
     func endRenaming() {
+        workspaceCards.forEach { $0.setRenaming(false) }
         activeRenameField?.isHidden = true
         activeHeaderLabel?.isHidden = false
         activeDetailViews.forEach { $0.isHidden = false }
