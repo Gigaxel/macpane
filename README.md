@@ -30,6 +30,12 @@ New windows split the currently focused tile, similar to Pop Shell and i3-style 
 
 Use the menu bar item to increase, decrease, or reset the configurable gap around and between tiled windows. The current gap is stored in `UserDefaults`; the default is `8 px`.
 
+## Pop-ups and app size limits
+
+Small new windows, such as OAuth pop-ups and pickers, float instead of splitting the focused tile. Set the size limits in Settings under "Pop-up Windows". The float shortcut tiles a floating window.
+
+MacPane learns an app's minimum size when the app rejects a smaller frame. It then grows that app's tile to fit. Reset the saved sizes in Settings under Maintenance if a tile is too large.
+
 ## Build
 
 ```bash

@@ -31,8 +31,9 @@ final class WindowTiler {
     private let workspaceSwitchApplyDelay: TimeInterval = 0.045
     private let workspaceSlideAnimationDuration: TimeInterval = 0.18
     private let workspaceSlideChainedDuration: TimeInterval = 0.14
-    private let windowDiscoveryReconcileOffsets: [TimeInterval] = [0, 0.10, 0.28, 0.70, 1.50]
+    private let windowDiscoveryReconcileOffsets: [TimeInterval] = [0, 0.10, 0.28, 0.70, 1.50, 3.00]
     private let accessibilityMessagingTimeout: Float = 0.15
+    private let globalAccessibilityMessagingTimeout: Float = 0.25
     private let accessibilityPermissionCacheDuration: TimeInterval = 0.50
     private var cachedAccessibilityPermission: (granted: Bool, createdAt: Date)?
     private var screenStates: [String: ScreenTileState] = [:]
@@ -63,6 +64,31 @@ final class WindowTiler {
     private var lastObserverRefresh = Date.distantPast
     private var knownNonObservablePIDs: Set<pid_t> = []
     private var suppressExternalChangesUntil = Date.distantPast
+    private let elementMetadataCache = WindowElementMetadataCache()
+    private let appSizeConstraints = AppSizeConstraintsStore()
+    private var pendingFrameChecks: [WindowIdentity: FrameCheck] = [:]
+    private var pendingFrameVerification: DispatchWorkItem?
+    private var frameVerificationGeneration = 0
+    private let frameVerificationDelay: TimeInterval = 0.30
+    private let frameVerificationRetryDelay: TimeInterval = 0.35
+    private let frameVerificationTolerance: CGFloat = 2
+    private let maxFrameReassertAttempts = 2
+    private var pendingAppDrivenReasserts: [WindowElementKey: AXUIElement] = [:]
+    private var pendingAppDrivenReassertDrain: DispatchWorkItem?
+    private let appDrivenReassertDelay: TimeInterval = 0.25
+    private var lastUserDragEventAt = Date.distantPast
+    private let userDragEventGrace: TimeInterval = 1.0
+    private var reassertBudget = ReassertBudget()
+    private var newlyDiscoveredWindowIDs: Set<WindowIdentity> = []
+    private var autoFloatedRecently: [WindowIdentity: Date] = [:]
+    private let autoFloatGrowOutInterval: TimeInterval = 3.0
+    private var lastDiscoveredRawWindows: (windowsByPID: [pid_t: [AXUIElement]], createdAt: Date)?
+    private let discoveredRawWindowsFreshness: TimeInterval = 1.0
+    private var deferredDiscoveryRetries = 0
+    private var hasCompletedInitialDiscovery = false
+    private var missingTiledWindowSinceByID: [WindowIdentity: Date] = [:]
+    private var confirmedRemovedWindowIDs: Set<WindowIdentity> = []
+    private let missingWindowRemovalGrace: TimeInterval = 1.0
     private var isWatching = false
     private var isApplyingLayout = false
     private var isStopping = false
@@ -129,6 +155,29 @@ final class WindowTiler {
     var workspaceSwitchAnimationsEnabled: Bool {
         settings.workspaceSwitchAnimationsEnabled
     }
+    var autoFloatSmallWindowsEnabled: Bool {
+        settings.autoFloatSmallWindowsEnabled
+    }
+    func setAutoFloatSmallWindowsEnabled(_ value: Bool) {
+        guard !isStopping else { return }
+        guard settings.autoFloatSmallWindowsEnabled != value else { return }
+        settings.setAutoFloatSmallWindowsEnabled(value)
+        scheduleReconcile(delay: 0.01)
+    }
+    var autoFloatWidthThreshold: Int {
+        settings.autoFloatWidthThreshold
+    }
+    func setAutoFloatWidthThreshold(_ value: Int) {
+        guard !isStopping else { return }
+        settings.setAutoFloatWidthThreshold(value)
+    }
+    var autoFloatHeightThreshold: Int {
+        settings.autoFloatHeightThreshold
+    }
+    func setAutoFloatHeightThreshold(_ value: Int) {
+        guard !isStopping else { return }
+        settings.setAutoFloatHeightThreshold(value)
+    }
 
     // MARK: - Lifecycle
 
@@ -164,6 +213,13 @@ final class WindowTiler {
         pendingSystemUISettle = nil
         pendingWorkspaceSwitchApply?.cancel()
         pendingWorkspaceSwitchApply = nil
+        pendingFrameVerification?.cancel()
+        pendingFrameVerification = nil
+        pendingFrameChecks.removeAll()
+        frameVerificationGeneration += 1
+        pendingAppDrivenReassertDrain?.cancel()
+        pendingAppDrivenReassertDrain = nil
+        pendingAppDrivenReasserts.removeAll()
         cancelPendingWorkspaceSlideAnimation(finalize: false)
         workspaceSwitchApplyGeneration += 1
         windowDiscoveryReconcileGeneration += 1
@@ -217,6 +273,16 @@ final class WindowTiler {
         isSystemSessionSuspended = false
         isUserSessionInactive = false
         lastSystemDrivenAXEventAt = .distantPast
+        lastUserDragEventAt = .distantPast
+        elementMetadataCache.removeAll()
+        reassertBudget.reset()
+        newlyDiscoveredWindowIDs.removeAll()
+        autoFloatedRecently.removeAll()
+        lastDiscoveredRawWindows = nil
+        deferredDiscoveryRetries = 0
+        hasCompletedInitialDiscovery = false
+        missingTiledWindowSinceByID.removeAll()
+        confirmedRemovedWindowIDs.removeAll()
     }
     private func restoreAllWorkspacesBeforeStopping() {
         guard hasAccessibilityPermission(prompt: false) else { return }
@@ -438,12 +504,22 @@ final class WindowTiler {
             guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
             recordSystemDrivenAXEventIfApplicable(element: element)
             invalidateManagedWindowCache(clearAppliedFrames: true)
-            scheduleExternalMove(element: element, userInitiated: isPointerButtonDown)
+            if isPointerButtonDown {
+                lastUserDragEventAt = Date()
+                scheduleExternalMove(element: element, userInitiated: true)
+            } else if !isWithinUserDragGrace {
+                scheduleAppDrivenReassert(element: element)
+            }
         case kAXResizedNotification:
             guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
             recordSystemDrivenAXEventIfApplicable(element: element)
             invalidateManagedWindowCache(clearAppliedFrames: true)
-            scheduleExternalResize(element: element, userInitiated: isPointerButtonDown)
+            if isPointerButtonDown {
+                lastUserDragEventAt = Date()
+                scheduleExternalResize(element: element, userInitiated: true)
+            } else if !isWithinUserDragGrace {
+                scheduleAppDrivenReassert(element: element)
+            }
         default:
             break
         }
@@ -486,6 +562,7 @@ final class WindowTiler {
             return
         }
         isWatching = true
+        configureGlobalAccessibilityMessagingTimeout()
         refreshAppObservers()
         lastKnownScreenNativeStateKeys = Set(currentScreenInfos().map(\.nativeStateKey))
         lastVisibleWindowSignature = VisibleWindowSignature(snapshot: WindowSnapshotReader.readOnScreenWindows())
@@ -581,6 +658,7 @@ final class WindowTiler {
         }
         removeFloatingWindowIDs(forTerminatedPIDs: stalePIDs)
         pruneDepartedLayouts(forTerminatedPIDs: stalePIDs)
+        elementMetadataCache.removeEntries(forPIDs: stalePIDs)
         for app in runningApps where appObservers[app.processIdentifier] == nil {
             installObserver(for: app)
         }
@@ -636,40 +714,47 @@ final class WindowTiler {
               let registration = appObservers[pid] else {
             return
         }
-        let token = metadataReader.notificationToken(for: element, fallbackIndex: registration.observedWindowTokens.count)
-        guard !registration.observedWindowTokens.contains(token) else { return }
+        registerWindowNotificationsIfNeeded(element, pid: pid, registration: registration)
+    }
+    private func registerWindowNotifications(for app: NSRunningApplication) {
+        guard !isStopping else { return }
+        let pid = app.processIdentifier
+        guard let registration = appObservers[pid] else { return }
+        let windows: [AXUIElement]
+        if let lastDiscoveredRawWindows,
+           Date().timeIntervalSince(lastDiscoveredRawWindows.createdAt) <= discoveredRawWindowsFreshness,
+           let discovered = lastDiscoveredRawWindows.windowsByPID[pid] {
+            windows = discovered
+        } else {
+            let appElement = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(appElement, accessibilityMessagingTimeout)
+            windows = AXReader.elements(appElement, attribute: kAXWindowsAttribute)
+        }
+        for window in windows {
+            registerWindowNotificationsIfNeeded(window, pid: pid, registration: registration)
+        }
+    }
+    private func registerWindowNotificationsIfNeeded(
+        _ window: AXUIElement,
+        pid: pid_t,
+        registration: AppObserverRegistration
+    ) {
+        let elementKey = WindowElementKey(pid: pid, hash: CFHash(window))
+        var tokens = ["element:\(elementKey.hash)"]
+        if let number = elementMetadataCache.entry(for: elementKey)?.windowNumber {
+            tokens.append("number:\(number)")
+        }
+        guard !tokens.contains(where: registration.observedWindowTokens.contains) else { return }
         let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         var registered = false
         for notification in [kAXMovedNotification, kAXResizedNotification, kAXUIElementDestroyedNotification] {
-            let error = AXObserverAddNotification(registration.observer, element, notification as CFString, refcon)
+            let error = AXObserverAddNotification(registration.observer, window, notification as CFString, refcon)
             if error == .success || error == .notificationAlreadyRegistered {
                 registered = true
             }
         }
         if registered {
-            registration.observedWindowTokens.insert(token)
-        }
-    }
-    private func registerWindowNotifications(for app: NSRunningApplication) {
-        guard !isStopping else { return }
-        guard let registration = appObservers[app.processIdentifier] else { return }
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetMessagingTimeout(appElement, accessibilityMessagingTimeout)
-        let windows = AXReader.elements(appElement, attribute: kAXWindowsAttribute)
-        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
-        for (index, window) in windows.enumerated() {
-            let token = metadataReader.notificationToken(for: window, fallbackIndex: index)
-            guard !registration.observedWindowTokens.contains(token) else { continue }
-            var registered = false
-            for notification in [kAXMovedNotification, kAXResizedNotification, kAXUIElementDestroyedNotification] {
-                let error = AXObserverAddNotification(registration.observer, window, notification as CFString, refcon)
-                if error == .success || error == .notificationAlreadyRegistered {
-                    registered = true
-                }
-            }
-            if registered {
-                registration.observedWindowTokens.insert(token)
-            }
+            registration.observedWindowTokens.formUnion(tokens)
         }
     }
     private func removeObserver(for pid: pid_t) {
@@ -791,8 +876,8 @@ final class WindowTiler {
             handleSystemUISettled()
             return
         }
-        refreshWindowNotificationRegistrationsIfStale()
         let allWindows = managedWindows()
+        refreshWindowNotificationRegistrationsIfStale()
         let tiled = tiledWindows(from: allWindows)
         let focusedID = focusTracker.focusedWindowID(in: allWindows)
         syncStates(with: tiled, focusedID: focusedID)
@@ -857,7 +942,19 @@ final class WindowTiler {
         }
         let screen = currentScreenInfosByKey()[key] ?? changedWindow.screen
         let observedSlot = TileSlot.normalized(from: changedWindow.frame, in: screen.frame)
-        if state.reflectResize(focusedID: changedWindow.id, observedSlot: observedSlot) {
+        // App size limits can make the rendered slot differ from the stored slot.
+        let renderedSlot = state.resolvedSlots(
+            in: screen.frame,
+            gap: CGFloat(gapPixels),
+            accommodating: minimumSizesByWindowID(for: allWindows)
+        )[changedWindow.id]
+        let movedBeyondRendered = renderedSlot.map { rendered in
+            abs(observedSlot.x - rendered.x) > TileLayout.resizeReflectionThreshold ||
+                abs(observedSlot.y - rendered.y) > TileLayout.resizeReflectionThreshold ||
+                abs(observedSlot.maxX - rendered.maxX) > TileLayout.resizeReflectionThreshold ||
+                abs(observedSlot.maxY - rendered.maxY) > TileLayout.resizeReflectionThreshold
+        } ?? true
+        if movedBeyondRendered, state.reflectResize(focusedID: changedWindow.id, observedSlot: observedSlot) {
             screenStates[key] = state
             invalidateDepartedLayout(forStateKey: key)
         }
@@ -1353,7 +1450,8 @@ final class WindowTiler {
             direction: direction,
             floatingWindowIDs: floatingWindowIDs,
             screens: currentScreenInfos(),
-            gapPixels: CGFloat(gapPixels)
+            gapPixels: CGFloat(gapPixels),
+            minimumSizesByID: minimumSizesByWindowID(for: allWindows)
         )
         guard !transitions.isEmpty,
               transitions.count <= WorkspaceSlidePlanner.maximumTransitionCount else {
@@ -1433,7 +1531,8 @@ final class WindowTiler {
             direction: direction,
             floatingWindowIDs: floatingWindowIDs,
             screens: currentScreenInfos(),
-            gapPixels: CGFloat(gapPixels)
+            gapPixels: CGFloat(gapPixels),
+            minimumSizesByID: minimumSizesByWindowID(for: allWindows)
         )
         guard !newTransitions.isEmpty,
               newTransitions.count <= WorkspaceSlidePlanner.maximumTransitionCount else {
@@ -1469,12 +1568,7 @@ final class WindowTiler {
     private func applyChainSlideStep(chain: SlideChain, progress: CGFloat) {
         let transitions = chain.transitions
         guard !transitions.isEmpty else { return }
-        // AXUIElementSetAttributeValue must be called from the main thread (per Apple),
-        // so we can't fan out across queues. We still avoid the previous per-frame defer
-        // work (suppressExternalChanges / updateManagedWindowCache) — those are paid
-        // once at chain start/end. With messaging timeouts already at 150 ms and the
-        // typical app responding in <1 ms, eight sequential writes still fit in a 8 ms
-        // 120Hz frame budget.
+        // AXUIElementSetAttributeValue must run on the main thread.
         for transition in transitions {
             let origin = WorkspaceSlidePlanner.interpolatedOrigin(
                 from: transition.startFrame,
@@ -1686,6 +1780,7 @@ final class WindowTiler {
             NSSound.beep()
             return
         }
+        autoFloatedRecently.removeValue(forKey: focusedID)
         if floatingWindowIDs.contains(focusedID) {
             floatingWindowIDs.remove(focusedID)
             floatingWindowStateKeys.removeValue(forKey: focusedID)
@@ -1738,14 +1833,30 @@ final class WindowTiler {
     private func syncStates(with windows: [ManagedWindow], focusedID: WindowIdentity?) {
         _ = restoreKnownLayoutIdentities(using: windows)
         _ = restorePersistedLayouts(using: windows)
-        let grouped = Dictionary(grouping: windows, by: { $0.screen.stateKey })
+        autoFloatNewWindows(in: windows)
+        hasCompletedInitialDiscovery = true
+        let tiledSyncWindows = windows.filter { !floatingWindowIDs.contains($0.id) }
+        let grouped = Dictionary(grouping: tiledSyncWindows, by: { $0.screen.stateKey })
         let idsByScreen = grouped.mapValues { Set($0.map(\.id)) }
         let activeStateKeys = Set(currentScreenInfos().map(\.stateKey))
         restoreDepartedLayouts(idsByScreen: idsByScreen)
         rememberDepartedLayouts(idsByScreen: idsByScreen, activeStateKeys: activeStateKeys)
+        let retention = WindowStateSyncPlanner.missingWindowRetention(
+            idsByScreen: idsByScreen,
+            activeStateKeys: activeStateKeys,
+            screenStates: screenStates,
+            visibleIDs: Set(windows.map(\.id)),
+            missingSinceByID: missingTiledWindowSinceByID,
+            confirmedRemovedIDs: confirmedRemovedWindowIDs,
+            isProcessRunning: { NSRunningApplication(processIdentifier: $0) != nil },
+            grace: missingWindowRemovalGrace,
+            now: Date()
+        )
+        missingTiledWindowSinceByID = retention.missingSinceByID
         for key in Array(screenStates.keys) where activeStateKeys.contains(key) {
             var state = screenStates[key] ?? ScreenTileState()
-            state.removeMissing(keeping: idsByScreen[key] ?? [])
+            let retainedIDs = retention.retainedIDsByStateKey[key] ?? []
+            state.removeMissing(keeping: (idsByScreen[key] ?? []).union(retainedIDs))
             if state.isEmpty {
                 screenStates.removeValue(forKey: key)
             } else {
@@ -1754,11 +1865,14 @@ final class WindowTiler {
         }
         for (screenKey, screenWindows) in grouped {
             var state = screenStates[screenKey] ?? ScreenTileState()
-            let ids = screenWindows.map(\.id)
+            var ids = screenWindows.map(\.id)
+            let retainedIDs = retention.retainedIDsByStateKey[screenKey] ?? []
+            ids.append(contentsOf: retainedIDs.subtracting(Set(ids)).sorted { $0.serial < $1.serial })
             let screenFocusedID = focusedID.flatMap { ids.contains($0) ? $0 : nil }
             state.sync(windowIDs: ids, focusedID: screenFocusedID)
             screenStates[screenKey] = state
         }
+        confirmedRemovedWindowIDs.formIntersection(Set(screenStates.values.flatMap(\.windowIDs)))
         rememberLayoutIdentities(using: windows)
         pruneLayoutIdentityCache(retainingVisibleIDs: Set(windows.map(\.id)))
         rememberPersistedLayouts(using: windows)
@@ -1836,14 +1950,19 @@ final class WindowTiler {
     private func removeDestroyedWindowState(forElement element: AXUIElement) {
         var pid: pid_t = 0
         guard AXUIElementGetPid(element, &pid) == .success else { return }
-        let windowKey = AXReader.int(element, attribute: "AXWindowNumber")
-            .map { WindowOrderKey(pid: pid, number: $0) }
-            ?? AXReader.int(element, attribute: "_AXWindowNumber")
-            .map { WindowOrderKey(pid: pid, number: $0) }
         let elementKey = WindowElementKey(pid: pid, hash: CFHash(element))
+        let cachedNumber = elementMetadataCache.entry(for: elementKey)?.windowNumber
+        elementMetadataCache.removeEntry(for: elementKey)
+        let windowKey = (cachedNumber
+            ?? AXReader.int(element, attribute: "AXWindowNumber")
+            ?? AXReader.int(element, attribute: "_AXWindowNumber"))
+            .map { WindowOrderKey(pid: pid, number: $0) }
         guard let id = identityRegistry.identityForStrongAlias(windowKey: windowKey, elementKey: elementKey) else {
             return
         }
+        autoFloatedRecently.removeValue(forKey: id)
+        confirmedRemovedWindowIDs.insert(id)
+        missingTiledWindowSinceByID.removeValue(forKey: id)
         if floatingWindowIDs.contains(id) {
             removeFloatingWindowIDs([id])
         }
@@ -1973,28 +2092,68 @@ final class WindowTiler {
             currentScreens: currentScreens,
             floatingWindowIDs: floatingWindowIDs,
             stateKeyLimit: stateKeyLimit,
-            gapPixels: CGFloat(gapPixels)
+            gapPixels: CGFloat(gapPixels),
+            minimumSizesByID: minimumSizesByWindowID(for: windows)
         )
         pendingMove?.cancel()
         pendingResize?.cancel()
         suppressExternalChanges(for: 0.45)
         isApplyingLayout = true
         var appliedFramesByID: [WindowIdentity: CGRect] = [:]
+        var frameChecks: [WindowIdentity: FrameCheck] = [:]
+        var hadWriteFailure = false
         defer {
             isApplyingLayout = false
             updateManagedWindowCache(withAppliedFrames: appliedFramesByID)
             updateLastAppliedWorkspaceIndices(using: currentScreens)
             suppressExternalChanges(for: 0.45)
+            replaceFrameChecks(with: frameChecks, merging: stateKeyLimit != nil)
             if plan.skippedIncompleteState {
-                scheduleReconcile(delay: 0.01)
+                scheduleReconcile(delay: 0.12)
+            } else if hadWriteFailure, pendingReconcile == nil {
+                scheduleReconcile(delay: 0.4)
             }
         }
-        for assignment in plan.assignments {
-            if let appliedFrame = set(window: assignment.window, frame: assignment.frame) {
-                appliedFramesByID[assignment.window.id] = appliedFrame
+        let assignmentsByPID = Dictionary(grouping: plan.assignments) { $0.window.id.pid }
+        for pid in assignmentsByPID.keys.sorted() {
+            var suspension: EnhancedUserInterfaceSuspension?
+            for assignment in assignmentsByPID[pid] ?? [] {
+                let result = set(window: assignment.window, frame: assignment.frame) {
+                    if suspension == nil {
+                        suspension = EnhancedUserInterfaceSuspension(pid: pid, messagingTimeout: accessibilityMessagingTimeout)
+                    }
+                }
+                if let applied = result.applied {
+                    appliedFramesByID[assignment.window.id] = applied
+                }
+                if result.writeFailed {
+                    hadWriteFailure = true
+                }
+                if assignment.kind == .visibleTile {
+                    frameChecks[assignment.window.id] = FrameCheck(
+                        target: WindowFrameApplier.sanitizedFrame(assignment.frame),
+                        attempts: 0,
+                        pid: pid,
+                        windowNumber: assignment.window.windowNumber,
+                        element: assignment.window.element
+                    )
+                }
             }
+            suspension?.restore()
         }
         rememberPersistedLayouts(using: windows, limitingToStateKeys: stateKeyLimit)
+    }
+    private func minimumSizesByWindowID(for windows: [ManagedWindow]) -> [WindowIdentity: CGSize] {
+        var minimums: [WindowIdentity: CGSize] = [:]
+        for window in windows {
+            guard let bundleID = window.bundleIdentifier,
+                  let learned = appSizeConstraints.minimumSize(forBundleIdentifier: bundleID) else { continue }
+            minimums[window.id] = CGSize(
+                width: max(learned.width, TileLayout.minimumWindowFrameSize.width),
+                height: max(learned.height, TileLayout.minimumWindowFrameSize.height)
+            )
+        }
+        return minimums
     }
     private func updateLastAppliedWorkspaceIndices(using screens: [ScreenInfo]? = nil) {
         for screen in screens ?? currentScreenInfos() {
@@ -2004,6 +2163,9 @@ final class WindowTiler {
     }
     private var isSuppressingExternalChanges: Bool {
         Date() < suppressExternalChangesUntil
+    }
+    private var isWithinUserDragGrace: Bool {
+        Date().timeIntervalSince(lastUserDragEventAt) < userDragEventGrace
     }
     private func suppressExternalChanges(for duration: TimeInterval) {
         suppressExternalChangesUntil = max(suppressExternalChangesUntil, Date().addingTimeInterval(duration))
@@ -2111,8 +2273,13 @@ final class WindowTiler {
         isUserSessionInactive = false
         resumeSystemSessionLayoutAfterWakeOrUnlock()
     }
+    private func configureGlobalAccessibilityMessagingTimeout() {
+        // App element timeouts do not apply to their window elements.
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), globalAccessibilityMessagingTimeout)
+    }
     private func resumeSystemSessionLayoutAfterWakeOrUnlock() {
         isSystemSessionSuspended = false
+        configureGlobalAccessibilityMessagingTimeout()
         cachedAccessibilityPermission = nil
         invalidateScreenInfoCache()
         invalidateManagedWindowCache(clearAppliedFrames: true)
@@ -2365,6 +2532,7 @@ final class WindowTiler {
         floatingWindowIDs.subtract(ids)
         for id in ids {
             floatingWindowStateKeys.removeValue(forKey: id)
+            autoFloatedRecently.removeValue(forKey: id)
         }
         identityRegistry.removeAliases(for: ids)
     }
@@ -2722,6 +2890,7 @@ final class WindowTiler {
         var registry = identityRegistry
         let discovery = WindowDiscovery(
             metadataReader: metadataReader,
+            metadataCache: elementMetadataCache,
             screenCatalog: catalog,
             accessibilityMessagingTimeout: accessibilityMessagingTimeout
         )
@@ -2735,13 +2904,84 @@ final class WindowTiler {
             screenForKnownStateKey: { self.screenInfo(forKnownStateKey: $0, fallback: $1, screens: screens) }
         )
         identityRegistry = registry
+        lastDiscoveredRawWindows = (result.rawWindowsByPID, Date())
 
         let windows = result.windows
+        newlyDiscoveredWindowIDs.formUnion(result.newlyCreatedIDs)
+        newlyDiscoveredWindowIDs.formIntersection(Set(windows.map(\.id)))
+        elementMetadataCache.pruneIfNeeded(keepingPIDs: Set(snapshot.visibleNumbersByPID.keys))
         updateVisibleFloatingWindowStateKeys(using: windows)
+        correctAutoFloatedWindows(using: windows)
         rememberLayoutIdentities(using: windows)
         pruneLayoutIdentityCache(retainingVisibleIDs: result.retainedIDs)
         refreshLastAppliedFrames(using: windows, retaining: result.retainedIDs)
+        if result.hasDeferredCandidates {
+            scheduleDeferredDiscoveryRetry()
+        } else {
+            deferredDiscoveryRetries = 0
+        }
         return windows
+    }
+    private func scheduleDeferredDiscoveryRetry() {
+        guard !isStopping, tilingEnabled else { return }
+        deferredDiscoveryRetries = min(deferredDiscoveryRetries + 1, 6)
+        guard pendingReconcile == nil else { return }
+        let delay = min(0.35 * pow(2.0, Double(deferredDiscoveryRetries - 1)), 5.0)
+        scheduleReconcile(delay: delay)
+    }
+
+    // MARK: - Auto-Float Heuristics
+
+    private func autoFloatNewWindows(in windows: [ManagedWindow]) {
+        guard settings.autoFloatSmallWindowsEnabled, tilingEnabled, hasCompletedInitialDiscovery else {
+            newlyDiscoveredWindowIDs.removeAll()
+            return
+        }
+        let candidates = newlyDiscoveredWindowIDs
+        newlyDiscoveredWindowIDs.removeAll()
+        guard !candidates.isEmpty else { return }
+        var knownIDs = Set(screenStates.values.flatMap(\.windowIDs))
+        knownIDs.formUnion(departedWindowIDs)
+        if let frozenSystemUIScreenStates {
+            knownIDs.formUnion(frozenSystemUIScreenStates.values.flatMap(\.windowIDs))
+        }
+        for window in windows where candidates.contains(window.id) {
+            guard !knownIDs.contains(window.id),
+                  !floatingWindowIDs.contains(window.id),
+                  shouldAutoFloat(window.frame) else {
+                continue
+            }
+            floatingWindowIDs.insert(window.id)
+            floatingWindowStateKeys[window.id] = window.screen.stateKey
+            autoFloatedRecently[window.id] = Date()
+        }
+    }
+    private func correctAutoFloatedWindows(using windows: [ManagedWindow]) {
+        guard !autoFloatedRecently.isEmpty else { return }
+        let now = Date()
+        autoFloatedRecently = autoFloatedRecently.filter {
+            now.timeIntervalSince($0.value) <= autoFloatGrowOutInterval
+        }
+        guard !autoFloatedRecently.isEmpty else { return }
+        var unfloatedAny = false
+        for window in windows {
+            guard autoFloatedRecently[window.id] != nil,
+                  floatingWindowIDs.contains(window.id),
+                  !shouldAutoFloat(window.frame) else {
+                continue
+            }
+            floatingWindowIDs.remove(window.id)
+            floatingWindowStateKeys.removeValue(forKey: window.id)
+            autoFloatedRecently.removeValue(forKey: window.id)
+            unfloatedAny = true
+        }
+        if unfloatedAny {
+            scheduleWindowDiscoveryReconcileBurst(initialDelay: 0.01)
+        }
+    }
+    private func shouldAutoFloat(_ frame: CGRect) -> Bool {
+        frame.width < CGFloat(settings.autoFloatWidthThreshold) ||
+            frame.height < CGFloat(settings.autoFloatHeightThreshold)
     }
     private func focus(window: ManagedWindow, updateTreeFocus: Bool) {
         focusTracker.focus(window)
@@ -2750,19 +2990,256 @@ final class WindowTiler {
             screenStates[key] = state
         }
     }
-    @discardableResult
-    private func set(window: ManagedWindow, frame: CGRect) -> CGRect? {
+    private func set(
+        window: ManagedWindow,
+        frame: CGRect,
+        beforeWrite: () -> Void = {}
+    ) -> (applied: CGRect?, writeFailed: Bool) {
         let frame = WindowFrameApplier.sanitizedFrame(frame)
-        if WindowFrameApplier.approximatelyEqual(window.frame, frame) {
+        switch FrameWritePlanner.mode(current: window.frame, target: frame) {
+        case .skip:
             lastAppliedFrameByWindowID[window.id] = frame
+            return (nil, false)
+        case .positionOnly:
+            beforeWrite()
+            let error = WindowFrameApplier.applyPosition(frame.origin, to: window.element)
+            lastAppliedFrameByWindowID[window.id] = frame
+            return (frame, error != .success)
+        case .full:
+            beforeWrite()
+            let error = WindowFrameApplier.applyFrame(frame, to: window.element)
+            lastAppliedFrameByWindowID[window.id] = frame
+            return (frame, error != .success)
+        }
+    }
+
+    // MARK: - Frame Verification
+
+    private func replaceFrameChecks(with checks: [WindowIdentity: FrameCheck], merging: Bool) {
+        frameVerificationGeneration += 1
+        if merging {
+            pendingFrameChecks.merge(checks) { _, new in new }
+        } else {
+            pendingFrameChecks = checks
+        }
+        pendingFrameVerification?.cancel()
+        pendingFrameVerification = nil
+        guard !pendingFrameChecks.isEmpty, !isStopping else { return }
+        scheduleFrameVerification(delay: frameVerificationDelay)
+    }
+    private func scheduleFrameVerification(delay: TimeInterval) {
+        guard !isStopping, !pendingFrameChecks.isEmpty else { return }
+        pendingFrameVerification?.cancel()
+        let generation = frameVerificationGeneration
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.runFrameVerification(generation: generation)
+        }
+        pendingFrameVerification = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+    private func runFrameVerification(generation: Int) {
+        pendingFrameVerification = nil
+        guard !isStopping, generation == frameVerificationGeneration, !pendingFrameChecks.isEmpty else { return }
+        guard hasAccessibilityPermission(prompt: false), tilingEnabled else {
+            pendingFrameChecks.removeAll()
+            return
+        }
+        guard pendingWorkspaceSwitchApply == nil,
+              activeSlideChain == nil,
+              !isApplyingLayout,
+              frozenSystemUIScreenStates == nil,
+              !shouldPauseLayoutForSystemUI(),
+              !isPointerButtonDown else {
+            scheduleFrameVerification(delay: frameVerificationRetryDelay)
+            return
+        }
+        let snapshot = WindowSnapshotReader.readOnScreenWindows()
+        let verificationStartedAt = Date()
+        var reassertions: [(id: WindowIdentity, check: FrameCheck)] = []
+        var learnedClamp = false
+        for (id, var check) in pendingFrameChecks {
+            var observedViaCG = false
+            var observed: CGRect?
+            if let number = check.windowNumber {
+                observed = snapshot.frame(pid: check.pid, number: number)
+                observedViaCG = observed != nil
+            }
+            if observed == nil {
+                observed = axFrame(of: check.element)
+            }
+            guard var observed else {
+                check.attempts += 1
+                if check.attempts > maxFrameReassertAttempts {
+                    pendingFrameChecks.removeValue(forKey: id)
+                } else {
+                    pendingFrameChecks[id] = check
+                }
+                continue
+            }
+            var verdict = FrameVerificationClassifier.classify(
+                target: check.target,
+                observed: observed,
+                tolerance: frameVerificationTolerance
+            )
+            if case .rejected = verdict, observedViaCG {
+                if let axObserved = axFrame(of: check.element) {
+                    observed = axObserved
+                    verdict = FrameVerificationClassifier.classify(
+                        target: check.target,
+                        observed: axObserved,
+                        tolerance: frameVerificationTolerance
+                    )
+                }
+            }
+            switch verdict {
+            case .applied:
+                pendingFrameChecks.removeValue(forKey: id)
+            case .clamped(let observedMinimum):
+                recordObservedMinimum(observedMinimum, forPID: check.pid)
+                learnedClamp = true
+                pendingFrameChecks.removeValue(forKey: id)
+            case .rejected:
+                guard check.attempts < maxFrameReassertAttempts,
+                      reassertBudget.allowsReassert(of: id, now: verificationStartedAt) else {
+                    pendingFrameChecks.removeValue(forKey: id)
+                    continue
+                }
+                check.attempts += 1
+                pendingFrameChecks[id] = check
+                reassertions.append((id, check))
+            }
+        }
+        if !reassertions.isEmpty {
+            performReassertions(reassertions)
+        }
+        if learnedClamp {
+            scheduleReconcile(delay: 0.01)
+        }
+        if !pendingFrameChecks.isEmpty {
+            scheduleFrameVerification(delay: frameVerificationRetryDelay)
+        }
+    }
+    private func performReassertions(_ reassertions: [(id: WindowIdentity, check: FrameCheck)]) {
+        isApplyingLayout = true
+        suppressExternalChanges(for: 0.45)
+        defer {
+            isApplyingLayout = false
+            suppressExternalChanges(for: 0.45)
+        }
+        let byPID = Dictionary(grouping: reassertions, by: { $0.check.pid })
+        for pid in byPID.keys.sorted() {
+            var suspension: EnhancedUserInterfaceSuspension?
+            for (id, check) in byPID[pid] ?? [] {
+                if suspension == nil {
+                    suspension = EnhancedUserInterfaceSuspension(pid: pid, messagingTimeout: accessibilityMessagingTimeout)
+                }
+                WindowFrameApplier.applyFrame(check.target, to: check.element)
+                lastAppliedFrameByWindowID[id] = check.target
+            }
+            suspension?.restore()
+        }
+    }
+    private func recordObservedMinimum(_ observedMinimum: CGSize, forPID pid: pid_t) {
+        guard let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier else { return }
+        let screens = currentScreenInfos()
+        let width = screens.map(\.frame.width).max() ?? 1440
+        let height = screens.map(\.frame.height).max() ?? 900
+        appSizeConstraints.recordObservedMinimum(
+            observedMinimum,
+            forBundleIdentifier: bundleID,
+            cappedTo: CGSize(width: width * 0.9, height: height * 0.9)
+        )
+    }
+    private func axFrame(of element: AXUIElement) -> CGRect? {
+        guard let position = AXReader.point(element, attribute: kAXPositionAttribute),
+              let size = AXReader.size(element, attribute: kAXSizeAttribute),
+              size.width > 0, size.height > 0 else {
             return nil
         }
-        // Do not synchronously read the AX frame here. AX reads are one of the slowest
-        // operations on the hot resize/workspace paths; a later window scan refreshes
-        // this cache and will re-apply if the app rejected the write.
-        WindowFrameApplier.applyFrame(frame, to: window.element)
-        lastAppliedFrameByWindowID[window.id] = frame
-        return frame
+        return CGRect(origin: position, size: size)
+    }
+    func resetLearnedAppSizeConstraints() {
+        guard !isStopping else { return }
+        appSizeConstraints.reset()
+        scheduleReconcile(delay: 0.01)
+    }
+
+    // MARK: - App-Driven Re-Asserts
+
+    private func scheduleAppDrivenReassert(element: AXUIElement) {
+        guard !isStopping, tilingEnabled, frozenSystemUIScreenStates == nil, !shouldPauseLayoutForSystemUI() else { return }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success else { return }
+        pendingAppDrivenReasserts[WindowElementKey(pid: pid, hash: CFHash(element))] = element
+        guard pendingAppDrivenReassertDrain == nil else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.drainAppDrivenReasserts()
+        }
+        pendingAppDrivenReassertDrain = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + appDrivenReassertDelay, execute: workItem)
+    }
+    private func drainAppDrivenReasserts() {
+        pendingAppDrivenReassertDrain = nil
+        guard !isStopping, tilingEnabled, !pendingAppDrivenReasserts.isEmpty else {
+            pendingAppDrivenReasserts.removeAll()
+            return
+        }
+        guard frozenSystemUIScreenStates == nil, !shouldPauseLayoutForSystemUI() else {
+            pendingAppDrivenReasserts.removeAll()
+            return
+        }
+        guard !isApplyingLayout,
+              !isSuppressingExternalChanges,
+              pendingWorkspaceSwitchApply == nil,
+              activeSlideChain == nil,
+              !isPointerButtonDown,
+              !isWithinUserDragGrace else {
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.drainAppDrivenReasserts()
+            }
+            pendingAppDrivenReassertDrain = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + appDrivenReassertDelay, execute: workItem)
+            return
+        }
+        let elements = Array(pendingAppDrivenReasserts.values)
+        pendingAppDrivenReasserts.removeAll()
+        guard hasAccessibilityPermission(prompt: false) else { return }
+        let allWindows = managedWindows()
+        let screensByKey = currentScreenInfosByKey()
+        let minimums = minimumSizesByWindowID(for: allWindows)
+        var reassertions: [(id: WindowIdentity, check: FrameCheck)] = []
+        let now = Date()
+        for element in elements {
+            guard let window = focusTracker.window(matching: element, in: allWindows),
+                  !floatingWindowIDs.contains(window.id),
+                  let key = stateKey(containing: window.id),
+                  let state = screenStates[key],
+                  let screen = screensByKey[key] else {
+                continue
+            }
+            let slots = state.resolvedSlots(in: screen.frame, gap: CGFloat(gapPixels), accommodating: minimums)
+            guard let slot = slots[window.id] else { continue }
+            let expected = WindowFrameApplier.sanitizedFrame(
+                slot.frame(in: screen.frame, gap: CGFloat(gapPixels), smartOuterGap: true)
+            )
+            guard !WindowFrameApplier.approximatelyEqual(window.frame, expected) else { continue }
+            // Only a frame check after a MacPane write can learn a minimum size.
+            guard reassertBudget.allowsReassert(of: window.id, now: now) else { continue }
+            reassertions.append((window.id, FrameCheck(
+                target: expected,
+                attempts: 1,
+                pid: window.id.pid,
+                windowNumber: window.windowNumber,
+                element: window.element
+            )))
+        }
+        if !reassertions.isEmpty {
+            performReassertions(reassertions)
+            for (id, check) in reassertions {
+                pendingFrameChecks[id] = check
+            }
+            scheduleFrameVerification(delay: frameVerificationRetryDelay)
+        }
     }
     private func currentScreenInfosByKey() -> [String: ScreenInfo] {
         Dictionary(currentScreenInfos().map { ($0.stateKey, $0) }, uniquingKeysWith: { first, _ in first })
@@ -2790,6 +3267,14 @@ final class WindowTiler {
             CGEventSource.buttonState(.combinedSessionState, button: .right) ||
             CGEventSource.buttonState(.combinedSessionState, button: .center)
     }
+}
+
+private struct FrameCheck {
+    let target: CGRect
+    var attempts: Int
+    let pid: pid_t
+    let windowNumber: Int?
+    let element: AXUIElement
 }
 
 /// Mutable state for an in-flight workspace slide so it can absorb rapid chained presses

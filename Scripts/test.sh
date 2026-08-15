@@ -12,6 +12,12 @@ xcrun swiftc \
   -framework Carbon \
   "$ROOT_DIR/Sources/MacPane/SnapGeometry.swift" \
   "$ROOT_DIR/Sources/MacPane/TilingLayout.swift" \
+  "$ROOT_DIR/Sources/MacPane/AXReader.swift" \
+  "$ROOT_DIR/Sources/MacPane/WindowFrameApplier.swift" \
+  "$ROOT_DIR/Sources/MacPane/WindowManageabilityPlanner.swift" \
+  "$ROOT_DIR/Sources/MacPane/FrameVerificationClassifier.swift" \
+  "$ROOT_DIR/Sources/MacPane/AppSizeConstraintsStore.swift" \
+  "$ROOT_DIR/Sources/MacPane/ReassertBudget.swift" \
   "$ROOT_DIR/Sources/MacPane/WindowIdentity.swift" \
   "$ROOT_DIR/Sources/MacPane/WindowLayoutIdentity.swift" \
   "$ROOT_DIR/Sources/MacPane/ScreenGeometryExtensions.swift" \

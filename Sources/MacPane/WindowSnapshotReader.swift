@@ -56,6 +56,9 @@ enum WindowSnapshotReader {
 
             if let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
                let frame = CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary) {
+                if snapshot.framesByWindow[key] == nil {
+                    snapshot.framesByWindow[key] = frame
+                }
                 snapshot.recordsByPID[pid, default: []].append(CGWindowRecord(
                     pid: pid,
                     number: number,

@@ -50,6 +50,18 @@ struct SnapGeometryTests {
         testWindowLayoutPlannerTilesShrunkenWindow()
         testChainedSlideSkipsAlreadyHiddenNonTargetWindows()
         testWorkspaceSwitchApplyPlanIncludesAdditionalChainedStates()
+        testWindowManageabilityPlannerFailsClosed()
+        testFrameWritePlannerChoosesMinimalWrite()
+        testFrameVerificationClassifierVerdicts()
+        testAccommodationGrowsConstrainedTile()
+        testAccommodationInfeasibleFallsBackProportionally()
+        testAccommodationLeavesUnconstrainedTreesUntouched()
+        testAccommodationDoesNotMutateStoredState()
+        testSlidePlannerUsesAccommodatedEndFrames()
+        testReassertBudgetBoundsAttempts()
+        testAppSizeConstraintsStorePersistsAfterConsistentObservations()
+        testResolveIdentityReportsNewlyCreated()
+        testMissingWindowRetentionKeepsTransientDropouts()
         print("SnapGeometryTests passed")
     }
     private static func testSnapGeometry() {
@@ -937,6 +949,296 @@ struct SnapGeometryTests {
             fail("expected assignment for the tiny window, got a different id")
         }
         expectEqual(assignment.frame, screenFrame, "tiny window must be resized to its full slot frame instead of keeping its shrunken size")
+    }
+    private static func manageabilityInputs(
+        role: AXRead<String> = .value(kAXWindowRole),
+        subrole: AXRead<String> = .value(kAXStandardWindowSubrole),
+        isMinimized: AXRead<Bool> = .value(false),
+        isFullScreen: AXRead<Bool> = .missing,
+        isModal: AXRead<Bool> = .missing,
+        title: String? = "Document",
+        positionSettable: AXRead<Bool> = .value(true),
+        sizeSettable: AXRead<Bool> = .value(true)
+    ) -> WindowManageabilityPlanner.Inputs {
+        WindowManageabilityPlanner.Inputs(
+            role: role,
+            subrole: subrole,
+            isMinimized: isMinimized,
+            isFullScreen: isFullScreen,
+            isModal: isModal,
+            title: title,
+            positionSettable: positionSettable,
+            sizeSettable: sizeSettable
+        )
+    }
+    private static func testWindowManageabilityPlannerFailsClosed() {
+        func expectVerdict(
+            _ inputs: WindowManageabilityPlanner.Inputs,
+            _ expected: WindowManageability,
+            _ message: String
+        ) {
+            let actual = WindowManageabilityPlanner.manageability(inputs)
+            guard actual == expected else {
+                fail("\(message): expected \(expected), got \(actual)")
+            }
+        }
+        expectVerdict(manageabilityInputs(), .manageable, "standard resizable window")
+        expectVerdict(manageabilityInputs(subrole: .missing), .manageable, "absent subrole keeps historical admit")
+        expectVerdict(manageabilityInputs(subrole: .value("AXDialog")), .excluded, "dialog subrole")
+        expectVerdict(manageabilityInputs(subrole: .failed), .unknown, "failed subrole read must fail closed")
+        expectVerdict(manageabilityInputs(role: .failed), .unknown, "failed role read must fail closed")
+        expectVerdict(manageabilityInputs(role: .value("AXSheet")), .excluded, "non-window role")
+        expectVerdict(manageabilityInputs(isModal: .value(true)), .excluded, "modal window")
+        expectVerdict(manageabilityInputs(isModal: .failed), .unknown, "failed modal read must fail closed")
+        expectVerdict(manageabilityInputs(isMinimized: .value(true)), .excluded, "minimized window")
+        expectVerdict(manageabilityInputs(isFullScreen: .value(true)), .excluded, "fullscreen window")
+        expectVerdict(manageabilityInputs(title: "Picture in Picture"), .excluded, "PiP title")
+        expectVerdict(manageabilityInputs(sizeSettable: .value(false)), .excluded, "non-resizable window")
+        expectVerdict(manageabilityInputs(positionSettable: .failed), .unknown, "failed settability must fail closed")
+    }
+    private static func testFrameWritePlannerChoosesMinimalWrite() {
+        let base = CGRect(x: 100, y: 100, width: 500, height: 400)
+        func expectMode(_ current: CGRect, _ target: CGRect, _ expected: FrameWriteMode, _ message: String) {
+            let actual = FrameWritePlanner.mode(current: current, target: target)
+            guard actual == expected else {
+                fail("\(message): expected \(expected), got \(actual)")
+            }
+        }
+        expectMode(base, base, .skip, "identical frames")
+        expectMode(base, base.offsetBy(dx: 1, dy: 0), .skip, "within tolerance")
+        expectMode(base, base.offsetBy(dx: 300, dy: 0), .positionOnly, "moved, same size")
+        expectMode(base, CGRect(x: 100, y: 100, width: 700, height: 400), .full, "resized")
+        expectMode(base, CGRect(x: 400, y: 100, width: 700, height: 500), .full, "moved and resized")
+    }
+    private static func testFrameVerificationClassifierVerdicts() {
+        let target = CGRect(x: 0, y: 0, width: 500, height: 400)
+        func expectVerdict(_ observed: CGRect, _ expected: FrameVerificationVerdict, _ message: String) {
+            let actual = FrameVerificationClassifier.classify(target: target, observed: observed, tolerance: 2)
+            guard actual == expected else {
+                fail("\(message): expected \(expected), got \(actual)")
+            }
+        }
+        expectVerdict(target, .applied, "exact match")
+        expectVerdict(CGRect(x: 1, y: -1, width: 501, height: 399), .applied, "within tolerance")
+        expectVerdict(
+            CGRect(x: 0, y: 0, width: 760, height: 400),
+            .clamped(observedMinimum: CGSize(width: 760, height: 0)),
+            "width-only clamp reports width only"
+        )
+        expectVerdict(
+            CGRect(x: 0, y: 0, width: 760, height: 620),
+            .clamped(observedMinimum: CGSize(width: 760, height: 620)),
+            "both-axis clamp"
+        )
+        expectVerdict(CGRect(x: 80, y: 0, width: 500, height: 400), .rejected, "moved window")
+        expectVerdict(CGRect(x: 0, y: 0, width: 400, height: 400), .rejected, "shrunken window")
+        expectVerdict(CGRect(x: 80, y: 0, width: 760, height: 400), .rejected, "moved and oversized is not a clamp")
+    }
+    private static func testAccommodationGrowsConstrainedTile() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let gap: CGFloat = 8
+        let a = windowID(1)
+        let b = windowID(2)
+        let state = screenState([a, b], focused: a)
+        let minimums = [a: CGSize(width: 700, height: 120)]
+        let resolved = state.resolvedSlots(in: screenFrame, gap: gap, accommodating: minimums)
+        guard let slotA = resolved[a], let slotB = resolved[b] else {
+            fail("accommodation must keep both windows")
+        }
+        let frameA = slotA.frame(in: screenFrame, gap: gap, smartOuterGap: true)
+        let frameB = slotB.frame(in: screenFrame, gap: gap, smartOuterGap: true)
+        guard frameA.width >= 700 - 1 else {
+            fail("constrained tile must grow to its minimum width, got \(frameA.width)")
+        }
+        guard frameB.width >= TileLayout.minimumWindowFrameSize.width - 1 else {
+            fail("sibling must keep at least the default minimum, got \(frameB.width)")
+        }
+        let intersection = frameA.intersection(frameB)
+        let overlapArea = intersection.isNull ? 0 : intersection.width * intersection.height
+        guard overlapArea <= 0.001 else {
+            fail("accommodated frames must not overlap")
+        }
+    }
+    private static func testAccommodationInfeasibleFallsBackProportionally() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let a = windowID(1)
+        let b = windowID(2)
+        let state = screenState([a, b], focused: a)
+        let minimums = [
+            a: CGSize(width: 800, height: 100),
+            b: CGSize(width: 800, height: 100)
+        ]
+        let resolved = state.resolvedSlots(in: screenFrame, gap: 0, accommodating: minimums)
+        guard let slotA = resolved[a], let slotB = resolved[b] else {
+            fail("infeasible accommodation must keep both windows")
+        }
+        guard approximatelyEqual(slotA.width, 0.5), approximatelyEqual(slotB.width, 0.5) else {
+            fail("equal minimums that cannot fit must split proportionally, got \(slotA.width)/\(slotB.width)")
+        }
+    }
+    private static func testAccommodationLeavesUnconstrainedTreesUntouched() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let a = windowID(1)
+        let b = windowID(2)
+        let unrelated = windowID(9)
+        let state = screenState([a, b], focused: a)
+        let plain = state.slots
+        let withEmpty = state.resolvedSlots(in: screenFrame, gap: 8, accommodating: [:])
+        let withIrrelevant = state.resolvedSlots(
+            in: screenFrame,
+            gap: 8,
+            accommodating: [unrelated: CGSize(width: 900, height: 700)]
+        )
+        for id in [a, b] {
+            expectEqual(withEmpty[id]!, plain[id]!, "empty minimums must not change slots")
+            expectEqual(withIrrelevant[id]!, plain[id]!, "minimums for absent windows must not change slots")
+        }
+    }
+    private static func testAccommodationDoesNotMutateStoredState() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let a = windowID(1)
+        let b = windowID(2)
+        let state = screenState([a, b], focused: a)
+        let before = state.slots
+        _ = state.resolvedSlots(in: screenFrame, gap: 8, accommodating: [a: CGSize(width: 700, height: 120)])
+        let after = state.slots
+        for id in [a, b] {
+            expectEqual(after[id]!, before[id]!, "accommodation must never mutate the stored tree")
+        }
+    }
+    private static func testSlidePlannerUsesAccommodatedEndFrames() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let screen = ScreenInfo(key: "display:7", frame: screenFrame, displayID: nil, workspaceIndex: 0)
+        let a = windowID(1)
+        let b = windowID(2)
+        let targetState = screenState([a, b], focused: a)
+        let windows = [
+            testManagedWindow(id: a, screen: screen, frame: CGRect(x: 0, y: 0, width: 400, height: 400)),
+            testManagedWindow(id: b, screen: screen, frame: CGRect(x: 400, y: 0, width: 400, height: 400), scanIndex: 1)
+        ]
+        let minimums = [a: CGSize(width: 700, height: 120)]
+        let transitions = WorkspaceSlidePlanner.transitions(
+            allWindows: windows,
+            screen: screen,
+            visibleState: nil,
+            targetState: targetState,
+            direction: .forward,
+            floatingWindowIDs: [],
+            screens: [screen],
+            gapPixels: 8,
+            minimumSizesByID: minimums
+        )
+        guard let transitionA = transitions.first(where: { $0.window.id == a }) else {
+            fail("slide planner must produce a transition for the constrained window")
+        }
+        guard transitionA.endFrame.width >= 700 - 1 else {
+            fail("slide end frame must honor the app minimum, got \(transitionA.endFrame.width)")
+        }
+    }
+    private static func testReassertBudgetBoundsAttempts() {
+        var budget = ReassertBudget(maxAttempts: 3, interval: 10)
+        let id = windowID(1)
+        let start = Date(timeIntervalSince1970: 1000)
+        for attempt in 0..<3 {
+            guard budget.allowsReassert(of: id, now: start.addingTimeInterval(Double(attempt))) else {
+                fail("attempt \(attempt + 1) should be allowed")
+            }
+        }
+        if budget.allowsReassert(of: id, now: start.addingTimeInterval(3)) {
+            fail("fourth attempt inside the interval must be denied")
+        }
+        let other = windowID(2)
+        guard budget.allowsReassert(of: other, now: start.addingTimeInterval(3)) else {
+            fail("budget must be tracked per window")
+        }
+        guard budget.allowsReassert(of: id, now: start.addingTimeInterval(20)) else {
+            fail("attempts must be allowed again after the interval expires")
+        }
+    }
+    private static func testAppSizeConstraintsStorePersistsAfterConsistentObservations() {
+        let suiteName = "com.gigaxel.macpane.tests.appSizeConstraints"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            fail("could not create test defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let cap = CGSize(width: 2000, height: 2000)
+        let bundleID = "com.microsoft.teams2"
+
+        let store = AppSizeConstraintsStore(defaults: defaults)
+        store.recordObservedMinimum(CGSize(width: 800, height: 0), forBundleIdentifier: bundleID, cappedTo: cap)
+        guard store.minimumSize(forBundleIdentifier: bundleID) == nil else {
+            fail("one observation must have no effect because it could be a misread")
+        }
+        guard AppSizeConstraintsStore(defaults: defaults).minimumSize(forBundleIdentifier: bundleID) == nil else {
+            fail("one observation must not persist")
+        }
+        store.recordObservedMinimum(CGSize(width: 802, height: 0), forBundleIdentifier: bundleID, cappedTo: cap)
+        guard store.minimumSize(forBundleIdentifier: bundleID)?.width ?? 0 >= 800 else {
+            fail("two consistent observations must take effect")
+        }
+        guard let persisted = AppSizeConstraintsStore(defaults: defaults).minimumSize(forBundleIdentifier: bundleID),
+              persisted.width >= 800 else {
+            fail("two consistent observations must persist")
+        }
+        store.recordObservedMinimum(CGSize(width: 3000, height: 50), forBundleIdentifier: bundleID, cappedTo: cap)
+        store.recordObservedMinimum(CGSize(width: 3000, height: 50), forBundleIdentifier: bundleID, cappedTo: cap)
+        guard let capped = store.minimumSize(forBundleIdentifier: bundleID), capped.width <= cap.width else {
+            fail("observations must be capped")
+        }
+        store.reset()
+        guard store.minimumSize(forBundleIdentifier: bundleID) == nil,
+              AppSizeConstraintsStore(defaults: defaults).minimumSize(forBundleIdentifier: bundleID) == nil else {
+            fail("reset must clear memory and persistence")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+    private static func testResolveIdentityReportsNewlyCreated() {
+        var registry = WindowIdentityRegistry()
+        let elementKey = WindowElementKey(pid: 42, hash: 12345)
+        let first = registry.resolveIdentity(for: nil, elementKey: elementKey, signature: nil)
+        guard first.isNewlyCreated else {
+            fail("first sight of an element must be newly created")
+        }
+        let second = registry.resolveIdentity(for: nil, elementKey: elementKey, signature: nil)
+        guard !second.isNewlyCreated, second.id == first.id else {
+            fail("a known element must resolve to the same identity without being newly created")
+        }
+    }
+    private static func testMissingWindowRetentionKeepsTransientDropouts() {
+        let key = "display:1:workspace:0"
+        let a = windowID(1)
+        let b = windowID(2)
+        let transientMissing = windowID(3)
+        let longMissing = windowID(4)
+        let destroyed = windowID(5)
+        let deadProcess = windowID(6, pid: 99)
+        let movedElsewhere = windowID(7)
+        let now = Date(timeIntervalSince1970: 10_000)
+        let state = screenState([a, b, transientMissing, longMissing, destroyed, deadProcess, movedElsewhere])
+
+        let retention = WindowStateSyncPlanner.missingWindowRetention(
+            idsByScreen: [key: [a, b]],
+            activeStateKeys: [key],
+            screenStates: [key: state],
+            visibleIDs: [a, b, movedElsewhere],
+            missingSinceByID: [longMissing: now.addingTimeInterval(-2)],
+            confirmedRemovedIDs: [destroyed],
+            isProcessRunning: { $0 != 99 },
+            grace: 1.0,
+            now: now
+        )
+        let retained = retention.retainedIDsByStateKey[key] ?? []
+        guard retained == [transientMissing] else {
+            fail("only the transiently missing window should be retained, got \(retained)")
+        }
+        guard retention.missingSinceByID[transientMissing] == now else {
+            fail("a newly missing window must start its grace clock at now")
+        }
+        for id in [longMissing, destroyed, deadProcess, movedElsewhere, a, b] {
+            guard retention.missingSinceByID[id] == nil else {
+                fail("only retained windows should stay tracked, but \(id) is tracked")
+            }
+        }
     }
     private static func windowSignature(pid: pid_t, title: String, stateKey: String = "display-a") -> WindowSignature {
         WindowSignature(

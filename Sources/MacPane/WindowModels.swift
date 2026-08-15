@@ -12,6 +12,10 @@ struct OnScreenWindowSnapshot {
     var recordsByPID: [pid_t: [CGWindowRecord]] = [:]
     var visibleNumbersByPID: [pid_t: Set<Int>] = [:]
     var rankByWindow: [WindowOrderKey: Int] = [:]
+    var framesByWindow: [WindowOrderKey: CGRect] = [:]
+    func frame(pid: pid_t, number: Int) -> CGRect? {
+        framesByWindow[WindowOrderKey(pid: pid, number: number)]
+    }
     func matchWindowNumber(pid: pid_t, frame: CGRect, title: String?, excluding excludedNumbers: Set<Int>) -> Int? {
         guard let records = recordsByPID[pid], !records.isEmpty else { return nil }
         let normalizedTitle = normalizedWindowTitle(title)
@@ -192,6 +196,17 @@ struct ScreenTileState {
     var isEmpty: Bool { tree.isEmpty }
     var slots: [WindowIdentity: TileSlot] { tree.slots() }
     var slotList: [(id: WindowIdentity, slot: TileSlot)] { tree.slotList() }
+    func resolvedSlots(
+        in screenFrame: CGRect,
+        gap: CGFloat,
+        accommodating minimums: [WindowIdentity: CGSize]
+    ) -> [WindowIdentity: TileSlot] {
+        guard !minimums.isEmpty else { return slots }
+        let ids = windowIDs
+        let relevantMinimums = minimums.filter { ids.contains($0.key) }
+        guard !relevantMinimums.isEmpty else { return slots }
+        return tree.slotsAccommodating(minimums: relevantMinimums, in: screenFrame, gap: gap)
+    }
     var tileCount: Int { tree.tileCount }
     var windowIDs: Set<WindowIdentity> { Set(tree.ids) }
     var focusedWindowID: WindowIdentity? {

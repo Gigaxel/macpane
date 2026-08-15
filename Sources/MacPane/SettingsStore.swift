@@ -51,6 +51,31 @@ final class SettingsStore: ObservableObject {
         tiler.setWorkspaceSwitchAnimationsEnabled(value)
     }
 
+    var autoFloatSmallWindowsEnabled: Bool { tiler.autoFloatSmallWindowsEnabled }
+    var autoFloatWidthThreshold: Int { tiler.autoFloatWidthThreshold }
+    var autoFloatHeightThreshold: Int { tiler.autoFloatHeightThreshold }
+    let autoFloatThresholdRange = WindowTilerSettings.autoFloatThresholdRange
+
+    func setAutoFloatSmallWindowsEnabled(_ value: Bool) {
+        objectWillChange.send()
+        tiler.setAutoFloatSmallWindowsEnabled(value)
+    }
+
+    func setAutoFloatWidthThreshold(_ value: Int) {
+        objectWillChange.send()
+        tiler.setAutoFloatWidthThreshold(value)
+    }
+
+    func setAutoFloatHeightThreshold(_ value: Int) {
+        objectWillChange.send()
+        tiler.setAutoFloatHeightThreshold(value)
+    }
+
+    func resetLearnedAppSizeLimits() {
+        objectWillChange.send()
+        tiler.resetLearnedAppSizeConstraints()
+    }
+
     func createWorkspace() {
         objectWillChange.send()
         tiler.handle(action: .createWorkspace)
