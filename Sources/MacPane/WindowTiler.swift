@@ -446,21 +446,33 @@ final class WindowTiler {
             return nil
         }
         let windowsByID = Dictionary(allWindows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let minimums = minimumSizesByWindowID(for: allWindows)
         let items = (0..<workspaceCount).map { index in
             let stateKey = ScreenInfo.workspaceStateKey(nativeStateKey: context.nativeStateKey, workspaceIndex: index)
             let state = screenStates[stateKey]
+            let slots = state?.resolvedSlots(
+                in: context.screen.frame,
+                gap: CGFloat(gapPixels),
+                accommodating: minimums
+            ) ?? [:]
             let windows = (state?.slotList ?? []).map { item in
                 overviewWindow(
                     for: item.id,
                     stateFocusedID: state?.focusedWindowID,
                     focusedID: focusedID,
-                    windowsByID: windowsByID
+                    windowsByID: windowsByID,
+                    frame: slots[item.id].map {
+                        WindowFrameApplier.sanitizedFrame(
+                            $0.frame(in: context.screen.frame, gap: CGFloat(gapPixels), smartOuterGap: true)
+                        )
+                    }
                 )
             }
             return WorkspaceOverviewItem(
                 index: index,
                 name: settings.workspaceName(forNativeStateKey: context.nativeStateKey, workspaceIndex: index),
                 isActive: index == context.activeWorkspaceIndex,
+                screenFrame: context.screen.frame,
                 windows: windows
             )
         }
@@ -2767,7 +2779,8 @@ final class WindowTiler {
         for id: WindowIdentity,
         stateFocusedID: WindowIdentity?,
         focusedID: WindowIdentity?,
-        windowsByID: [WindowIdentity: ManagedWindow]
+        windowsByID: [WindowIdentity: ManagedWindow],
+        frame: CGRect?
     ) -> WorkspaceOverviewWindow {
         let window = windowsByID[id]
         let layoutIdentity = layoutIdentityByWindowID[id]
@@ -2782,7 +2795,9 @@ final class WindowTiler {
         return WorkspaceOverviewWindow(
             title: title,
             detail: detail,
-            isFocused: id == focusedID || id == stateFocusedID
+            isFocused: id == focusedID || id == stateFocusedID,
+            frame: frame,
+            pid: id.pid
         )
     }
     private func screenInfo(

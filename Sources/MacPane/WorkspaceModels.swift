@@ -41,12 +41,15 @@ struct WorkspaceOverviewItem {
     let index: Int
     let name: String?
     let isActive: Bool
+    let screenFrame: CGRect
     let windows: [WorkspaceOverviewWindow]
 }
 struct WorkspaceOverviewWindow {
     let title: String
     let detail: String?
     let isFocused: Bool
+    let frame: CGRect?
+    let pid: pid_t
 }
 struct WorkspaceContext {
     let screen: ScreenInfo
