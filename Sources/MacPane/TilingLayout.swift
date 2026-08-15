@@ -88,6 +88,7 @@ enum TileLayout {
     static let minimumSlotSize: CGFloat = 0.04
     static let resizeReflectionThreshold: CGFloat = 0.018
     static let minimumWindowFrameSize = CGSize(width: 180, height: 120)
+    static let minimumAccommodationRatio: CGFloat = 0.02
     static func maximumSpatialTileCount(
         in screen: CGRect,
         gap: CGFloat,
@@ -177,6 +178,24 @@ struct BSPTree<ID: Hashable> {
         guard let root else { return [] }
         var output: [(id: ID, slot: TileSlot)] = []
         root.collectSlotList(in: TileSlot(x: 0, y: 0, width: 1, height: 1), into: &output)
+        return output
+    }
+
+    func slotsAccommodating(minimums: [ID: CGSize], in screenFrame: CGRect, gap: CGFloat) -> [ID: TileSlot] {
+        guard let root else { return [:] }
+        guard !minimums.isEmpty else { return slots() }
+        let gap = max(0, gap)
+        let usable = screenFrame.insetBy(dx: gap, dy: gap)
+        guard usable.width > 0, usable.height > 0 else { return slots() }
+        var output: [ID: TileSlot] = [:]
+        root.collectAccommodatedSlots(
+            in: TileSlot(x: 0, y: 0, width: 1, height: 1),
+            unitSize: usable.size,
+            minimums: minimums,
+            defaultMinimum: TileLayout.minimumWindowFrameSize,
+            gap: gap,
+            into: &output
+        )
         return output
     }
     mutating func removeMissing(keeping liveIDs: Set<ID>) {
@@ -416,6 +435,95 @@ private indirect enum BSPNode<ID: Hashable> {
             second.collectSlotList(in: secondSlot, into: &output)
         }
     }
+
+    func requiredMinimumSize(minimums: [ID: CGSize], defaultMinimum: CGSize, gap: CGFloat) -> CGSize {
+        switch self {
+        case .leaf(let id):
+            let minimum = minimums[id] ?? defaultMinimum
+            return CGSize(width: minimum.width + gap, height: minimum.height + gap)
+        case .split(let axis, _, let first, let second):
+            let firstMinimum = first.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap)
+            let secondMinimum = second.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap)
+            switch axis {
+            case .horizontal:
+                return CGSize(
+                    width: firstMinimum.width + secondMinimum.width,
+                    height: max(firstMinimum.height, secondMinimum.height)
+                )
+            case .vertical:
+                return CGSize(
+                    width: max(firstMinimum.width, secondMinimum.width),
+                    height: firstMinimum.height + secondMinimum.height
+                )
+            }
+        }
+    }
+
+    func collectAccommodatedSlots(
+        in slot: TileSlot,
+        unitSize: CGSize,
+        minimums: [ID: CGSize],
+        defaultMinimum: CGSize,
+        gap: CGFloat,
+        into output: inout [ID: TileSlot]
+    ) {
+        switch self {
+        case .leaf(let id):
+            output[id] = slot
+        case .split(let axis, let ratio, let first, let second):
+            let firstMinimum = first.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap)
+            let secondMinimum = second.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap)
+            let availablePixels: CGFloat
+            let firstMinimumPixels: CGFloat
+            let secondMinimumPixels: CGFloat
+            switch axis {
+            case .horizontal:
+                availablePixels = slot.width * unitSize.width
+                firstMinimumPixels = firstMinimum.width
+                secondMinimumPixels = secondMinimum.width
+            case .vertical:
+                availablePixels = slot.height * unitSize.height
+                firstMinimumPixels = firstMinimum.height
+                secondMinimumPixels = secondMinimum.height
+            }
+            var resolvedRatio = clamped(
+                ratio,
+                minimum: TileLayout.minimumSplitRatio,
+                maximum: 1 - TileLayout.minimumSplitRatio
+            )
+            if availablePixels > 0 {
+                let firstFraction = firstMinimumPixels / availablePixels
+                let secondFraction = secondMinimumPixels / availablePixels
+                if firstFraction + secondFraction <= 1 {
+                    resolvedRatio = clamped(resolvedRatio, minimum: firstFraction, maximum: 1 - secondFraction)
+                } else if firstMinimumPixels + secondMinimumPixels > 0 {
+                    resolvedRatio = firstMinimumPixels / (firstMinimumPixels + secondMinimumPixels)
+                }
+            }
+            resolvedRatio = clamped(
+                resolvedRatio,
+                minimum: TileLayout.minimumAccommodationRatio,
+                maximum: 1 - TileLayout.minimumAccommodationRatio
+            )
+            let (firstSlot, secondSlot) = splitSlotsUnclamped(slot, axis: axis, ratio: resolvedRatio)
+            first.collectAccommodatedSlots(
+                in: firstSlot,
+                unitSize: unitSize,
+                minimums: minimums,
+                defaultMinimum: defaultMinimum,
+                gap: gap,
+                into: &output
+            )
+            second.collectAccommodatedSlots(
+                in: secondSlot,
+                unitSize: unitSize,
+                minimums: minimums,
+                defaultMinimum: defaultMinimum,
+                gap: gap,
+                into: &output
+            )
+        }
+    }
     func inserting(_ id: ID, near target: ID, axis: TileAxis, newFirst: Bool) -> BSPNode<ID> {
         switch self {
         case .leaf(let current):
@@ -616,6 +724,10 @@ private indirect enum BSPNode<ID: Hashable> {
 }
 private func splitSlots(_ slot: TileSlot, axis: TileAxis, ratio rawRatio: CGFloat) -> (TileSlot, TileSlot) {
     let ratio = clamped(rawRatio, minimum: TileLayout.minimumSplitRatio, maximum: 1 - TileLayout.minimumSplitRatio)
+    return splitSlotsUnclamped(slot, axis: axis, ratio: ratio)
+}
+
+private func splitSlotsUnclamped(_ slot: TileSlot, axis: TileAxis, ratio: CGFloat) -> (TileSlot, TileSlot) {
     switch axis {
     case .horizontal:
         return (

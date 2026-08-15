@@ -109,6 +109,47 @@ private struct GeneralSettingsView: View {
                 }
             }
 
+            Section("Pop-up Windows") {
+                Toggle(
+                    "Float small pop-up windows",
+                    isOn: Binding(
+                        get: { store.autoFloatSmallWindowsEnabled },
+                        set: { store.setAutoFloatSmallWindowsEnabled($0) }
+                    )
+                )
+                if store.autoFloatSmallWindowsEnabled {
+                    LabeledContent("Float when narrower than") {
+                        Stepper(
+                            value: Binding(
+                                get: { store.autoFloatWidthThreshold },
+                                set: { store.setAutoFloatWidthThreshold($0) }
+                            ),
+                            in: store.autoFloatThresholdRange,
+                            step: 20
+                        ) {
+                            Text("\(store.autoFloatWidthThreshold) px")
+                                .monospacedDigit()
+                        }
+                    }
+                    LabeledContent("Float when shorter than") {
+                        Stepper(
+                            value: Binding(
+                                get: { store.autoFloatHeightThreshold },
+                                set: { store.setAutoFloatHeightThreshold($0) }
+                            ),
+                            in: store.autoFloatThresholdRange,
+                            step: 20
+                        ) {
+                            Text("\(store.autoFloatHeightThreshold) px")
+                                .monospacedDigit()
+                        }
+                    }
+                    Text("New windows below either limit float instead of splitting a tile. Use the float shortcut to tile a window.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Section("Permissions") {
                 HStack(spacing: 10) {
                     Image(systemName: store.accessibilityEnabled ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
@@ -129,6 +170,12 @@ private struct GeneralSettingsView: View {
 
             Section("Maintenance") {
                 Button("Retile Windows Now") { store.retileNow() }
+                LabeledContent("Learned app size limits") {
+                    Button("Reset") { store.resetLearnedAppSizeLimits() }
+                }
+                Text("MacPane learns an app's minimum size when the app rejects a smaller frame. Reset the saved sizes if a tile is too large.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)

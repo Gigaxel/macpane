@@ -35,7 +35,8 @@ enum WorkspaceSlidePlanner {
         direction: WorkspaceSlideDirection,
         floatingWindowIDs: Set<WindowIdentity>,
         screens: [ScreenInfo],
-        gapPixels: CGFloat
+        gapPixels: CGFloat,
+        minimumSizesByID: [WindowIdentity: CGSize] = [:]
     ) -> [WorkspaceSlideTransition] {
         let windowsByID = Dictionary(allWindows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var transitions: [WorkspaceSlideTransition] = []
@@ -68,8 +69,13 @@ enum WorkspaceSlidePlanner {
             guard targetState.windowIDs.allSatisfy({ windowsByID[$0] != nil || floatingWindowIDs.contains($0) }) else {
                 return []
             }
-            for (id, slot) in targetState.slotList {
-                guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { continue }
+            let resolvedSlots = targetState.resolvedSlots(
+                in: screen.frame,
+                gap: gapPixels,
+                accommodating: minimumSizesByID
+            )
+            for (id, _) in targetState.slotList {
+                guard let window = windowsByID[id], !floatingWindowIDs.contains(id), let slot = resolvedSlots[id] else { continue }
                 let endFrame = sanitizedFrame(slot.frame(in: screen.frame, gap: gapPixels, smartOuterGap: true))
                 let startFrame = hiddenFrame(
                     matching: endFrame,
@@ -118,15 +124,17 @@ enum WorkspaceSlidePlanner {
         direction: WorkspaceSlideDirection,
         floatingWindowIDs: Set<WindowIdentity>,
         screens: [ScreenInfo],
-        gapPixels: CGFloat
+        gapPixels: CGFloat,
+        minimumSizesByID: [WindowIdentity: CGSize] = [:]
     ) -> [WorkspaceSlideTransition] {
         let windowsByID = Dictionary(allWindows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let outgoingEdge: WorkspaceSlideEdge = direction == .forward ? .left : .right
         let incomingEdge: WorkspaceSlideEdge = direction == .forward ? .right : .left
-        let newTargetSlotsByID: [WindowIdentity: TileSlot] = {
-            guard let newTargetState else { return [:] }
-            return Dictionary(uniqueKeysWithValues: newTargetState.slotList.map { ($0.id, $0.slot) })
-        }()
+        let newTargetSlotsByID: [WindowIdentity: TileSlot] = newTargetState?.resolvedSlots(
+            in: screen.frame,
+            gap: gapPixels,
+            accommodating: minimumSizesByID
+        ) ?? [:]
         if let newTargetState {
             guard newTargetState.windowIDs.allSatisfy({ windowsByID[$0] != nil || floatingWindowIDs.contains($0) }) else {
                 return []
@@ -182,9 +190,9 @@ enum WorkspaceSlidePlanner {
         // 2. Windows joining from the new target workspace that weren't in the prior
         //    slide — slide them in from the incoming edge of the new direction.
         if let newTargetState {
-            for (id, slot) in newTargetState.slotList {
+            for (id, _) in newTargetState.slotList {
                 guard !seenIDs.contains(id) else { continue }
-                guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { continue }
+                guard let window = windowsByID[id], !floatingWindowIDs.contains(id), let slot = newTargetSlotsByID[id] else { continue }
                 let endFrame = sanitizedFrame(slot.frame(in: screen.frame, gap: gapPixels, smartOuterGap: true))
                 let startFrame = hiddenFrame(matching: endFrame, on: screen, edge: incomingEdge)
                 guard hiddenFrameDoesNotCoverAnotherScreen(startFrame, source: screen, screens: screens) else {

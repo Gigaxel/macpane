@@ -9,9 +9,16 @@ final class WindowTilerSettings {
         static let workspaceNamesByDisplay = "workspaceNamesByDisplay"
         static let accessibilityPrompted = "accessibilityPrompted"
         static let onboardingCompleted = "onboardingCompleted"
+        static let autoFloatSmallWindowsEnabled = "autoFloatSmallWindowsEnabled"
+        static let autoFloatWidthThreshold = "autoFloatWidthThreshold"
+        static let autoFloatHeightThreshold = "autoFloatHeightThreshold"
     }
 
     private let defaults: UserDefaults
+    static let autoFloatThresholdRange = 100...1200
+
+    private static let defaultAutoFloatWidthThreshold = 500
+    private static let defaultAutoFloatHeightThreshold = 400
     private let defaultGap = 8
     private let defaultWorkspaceCount = 4
 
@@ -65,6 +72,43 @@ final class WindowTilerSettings {
 
     func toggleWorkspaceSwitchAnimations() {
         defaults.set(!workspaceSwitchAnimationsEnabled, forKey: DefaultsKey.workspaceSwitchAnimationsEnabled)
+    }
+
+    var autoFloatSmallWindowsEnabled: Bool {
+        if defaults.object(forKey: DefaultsKey.autoFloatSmallWindowsEnabled) == nil {
+            return true
+        }
+        return defaults.bool(forKey: DefaultsKey.autoFloatSmallWindowsEnabled)
+    }
+
+    func setAutoFloatSmallWindowsEnabled(_ value: Bool) {
+        defaults.set(value, forKey: DefaultsKey.autoFloatSmallWindowsEnabled)
+    }
+
+    var autoFloatWidthThreshold: Int {
+        clampedAutoFloatThreshold(
+            defaults.object(forKey: DefaultsKey.autoFloatWidthThreshold) as? Int
+                ?? Self.defaultAutoFloatWidthThreshold
+        )
+    }
+
+    func setAutoFloatWidthThreshold(_ value: Int) {
+        defaults.set(clampedAutoFloatThreshold(value), forKey: DefaultsKey.autoFloatWidthThreshold)
+    }
+
+    var autoFloatHeightThreshold: Int {
+        clampedAutoFloatThreshold(
+            defaults.object(forKey: DefaultsKey.autoFloatHeightThreshold) as? Int
+                ?? Self.defaultAutoFloatHeightThreshold
+        )
+    }
+
+    func setAutoFloatHeightThreshold(_ value: Int) {
+        defaults.set(clampedAutoFloatThreshold(value), forKey: DefaultsKey.autoFloatHeightThreshold)
+    }
+
+    private func clampedAutoFloatThreshold(_ value: Int) -> Int {
+        min(max(value, Self.autoFloatThresholdRange.lowerBound), Self.autoFloatThresholdRange.upperBound)
     }
 
     var hasPromptedForAccessibilityPermission: Bool {

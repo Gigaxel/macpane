@@ -36,27 +36,41 @@ struct WindowIdentityRegistry {
         signature: WindowSignature?,
         avoidingIdentities reservedIdentities: Set<WindowIdentity> = []
     ) -> WindowIdentity {
+        resolveIdentity(
+            for: windowKey,
+            elementKey: elementKey,
+            signature: signature,
+            avoidingIdentities: reservedIdentities
+        ).id
+    }
+
+    mutating func resolveIdentity(
+        for windowKey: WindowOrderKey?,
+        elementKey: WindowElementKey,
+        signature: WindowSignature?,
+        avoidingIdentities reservedIdentities: Set<WindowIdentity> = []
+    ) -> (id: WindowIdentity, isNewlyCreated: Bool) {
         if let existing = identityByElement[elementKey] {
             rememberIdentity(existing, windowKey: windowKey, elementKey: elementKey, signature: signature)
-            return existing
+            return (existing, false)
         }
         if let windowKey,
            let existing = identityByWindowNumber[windowKey],
            !reservedIdentities.contains(existing),
            isCompatibleIdentity(existing, signature: signature) {
             rememberIdentity(existing, windowKey: windowKey, elementKey: elementKey, signature: signature)
-            return existing
+            return (existing, false)
         }
         if let signature,
            let existing = identityBySignature[signature],
            !reservedIdentities.contains(existing) {
             rememberIdentity(existing, windowKey: windowKey, elementKey: elementKey, signature: signature)
-            return existing
+            return (existing, false)
         }
         let created = WindowIdentity(pid: windowKey?.pid ?? elementKey.pid, serial: nextWindowIdentitySerial)
         nextWindowIdentitySerial += 1
         rememberIdentity(created, windowKey: windowKey, elementKey: elementKey, signature: signature)
-        return created
+        return (created, true)
     }
     mutating func retainAliases(for retainedIdentities: Set<WindowIdentity>) {
         let knownIdentities = Set(windowNumbersByIdentity.keys)

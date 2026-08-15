@@ -5,8 +5,43 @@ struct DepartedScreenLayout {
     let createdAt: Date
 }
 
+struct MissingWindowRetention {
+    let retainedIDsByStateKey: [String: Set<WindowIdentity>]
+    let missingSinceByID: [WindowIdentity: Date]
+}
+
 enum WindowStateSyncPlanner {
     static let departedLayoutExpiry: TimeInterval = 6 * 60 * 60
+
+    static func missingWindowRetention(
+        idsByScreen: [String: Set<WindowIdentity>],
+        activeStateKeys: Set<String>,
+        screenStates: [String: ScreenTileState],
+        visibleIDs: Set<WindowIdentity>,
+        missingSinceByID: [WindowIdentity: Date],
+        confirmedRemovedIDs: Set<WindowIdentity>,
+        isProcessRunning: (pid_t) -> Bool,
+        grace: TimeInterval,
+        now: Date
+    ) -> MissingWindowRetention {
+        var retainedIDsByStateKey: [String: Set<WindowIdentity>] = [:]
+        var updatedMissingSince: [WindowIdentity: Date] = [:]
+        for (key, state) in screenStates where activeStateKeys.contains(key) {
+            let stateVisibleIDs = idsByScreen[key] ?? []
+            for id in state.windowIDs.subtracting(stateVisibleIDs) {
+                guard !visibleIDs.contains(id) else { continue }
+                guard !confirmedRemovedIDs.contains(id), isProcessRunning(id.pid) else { continue }
+                let missingSince = missingSinceByID[id] ?? now
+                guard now.timeIntervalSince(missingSince) < grace else { continue }
+                retainedIDsByStateKey[key, default: []].insert(id)
+                updatedMissingSince[id] = missingSince
+            }
+        }
+        return MissingWindowRetention(
+            retainedIDsByStateKey: retainedIDsByStateKey,
+            missingSinceByID: updatedMissingSince
+        )
+    }
 
     static func restoredDepartedLayout(
         memory: DepartedScreenLayout,

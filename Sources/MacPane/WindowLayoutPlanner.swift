@@ -1,8 +1,14 @@
 import CoreGraphics
 
 struct WindowFrameAssignment {
+    enum Kind: Equatable {
+        case visibleTile
+        case hiddenPark
+    }
+
     let window: ManagedWindow
     let frame: CGRect
+    let kind: Kind
 }
 
 struct WindowLayoutPlan {
@@ -17,7 +23,8 @@ enum WindowLayoutPlanner {
         currentScreens: [ScreenInfo],
         floatingWindowIDs: Set<WindowIdentity>,
         stateKeyLimit: Set<String>?,
-        gapPixels: CGFloat
+        gapPixels: CGFloat,
+        minimumSizesByID: [WindowIdentity: CGSize] = [:]
     ) -> WindowLayoutPlan {
         let windowsByID = Dictionary(windows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let screens = Dictionary(uniqueKeysWithValues: currentScreens.map { ($0.stateKey, $0) })
@@ -40,7 +47,8 @@ enum WindowLayoutPlanner {
                     screen: screen,
                     windowsByID: windowsByID,
                     floatingWindowIDs: floatingWindowIDs,
-                    gapPixels: gapPixels
+                    gapPixels: gapPixels,
+                    minimumSizesByID: minimumSizesByID
                 ))
                 continue
             }
@@ -93,12 +101,14 @@ enum WindowLayoutPlanner {
         screen: ScreenInfo,
         windowsByID: [WindowIdentity: ManagedWindow],
         floatingWindowIDs: Set<WindowIdentity>,
-        gapPixels: CGFloat
+        gapPixels: CGFloat,
+        minimumSizesByID: [WindowIdentity: CGSize]
     ) -> [WindowFrameAssignment] {
-        state.slots.compactMap { id, slot in
+        let slots = state.resolvedSlots(in: screen.frame, gap: gapPixels, accommodating: minimumSizesByID)
+        return slots.compactMap { id, slot in
             guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { return nil }
             let frame = slot.frame(in: screen.frame, gap: gapPixels, smartOuterGap: true)
-            return WindowFrameAssignment(window: window, frame: frame)
+            return WindowFrameAssignment(window: window, frame: frame, kind: .visibleTile)
         }
     }
 
@@ -110,7 +120,7 @@ enum WindowLayoutPlanner {
     ) -> [WindowFrameAssignment] {
         state.windowIDs.compactMap { id in
             guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { return nil }
-            return WindowFrameAssignment(window: window, frame: hiddenFrame(for: window, on: screen))
+            return WindowFrameAssignment(window: window, frame: hiddenFrame(for: window, on: screen), kind: .hiddenPark)
         }
     }
 
