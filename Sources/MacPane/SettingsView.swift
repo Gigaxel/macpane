@@ -231,6 +231,7 @@ private let shortcutGroups: [ShortcutGroupSpec] = [
         title: "Window",
         symbol: "macwindow",
         rows: [
+            ShortcutRowSpec(id: "toggleZoom", label: "Toggle zoom", identifier: "toggleZoom", mode: .atomic),
             ShortcutRowSpec(id: "toggleFloating", label: "Toggle floating", identifier: "toggleFloating", mode: .atomic),
             ShortcutRowSpec(id: "toggleOrientation", label: "Rotate split", identifier: "toggleOrientation", mode: .atomic),
             ShortcutRowSpec(id: "balance", label: "Balance BSP tree", identifier: "balance", mode: .atomic),

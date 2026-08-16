@@ -143,6 +143,13 @@ enum HotKeyBindingDefaults {
             action: .toggleFloating
         ))
         entries.append(HotKeyBindingEntry(
+            identifier: "toggleZoom",
+            keyCode: UInt32(kVK_ANSI_Z),
+            defaultModifiers: cmdOpt,
+            scope: .atomic,
+            action: .toggleZoom
+        ))
+        entries.append(HotKeyBindingEntry(
             identifier: "toggleTiling",
             keyCode: UInt32(kVK_ANSI_Y),
             defaultModifiers: cmdOpt,

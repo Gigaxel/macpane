@@ -43,12 +43,14 @@ enum LayoutRestorePlanner {
         }
 
         let sourceFocusedEntryID = source.lastFocusedEntryID.flatMap { sourceEntryIDReplacements[$0] }
+        let sourceZoomedEntryID = source.zoomedEntryID.flatMap { sourceEntryIDReplacements[$0] }
         return PersistedScreenLayout(
             stateKey: targetKey,
             displayKey: displayKey,
             tree: tree,
             entriesByID: entriesByID,
             lastFocusedEntryID: target.lastFocusedEntryID ?? sourceFocusedEntryID,
+            zoomedEntryID: target.zoomedEntryID ?? sourceZoomedEntryID,
             lastUpdated: max(target.lastUpdated, source.lastUpdated)
         )
     }
@@ -204,7 +206,8 @@ enum LayoutRestorePlanner {
 
         guard let tree = snapshot.tree.compactMapIDs({ entryIDToWindowID[$0] }) else { return nil }
         let focusedID = snapshot.lastFocusedEntryID.flatMap { entryIDToWindowID[$0] }
-        return ScreenTileState(tree: tree, lastFocusedID: focusedID)
+        let zoomedID = snapshot.zoomedEntryID.flatMap { entryIDToWindowID[$0] }
+        return ScreenTileState(tree: tree, lastFocusedID: focusedID, zoomedWindowID: zoomedID)
     }
 
     static func snapshot(
@@ -244,6 +247,7 @@ enum LayoutRestorePlanner {
             tree: tree,
             entriesByID: entriesByID,
             lastFocusedEntryID: state.focusedWindowID.flatMap { entryIDByWindowID[$0] },
+            zoomedEntryID: state.zoomedWindowID.flatMap { entryIDByWindowID[$0] },
             lastUpdated: Date()
         )
     }

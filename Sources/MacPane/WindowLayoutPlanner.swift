@@ -107,9 +107,28 @@ enum WindowLayoutPlanner {
         let slots = state.resolvedSlots(in: screen.frame, gap: gapPixels, accommodating: minimumSizesByID)
         return slots.compactMap { id, slot in
             guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { return nil }
-            let frame = slot.frame(in: screen.frame, gap: gapPixels, smartOuterGap: true)
+            let frame = visibleFrame(
+                for: id,
+                slot: slot,
+                state: state,
+                screenFrame: screen.frame,
+                gapPixels: gapPixels
+            )
             return WindowFrameAssignment(window: window, frame: frame, kind: .visibleTile)
         }
+    }
+
+    static func visibleFrame(
+        for id: WindowIdentity,
+        slot: TileSlot,
+        state: ScreenTileState,
+        screenFrame: CGRect,
+        gapPixels: CGFloat
+    ) -> CGRect {
+        let visibleSlot = id == state.zoomedWindowID
+            ? TileSlot(x: 0, y: 0, width: 1, height: 1)
+            : slot
+        return visibleSlot.frame(in: screenFrame, gap: gapPixels, smartOuterGap: true)
     }
 
     private static func hiddenFrameAssignments(

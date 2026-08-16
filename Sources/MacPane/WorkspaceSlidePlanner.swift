@@ -76,7 +76,13 @@ enum WorkspaceSlidePlanner {
             )
             for (id, _) in targetState.slotList {
                 guard let window = windowsByID[id], !floatingWindowIDs.contains(id), let slot = resolvedSlots[id] else { continue }
-                let endFrame = sanitizedFrame(slot.frame(in: screen.frame, gap: gapPixels, smartOuterGap: true))
+                let endFrame = sanitizedFrame(WindowLayoutPlanner.visibleFrame(
+                    for: id,
+                    slot: slot,
+                    state: targetState,
+                    screenFrame: screen.frame,
+                    gapPixels: gapPixels
+                ))
                 let startFrame = hiddenFrame(
                     matching: endFrame,
                     on: screen,
@@ -157,8 +163,14 @@ enum WorkspaceSlidePlanner {
             // Reference for hidden-frame y: any frame from the previous transition has the
             // correct on-screen y (slides only move along x).
             let yReference = previousTransition.endFrame
-            if let slot = newTargetSlotsByID[id] {
-                let endFrame = sanitizedFrame(slot.frame(in: screen.frame, gap: gapPixels, smartOuterGap: true))
+            if let newTargetState, let slot = newTargetSlotsByID[id] {
+                let endFrame = sanitizedFrame(WindowLayoutPlanner.visibleFrame(
+                    for: id,
+                    slot: slot,
+                    state: newTargetState,
+                    screenFrame: screen.frame,
+                    gapPixels: gapPixels
+                ))
                 transitions.append(WorkspaceSlideTransition(
                     window: window,
                     startFrame: startFrame,
@@ -193,7 +205,13 @@ enum WorkspaceSlidePlanner {
             for (id, _) in newTargetState.slotList {
                 guard !seenIDs.contains(id) else { continue }
                 guard let window = windowsByID[id], !floatingWindowIDs.contains(id), let slot = newTargetSlotsByID[id] else { continue }
-                let endFrame = sanitizedFrame(slot.frame(in: screen.frame, gap: gapPixels, smartOuterGap: true))
+                let endFrame = sanitizedFrame(WindowLayoutPlanner.visibleFrame(
+                    for: id,
+                    slot: slot,
+                    state: newTargetState,
+                    screenFrame: screen.frame,
+                    gapPixels: gapPixels
+                ))
                 let startFrame = hiddenFrame(matching: endFrame, on: screen, edge: incomingEdge)
                 guard hiddenFrameDoesNotCoverAnotherScreen(startFrame, source: screen, screens: screens) else {
                     return []

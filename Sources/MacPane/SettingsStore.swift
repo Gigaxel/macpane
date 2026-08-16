@@ -187,6 +187,7 @@ final class SettingsStore: ObservableObject {
         case "showWorkspaceOverview": return "Show workspace overview"
         case "toggleOrientation": return "Rotate split"
         case "toggleFloating": return "Toggle floating"
+        case "toggleZoom": return "Toggle zoom"
         case "toggleTiling": return "Toggle tiling"
         case "toggleWorkspaceSwitchAnimations": return "Toggle workspace animations"
         case "balance": return "Balance BSP tree"

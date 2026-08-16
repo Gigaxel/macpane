@@ -302,7 +302,8 @@ final class WindowTiler {
         }
         pruneScreenStatesForVisibleWindows(Set(allWindows.map(\.id)))
         let mergedWorkspaces = mergeAllWorkspaceStatesIntoActiveWorkspaces(focusedID: focusedID)
-        guard migratedAfterScreenChange || mergedWorkspaces else { return }
+        let clearedZooms = clearAllWorkspaceZooms()
+        guard migratedAfterScreenChange || mergedWorkspaces || clearedZooms else { return }
         invalidateManagedWindowCache(clearAppliedFrames: true)
         allWindows = managedWindows()
         applyLayout(to: allWindows, respectingTilingEnabled: false)
@@ -362,6 +363,9 @@ final class WindowTiler {
             return
         }
         startWatching()
+        if shouldUnzoomBeforePerforming(action) {
+            unzoomVisibleWorkspaces()
+        }
         switch action {
         case .focus(let direction):
             focusNeighbor(direction: direction)
@@ -389,6 +393,8 @@ final class WindowTiler {
             toggleFocusedSplitOrientation()
         case .toggleFloating:
             toggleFocusedFloating()
+        case .toggleZoom:
+            toggleFocusedZoom()
         case .toggleTiling:
             toggleTiling()
         case .toggleWorkspaceSwitchAnimations:
@@ -449,22 +455,26 @@ final class WindowTiler {
         let minimums = minimumSizesByWindowID(for: allWindows)
         let items = (0..<workspaceCount).map { index in
             let stateKey = ScreenInfo.workspaceStateKey(nativeStateKey: context.nativeStateKey, workspaceIndex: index)
-            let state = screenStates[stateKey]
-            let slots = state?.resolvedSlots(
+            let state = screenStates[stateKey] ?? ScreenTileState()
+            let slots = state.resolvedSlots(
                 in: context.screen.frame,
                 gap: CGFloat(gapPixels),
                 accommodating: minimums
-            ) ?? [:]
-            let windows = (state?.slotList ?? []).map { item in
+            )
+            let windows = state.slotList.map { item in
                 overviewWindow(
                     for: item.id,
-                    stateFocusedID: state?.focusedWindowID,
+                    stateFocusedID: state.focusedWindowID,
                     focusedID: focusedID,
                     windowsByID: windowsByID,
                     frame: slots[item.id].map {
-                        WindowFrameApplier.sanitizedFrame(
-                            $0.frame(in: context.screen.frame, gap: CGFloat(gapPixels), smartOuterGap: true)
-                        )
+                        WindowFrameApplier.sanitizedFrame(WindowLayoutPlanner.visibleFrame(
+                            for: item.id,
+                            slot: $0,
+                            state: state,
+                            screenFrame: context.screen.frame,
+                            gapPixels: CGFloat(gapPixels)
+                        ))
                     }
                 )
             }
@@ -932,6 +942,11 @@ final class WindowTiler {
               !floatingWindowIDs.contains(changedWindow.id) else {
             return
         }
+        if let key = stateKey(containing: changedWindow.id),
+           screenStates[key]?.zoomedWindowID == changedWindow.id {
+            applyLayout(to: allWindows, limitingToStateKeys: [key])
+            return
+        }
         guard placeDroppedWindow(changedWindow, allWindows: allWindows) else {
             applyLayout(to: allWindows)
             return
@@ -950,6 +965,11 @@ final class WindowTiler {
               !floatingWindowIDs.contains(changedWindow.id),
               let key = stateKey(containing: changedWindow.id),
               var state = screenStates[key] else {
+            return
+        }
+        if state.zoomedWindowID == changedWindow.id {
+            applyLayout(to: allWindows, limitingToStateKeys: [key])
+            focus(window: changedWindow, updateTreeFocus: true)
             return
         }
         let screen = currentScreenInfosByKey()[key] ?? changedWindow.screen
@@ -1294,6 +1314,52 @@ final class WindowTiler {
             self.applyLayout(to: allWindows, limitingToStateKeys: [key])
             return true
         }
+    }
+    private func toggleFocusedZoom() {
+        _ = performHotKeyActionWithRetry { [weak self] allWindows, focusedID in
+            guard let self,
+                  let focusedID,
+                  !self.floatingWindowIDs.contains(focusedID),
+                  let key = self.resolvedHotKeyStateKey(for: focusedID, windows: allWindows),
+                  var state = self.synchronizeHotKeyState(key: key, focusedID: focusedID, windows: allWindows),
+                  state.toggleZoom(focusedID) else {
+                return false
+            }
+            self.screenStates[key] = state
+            self.applyLayout(to: allWindows, limitingToStateKeys: [key])
+            if let focusedWindow = allWindows.first(where: { $0.id == focusedID }) {
+                self.focus(window: focusedWindow, updateTreeFocus: true)
+            }
+            return true
+        }
+    }
+    private func shouldUnzoomBeforePerforming(_ action: HotKeyAction) -> Bool {
+        switch action {
+        case .focus, .swap, .resize, .toggleOrientation, .balance:
+            return true
+        default:
+            return false
+        }
+    }
+    private func unzoomVisibleWorkspaces() {
+        var clearedKeys = Set<String>()
+        for key in currentScreenInfos().map(\.stateKey) {
+            guard var state = screenStates[key], state.clearZoom() else { continue }
+            screenStates[key] = state
+            clearedKeys.insert(key)
+        }
+        guard !clearedKeys.isEmpty else { return }
+        applyLayout(to: managedWindows(), limitingToStateKeys: clearedKeys)
+    }
+    @discardableResult
+    private func clearAllWorkspaceZooms() -> Bool {
+        var cleared = false
+        for key in Array(screenStates.keys) {
+            guard var state = screenStates[key], state.clearZoom() else { continue }
+            screenStates[key] = state
+            cleared = true
+        }
+        return cleared
     }
 
     // MARK: - Workspaces
@@ -1930,7 +1996,12 @@ final class WindowTiler {
             ) else {
                 continue
             }
-            departedLayoutsByStateKey[key] = DepartedScreenLayout(state: state, createdAt: Date())
+            var rememberedState = state
+            if let zoomedWindowID = state.zoomedWindowID,
+               !(idsByScreen[key] ?? []).contains(zoomedWindowID) {
+                rememberedState.clearZoom()
+            }
+            departedLayoutsByStateKey[key] = DepartedScreenLayout(state: rememberedState, createdAt: Date())
         }
     }
     private var departedWindowIDs: Set<WindowIdentity> {
@@ -3234,9 +3305,13 @@ final class WindowTiler {
             }
             let slots = state.resolvedSlots(in: screen.frame, gap: CGFloat(gapPixels), accommodating: minimums)
             guard let slot = slots[window.id] else { continue }
-            let expected = WindowFrameApplier.sanitizedFrame(
-                slot.frame(in: screen.frame, gap: CGFloat(gapPixels), smartOuterGap: true)
-            )
+            let expected = WindowFrameApplier.sanitizedFrame(WindowLayoutPlanner.visibleFrame(
+                for: window.id,
+                slot: slot,
+                state: state,
+                screenFrame: screen.frame,
+                gapPixels: CGFloat(gapPixels)
+            ))
             guard !WindowFrameApplier.approximatelyEqual(window.frame, expected) else { continue }
             // Only a frame check after a MacPane write can learn a minimum size.
             guard reassertBudget.allowsReassert(of: window.id, now: now) else { continue }

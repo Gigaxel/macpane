@@ -141,6 +141,7 @@ struct PersistedScreenLayout {
     let tree: BSPTree<Int>
     let entriesByID: [Int: PersistedWindowLayoutEntry]
     let lastFocusedEntryID: Int?
+    let zoomedEntryID: Int?
     let lastUpdated: Date
 }
 struct PersistedWindowLayoutEntry {
@@ -188,10 +189,16 @@ final class AppObserverRegistration {
 struct ScreenTileState {
     private var tree = BSPTree<WindowIdentity>()
     private var lastFocusedID: WindowIdentity?
+    private(set) var zoomedWindowID: WindowIdentity?
     init() {}
-    init(tree: BSPTree<WindowIdentity>, lastFocusedID: WindowIdentity? = nil) {
+    init(
+        tree: BSPTree<WindowIdentity>,
+        lastFocusedID: WindowIdentity? = nil,
+        zoomedWindowID: WindowIdentity? = nil
+    ) {
         self.tree = tree
         self.lastFocusedID = lastFocusedID.flatMap { tree.contains($0) ? $0 : nil }
+        self.zoomedWindowID = zoomedWindowID.flatMap { tree.contains($0) ? $0 : nil }
     }
     var isEmpty: Bool { tree.isEmpty }
     var slots: [WindowIdentity: TileSlot] { tree.slots() }
@@ -223,6 +230,10 @@ struct ScreenTileState {
         if let lastFocusedID, let replacement = replacements[lastFocusedID] {
             self.lastFocusedID = replacement
         }
+        if let zoomedWindowID, let replacement = replacements[zoomedWindowID] {
+            self.zoomedWindowID = replacement
+        }
+        clearZoomIfInvalid()
         return true
     }
     func compactMapWindowIDs<NewID: Hashable>(_ transform: (WindowIdentity) -> NewID?) -> BSPTree<NewID>? {
@@ -232,6 +243,9 @@ struct ScreenTileState {
         let liveIDs = Set(windowIDs)
         tree.removeMissing(keeping: liveIDs)
         let existingIDs = Set(tree.ids)
+        if windowIDs.contains(where: { !existingIDs.contains($0) }) {
+            zoomedWindowID = nil
+        }
         var target = focusedID.flatMap { existingIDs.contains($0) ? $0 : nil }
             ?? lastFocusedID.flatMap { existingIDs.contains($0) ? $0 : nil }
             ?? tree.largestLeafID()
@@ -251,16 +265,22 @@ struct ScreenTileState {
         } else {
             lastFocusedID = nil
         }
+        clearZoomIfInvalid()
     }
     mutating func removeMissing(keeping liveIDs: Set<WindowIdentity>) {
         tree.removeMissing(keeping: liveIDs)
         if let lastFocusedID, !tree.contains(lastFocusedID) {
             self.lastFocusedID = tree.firstID
         }
+        clearZoomIfInvalid()
     }
     mutating func insertExisting(_ id: WindowIdentity, near targetID: WindowIdentity?, placement: TilePlacement) {
+        let addsMember = !tree.contains(id)
         let target = targetID.flatMap { tree.contains($0) ? $0 : nil } ?? lastFocusedOrLargestID
         tree.insert(id, near: target, placement: placement)
+        if addsMember {
+            zoomedWindowID = nil
+        }
         markFocused(id)
     }
     mutating func merge(_ source: ScreenTileState, preferSourceFocus: Bool) {
@@ -271,10 +291,15 @@ struct ScreenTileState {
         }
         let preservedFocus = focusedWindowID
         var insertionTarget = lastFocusedOrLargestID
+        var addedMember = false
         for item in source.slotList {
             guard !tree.contains(item.id) else { continue }
             tree.insert(item.id, near: insertionTarget, placement: .automatic)
             insertionTarget = item.id
+            addedMember = true
+        }
+        if addedMember {
+            zoomedWindowID = nil
         }
         if preferSourceFocus, let sourceFocus = source.focusedWindowID ?? source.lastFocusedOrLargestID {
             markFocusedIfKnown(sourceFocus)
@@ -289,6 +314,19 @@ struct ScreenTileState {
         if lastFocusedID == id {
             lastFocusedID = tree.firstID
         }
+        clearZoomIfInvalid()
+    }
+    @discardableResult
+    mutating func toggleZoom(_ id: WindowIdentity) -> Bool {
+        guard tree.contains(id) else { return false }
+        zoomedWindowID = zoomedWindowID == id ? nil : id
+        return true
+    }
+    @discardableResult
+    mutating func clearZoom() -> Bool {
+        guard zoomedWindowID != nil else { return false }
+        zoomedWindowID = nil
+        return true
     }
     func neighborID(from focusedID: WindowIdentity, direction: SnapDirection) -> WindowIdentity? {
         tree.neighborID(from: focusedID, direction: direction)
@@ -340,6 +378,12 @@ struct ScreenTileState {
         if let lastFocusedID, !tree.contains(lastFocusedID) {
             self.lastFocusedID = tree.firstID
         }
+        clearZoomIfInvalid()
         return removed
+    }
+    private mutating func clearZoomIfInvalid() {
+        if let zoomedWindowID, !tree.contains(zoomedWindowID) {
+            self.zoomedWindowID = nil
+        }
     }
 }

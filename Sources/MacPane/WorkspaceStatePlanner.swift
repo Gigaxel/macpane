@@ -52,6 +52,7 @@ enum WorkspaceStatePlanner {
                 tree: snapshot.tree,
                 entriesByID: snapshot.entriesByID,
                 lastFocusedEntryID: snapshot.lastFocusedEntryID,
+                zoomedEntryID: snapshot.zoomedEntryID,
                 lastUpdated: snapshot.lastUpdated
             )
             if let existing = shifted[shiftedKey], existing.lastUpdated > shiftedSnapshot.lastUpdated {

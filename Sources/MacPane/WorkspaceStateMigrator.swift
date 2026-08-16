@@ -163,6 +163,7 @@ enum WorkspaceStateMigrator {
                 tree: sourceSnapshot.tree,
                 entriesByID: sourceSnapshot.entriesByID,
                 lastFocusedEntryID: sourceSnapshot.lastFocusedEntryID,
+                zoomedEntryID: sourceSnapshot.zoomedEntryID,
                 lastUpdated: sourceSnapshot.lastUpdated
             )
         }
@@ -234,6 +235,7 @@ enum WorkspaceStateMigrator {
             tree: snapshot.tree,
             entriesByID: snapshot.entriesByID,
             lastFocusedEntryID: snapshot.lastFocusedEntryID,
+            zoomedEntryID: snapshot.zoomedEntryID,
             lastUpdated: snapshot.lastUpdated
         )
         return true

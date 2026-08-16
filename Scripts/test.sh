@@ -24,6 +24,7 @@ xcrun swiftc \
   "$ROOT_DIR/Sources/MacPane/WindowModels.swift" \
   "$ROOT_DIR/Sources/MacPane/WorkspaceModels.swift" \
   "$ROOT_DIR/Sources/MacPane/WorkspaceSlidePlanner.swift" \
+  "$ROOT_DIR/Sources/MacPane/WorkspaceStatePlanner.swift" \
   "$ROOT_DIR/Sources/MacPane/WorkspaceSwitchPlanner.swift" \
   "$ROOT_DIR/Sources/MacPane/WorkspaceStateKeys.swift" \
   "$ROOT_DIR/Sources/MacPane/WindowStateSyncPlanner.swift" \

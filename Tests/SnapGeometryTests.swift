@@ -39,6 +39,9 @@ struct SnapGeometryTests {
         testWindowLayoutIdentityMatchesStrongComponentWhenTitleChanges()
         testWindowLayoutIdentityRejectsDuplicateWeakMatches()
         testWindowLayoutIdentityRejectsWeakMatchWhenStrongComponentConflicts()
+        testScreenTileStateZoomInvariant()
+        testScreenTileStateClearsZoomForNewMembersAndRemoval()
+        testScreenTileStateRemapsZoomAndClearsItForMerge()
         testWorkspaceStateMigratorMovesNativeDisplayState()
         testWorkspaceStateMigratorMigratesLegacyDisplayState()
         testWindowStateSyncPlannerDetectsUnchangedWindowSet()
@@ -48,6 +51,11 @@ struct SnapGeometryTests {
         testDepartedLayoutDoesNotRestoreWithoutReturningWindow()
         testDepartedLayoutCaptureRules()
         testWindowLayoutPlannerTilesShrunkenWindow()
+        testWindowLayoutPlannerZoomedWindowFillsWorkspace()
+        testSlidePlannerUsesZoomedEndFrame()
+        testChainedSlidePlannerUsesZoomedEndFrame()
+        testWorkspaceStatePlannerShiftsZoomedState()
+        testPersistedLayoutRoundTripPreservesZoom()
         testChainedSlideSkipsAlreadyHiddenNonTargetWindows()
         testWorkspaceSwitchApplyPlanIncludesAdditionalChainedStates()
         testWindowManageabilityPlannerFailsClosed()
@@ -679,6 +687,79 @@ struct SnapGeometryTests {
             fail("layout identity should not fall back to matching weak titles after stable documents conflict")
         }
     }
+    private static func testScreenTileStateZoomInvariant() {
+        let first = windowID(1)
+        let missing = windowID(2)
+        var state = screenState([first], focused: first)
+        guard state.toggleZoom(first), state.zoomedWindowID == first else {
+            fail("a tree member must toggle zoom on")
+        }
+        guard state.toggleZoom(first), state.zoomedWindowID == nil else {
+            fail("the zoomed tree member must toggle zoom off")
+        }
+        guard !state.toggleZoom(missing), state.zoomedWindowID == nil else {
+            fail("a window outside the tree must not become zoomed")
+        }
+        let initialized = screenState([first], zoomed: missing)
+        guard initialized.zoomedWindowID == nil else {
+            fail("initial state must reject a zoom identity outside the tree")
+        }
+    }
+    private static func testScreenTileStateClearsZoomForNewMembersAndRemoval() {
+        let first = windowID(1)
+        let second = windowID(2)
+        var synced = screenState([first], zoomed: first)
+        synced.sync(windowIDs: [first, second], focusedID: first)
+        guard synced.zoomedWindowID == nil else {
+            fail("sync must clear zoom when it adds a member")
+        }
+
+        var inserted = screenState([first], zoomed: first)
+        inserted.insertExisting(second, near: first, placement: .automatic)
+        guard inserted.zoomedWindowID == nil else {
+            fail("insertExisting must clear zoom when it adds a member")
+        }
+
+        var removed = screenState([first, second], zoomed: first)
+        removed.remove(first)
+        guard removed.zoomedWindowID == nil else {
+            fail("remove must clear zoom when it removes the zoom target")
+        }
+
+        var pruned = screenState([first, second], zoomed: second)
+        pruned.removeMissing(keeping: [first])
+        guard pruned.zoomedWindowID == nil else {
+            fail("removeMissing must clear zoom when it removes the zoom target")
+        }
+
+        var limited = screenState([first, second], zoomed: second)
+        _ = limited.limitTileCount(to: 1)
+        guard limited.zoomedWindowID == nil else {
+            fail("tile-count limiting must clear zoom when it removes the zoom target")
+        }
+    }
+    private static func testScreenTileStateRemapsZoomAndClearsItForMerge() {
+        let first = windowID(1)
+        let replacement = windowID(2)
+        let added = windowID(3)
+        var remapped = screenState([first], focused: first, zoomed: first)
+        guard remapped.replaceWindowIDs([first: replacement]),
+              remapped.zoomedWindowID == replacement else {
+            fail("identity replacement must remap the zoom target")
+        }
+
+        var target = screenState([replacement], focused: replacement, zoomed: replacement)
+        target.merge(screenState([added], focused: added, zoomed: added), preferSourceFocus: false)
+        guard target.windowIDs == Set([replacement, added]), target.zoomedWindowID == nil else {
+            fail("merging into a nonempty state must clear zoom when the merge adds a member")
+        }
+
+        var empty = ScreenTileState()
+        empty.merge(screenState([added], focused: added, zoomed: added), preferSourceFocus: true)
+        guard empty.zoomedWindowID == added else {
+            fail("merging into an empty state must preserve the source zoom target")
+        }
+    }
     private static func testWorkspaceStateMigratorMovesNativeDisplayState() {
         let first = windowID(1)
         let second = windowID(2)
@@ -687,7 +768,7 @@ struct SnapGeometryTests {
         let sourceOne = ScreenInfo.workspaceStateKey(nativeStateKey: "display-old", workspaceIndex: 1)
         let targetZero = ScreenInfo.workspaceStateKey(nativeStateKey: "display-new", workspaceIndex: 0)
         let targetOne = ScreenInfo.workspaceStateKey(nativeStateKey: "display-new", workspaceIndex: 1)
-        var screenStates = [sourceZero: screenState([first, second], focused: second)]
+        var screenStates = [sourceZero: screenState([first, second], focused: second, zoomed: first)]
         var persistedLayouts = [sourceZero: persistedLayout(stateKey: sourceZero)]
         var floatingStateKeys = [floating: sourceOne]
         var focusedWorkspaceIndex: Int?
@@ -711,7 +792,8 @@ struct SnapGeometryTests {
         }
         guard screenStates[sourceZero] == nil,
               screenStates[targetZero]?.windowIDs == Set([first, second]),
-              screenStates[targetZero]?.focusedWindowID == second else {
+              screenStates[targetZero]?.focusedWindowID == second,
+              screenStates[targetZero]?.zoomedWindowID == first else {
             fail("screen state should move to the matching target workspace")
         }
         guard persistedLayouts[sourceZero] == nil,
@@ -949,6 +1031,162 @@ struct SnapGeometryTests {
             fail("expected assignment for the tiny window, got a different id")
         }
         expectEqual(assignment.frame, screenFrame, "tiny window must be resized to its full slot frame instead of keeping its shrunken size")
+    }
+    private static func testPersistedLayoutRoundTripPreservesZoom() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let screen = ScreenInfo(key: "display:1", frame: screenFrame, displayID: nil, workspaceIndex: 0)
+        let a = windowID(1)
+        let b = windowID(2)
+        let windows = [
+            testManagedWindow(id: a, screen: screen, frame: CGRect(x: 0, y: 0, width: 960, height: 1080)),
+            testManagedWindow(id: b, screen: screen, frame: CGRect(x: 960, y: 0, width: 960, height: 1080), scanIndex: 1)
+        ]
+        let state = screenState([a, b], focused: a, zoomed: a)
+        guard let snapshot = LayoutRestorePlanner.snapshot(
+            stateKey: screen.stateKey,
+            state: state,
+            windowsByID: Dictionary(uniqueKeysWithValues: windows.map { ($0.id, $0) }),
+            layoutIdentityByWindowID: [:],
+            displayKey: "display:1"
+        ) else {
+            fail("snapshot of a zoomed state must succeed")
+        }
+        guard snapshot.zoomedEntryID != nil else {
+            fail("snapshot must remember which entry is zoomed")
+        }
+        guard let restored = LayoutRestorePlanner.restoredState(
+            from: snapshot,
+            on: screen,
+            currentWindows: windows,
+            gapPixels: 0
+        ) else {
+            fail("restore from a zoomed snapshot must succeed")
+        }
+        guard restored.zoomedWindowID == a else {
+            fail("restoring a persisted layout must preserve the zoomed window, got \(String(describing: restored.zoomedWindowID))")
+        }
+    }
+    private static func testWindowLayoutPlannerZoomedWindowFillsWorkspace() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let screen = ScreenInfo(key: "display:1", frame: screenFrame, displayID: nil, workspaceIndex: 0)
+        let a = windowID(1)
+        let b = windowID(2)
+        let windows = [
+            testManagedWindow(id: a, screen: screen, frame: CGRect(x: 0, y: 0, width: 960, height: 1080)),
+            testManagedWindow(id: b, screen: screen, frame: CGRect(x: 960, y: 0, width: 960, height: 1080), scanIndex: 1)
+        ]
+        var state = screenState([a, b], focused: a, zoomed: a)
+        let plan = WindowLayoutPlanner.plan(
+            windows: windows,
+            screenStates: [screen.stateKey: state],
+            currentScreens: [screen],
+            floatingWindowIDs: [],
+            stateKeyLimit: nil,
+            gapPixels: 0
+        )
+        guard let zoomed = plan.assignments.first(where: { $0.window.id == a }) else {
+            fail("zoomed window must receive an assignment")
+        }
+        expectEqual(zoomed.frame, screenFrame, "zoomed window must fill the workspace")
+        guard zoomed.kind == .visibleTile else {
+            fail("zoomed window must remain a visible tile")
+        }
+        guard let tiled = plan.assignments.first(where: { $0.window.id == b }) else {
+            fail("non-zoomed window must keep an assignment")
+        }
+        expectEqual(tiled.frame, CGRect(x: 960, y: 0, width: 960, height: 1080), "non-zoomed window must keep its tile frame beneath the zoom")
+        state.clearZoom()
+        let unzoomedPlan = WindowLayoutPlanner.plan(
+            windows: windows,
+            screenStates: [screen.stateKey: state],
+            currentScreens: [screen],
+            floatingWindowIDs: [],
+            stateKeyLimit: nil,
+            gapPixels: 0
+        )
+        guard let restored = unzoomedPlan.assignments.first(where: { $0.window.id == a }) else {
+            fail("unzoomed window must receive an assignment")
+        }
+        expectEqual(restored.frame, CGRect(x: 0, y: 0, width: 960, height: 1080), "clearing zoom must restore the tiled frame")
+    }
+    private static func testSlidePlannerUsesZoomedEndFrame() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let screen = ScreenInfo(key: "display:7", frame: screenFrame, displayID: nil, workspaceIndex: 0)
+        let a = windowID(1)
+        let b = windowID(2)
+        let windows = [
+            testManagedWindow(id: a, screen: screen, frame: CGRect(x: 0, y: 0, width: 400, height: 400)),
+            testManagedWindow(id: b, screen: screen, frame: CGRect(x: 400, y: 0, width: 400, height: 400), scanIndex: 1)
+        ]
+        let transitions = WorkspaceSlidePlanner.transitions(
+            allWindows: windows,
+            screen: screen,
+            visibleState: nil,
+            targetState: screenState([a, b], focused: a, zoomed: a),
+            direction: .forward,
+            floatingWindowIDs: [],
+            screens: [screen],
+            gapPixels: 0
+        )
+        guard let transitionA = transitions.first(where: { $0.window.id == a }) else {
+            fail("slide planner must produce a transition for the zoomed window")
+        }
+        expectEqual(transitionA.endFrame, screenFrame, "zoomed window must slide in at its zoom frame, not its tile frame")
+        guard let transitionB = transitions.first(where: { $0.window.id == b }) else {
+            fail("slide planner must produce a transition for the non-zoomed window")
+        }
+        expectEqual(transitionB.endFrame, CGRect(x: 500, y: 0, width: 500, height: 800), "non-zoomed window must keep its tile end frame")
+    }
+    private static func testChainedSlidePlannerUsesZoomedEndFrame() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let screen = ScreenInfo(key: "display:8", frame: screenFrame, displayID: nil, workspaceIndex: 0)
+        let outgoing = testManagedWindow(id: windowID(1), screen: screen, frame: screenFrame)
+        let target = testManagedWindow(id: windowID(2), screen: screen, frame: CGRect(x: 500, y: 0, width: 500, height: 800))
+        let transitions = WorkspaceSlidePlanner.chainedTransitions(
+            previousTransitions: [
+                WorkspaceSlideTransition(
+                    window: outgoing,
+                    startFrame: screenFrame,
+                    endFrame: screenFrame,
+                    needsInitialFrame: false
+                )
+            ],
+            currentOriginsByID: [outgoing.id: screenFrame.origin],
+            allWindows: [outgoing, target],
+            screen: screen,
+            newTargetState: screenState([target.id], focused: target.id, zoomed: target.id),
+            direction: .forward,
+            floatingWindowIDs: [],
+            screens: [screen],
+            gapPixels: 0
+        )
+        guard let targetTransition = transitions.first(where: { $0.window.id == target.id }) else {
+            fail("chained slide planner must produce a transition for the zoomed window")
+        }
+        expectEqual(targetTransition.endFrame, screenFrame, "chained slide must use the target state's zoom frame")
+    }
+    private static func testWorkspaceStatePlannerShiftsZoomedState() {
+        let a = windowID(1)
+        let c = windowID(3)
+        func key(_ index: Int) -> String {
+            ScreenInfo.workspaceStateKey(nativeStateKey: "display:1", workspaceIndex: index)
+        }
+        let shifted = WorkspaceStatePlanner.shiftedScreenStates(
+            [
+                key(0): screenState([a], focused: a, zoomed: a),
+                key(2): screenState([c], focused: c, zoomed: c)
+            ],
+            deletingWorkspaceIndex: 1
+        )
+        guard shifted.count == 2 else {
+            fail("workspace deletion must retain both nonempty states, got \(shifted.count) entries")
+        }
+        guard shifted[key(0)]?.zoomedWindowID == a else {
+            fail("zoom state below the deleted workspace must keep its key")
+        }
+        guard shifted[key(1)]?.zoomedWindowID == c else {
+            fail("zoom state above the deleted workspace must shift down with its tile state")
+        }
     }
     private static func manageabilityInputs(
         role: AXRead<String> = .value(kAXWindowRole),
@@ -1275,14 +1513,18 @@ struct SnapGeometryTests {
     private static func testManagedWindow(serial: Int, frame: CGRect, screen: ScreenInfo) -> ManagedWindow {
         testManagedWindow(id: windowID(serial), screen: screen, frame: frame, scanIndex: serial)
     }
-    private static func screenState(_ ids: [WindowIdentity], focused: WindowIdentity? = nil) -> ScreenTileState {
+    private static func screenState(
+        _ ids: [WindowIdentity],
+        focused: WindowIdentity? = nil,
+        zoomed: WindowIdentity? = nil
+    ) -> ScreenTileState {
         var tree = BSPTree<WindowIdentity>()
         var target: WindowIdentity?
         for id in ids {
             tree.insert(id, near: target)
             target = id
         }
-        return ScreenTileState(tree: tree, lastFocusedID: focused)
+        return ScreenTileState(tree: tree, lastFocusedID: focused, zoomedWindowID: zoomed)
     }
     private static func persistedLayout(stateKey: String) -> PersistedScreenLayout {
         var tree = BSPTree<Int>()
@@ -1302,6 +1544,7 @@ struct SnapGeometryTests {
                 )
             ],
             lastFocusedEntryID: 1,
+            zoomedEntryID: nil,
             lastUpdated: Date(timeIntervalSince1970: 1)
         )
     }

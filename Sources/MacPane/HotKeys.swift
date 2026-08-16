@@ -20,6 +20,7 @@ enum HotKeyAction {
     case overviewRenameStart
     case toggleOrientation
     case toggleFloating
+    case toggleZoom
     case toggleTiling
     case toggleWorkspaceSwitchAnimations
     case balance
