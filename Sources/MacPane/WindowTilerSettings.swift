@@ -26,7 +26,6 @@ final class WindowTilerSettings {
     let maximumWorkspaceCount = 9
 
     private var activeWorkspaceIndexByNativeStateKey: [String: Int] = [:]
-    private var activeWorkspaceIndexByDisplayKey: [String: Int] = [:]
     private(set) var workspaceConfigurationVersion = 0
 
     init(defaults: UserDefaults = .standard) {
@@ -129,7 +128,6 @@ final class WindowTilerSettings {
 
     func resetRuntimeState() {
         activeWorkspaceIndexByNativeStateKey.removeAll()
-        activeWorkspaceIndexByDisplayKey.removeAll()
         workspaceConfigurationVersion += 1
     }
 
@@ -156,39 +154,29 @@ final class WindowTilerSettings {
         activeWorkspaceIndexByNativeStateKey = activeWorkspaceIndexByNativeStateKey.mapValues {
             shiftedActiveWorkspaceIndex($0, deletingWorkspaceIndex: index, newWorkspaceCount: newWorkspaceCount)
         }
-        activeWorkspaceIndexByDisplayKey = activeWorkspaceIndexByDisplayKey.mapValues {
-            shiftedActiveWorkspaceIndex($0, deletingWorkspaceIndex: index, newWorkspaceCount: newWorkspaceCount)
-        }
         workspaceConfigurationVersion += 1
     }
 
     func activeWorkspaceIndex(forNativeStateKey nativeStateKey: String) -> Int {
         let displayKey = displayKeyComponent(of: nativeStateKey)
-        let fallbackIndex = activeWorkspaceIndexByDisplayKey[displayKey]
-            ?? activeWorkspaceIndexByNativeStateKey.first { displayKeyComponent(of: $0.key) == displayKey }?.value
+        let fallbackIndex = activeWorkspaceIndexByNativeStateKey
+            .first { displayKeyComponent(of: $0.key) == displayKey }?.value
             ?? 0
         let index = clampedWorkspaceIndex(activeWorkspaceIndexByNativeStateKey[nativeStateKey] ?? fallbackIndex)
         activeWorkspaceIndexByNativeStateKey[nativeStateKey] = index
-        activeWorkspaceIndexByDisplayKey[displayKey] = index
         return index
     }
 
     func storedActiveWorkspaceIndex(forNativeStateKey nativeStateKey: String) -> Int? {
-        let displayKey = displayKeyComponent(of: nativeStateKey)
-        let index = activeWorkspaceIndexByNativeStateKey[nativeStateKey]
-            ?? activeWorkspaceIndexByDisplayKey[displayKey]
-        return index.map(clampedWorkspaceIndex)
+        activeWorkspaceIndexByNativeStateKey[nativeStateKey].map(clampedWorkspaceIndex)
     }
 
     func setActiveWorkspaceIndex(_ index: Int, forNativeStateKey nativeStateKey: String) {
         let index = clampedWorkspaceIndex(index)
-        let displayKey = displayKeyComponent(of: nativeStateKey)
-        if activeWorkspaceIndexByNativeStateKey[nativeStateKey] != index ||
-            activeWorkspaceIndexByDisplayKey[displayKey] != index {
+        if activeWorkspaceIndexByNativeStateKey[nativeStateKey] != index {
             workspaceConfigurationVersion += 1
         }
         activeWorkspaceIndexByNativeStateKey[nativeStateKey] = index
-        activeWorkspaceIndexByDisplayKey[displayKey] = index
     }
 
     func hasWorkspaceMetadata(forNativeStateKey nativeStateKey: String) -> Bool {
@@ -196,9 +184,6 @@ final class WindowTilerSettings {
             return true
         }
         let displayKey = displayKeyComponent(of: nativeStateKey)
-        if activeWorkspaceIndexByDisplayKey[displayKey] != nil {
-            return true
-        }
         return workspaceNames().keys.contains { nameKey in
             workspaceNameDisplayKey(from: nameKey) == displayKey
         }
@@ -267,9 +252,6 @@ final class WindowTilerSettings {
     ) -> Bool {
         var migrated = false
         if activeWorkspaceIndexByNativeStateKey.removeValue(forKey: sourceNativeStateKey) != nil {
-            migrated = true
-        }
-        if activeWorkspaceIndexByDisplayKey.removeValue(forKey: displayKeyComponent(of: sourceNativeStateKey)) != nil {
             migrated = true
         }
         if migrated {

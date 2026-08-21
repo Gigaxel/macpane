@@ -60,6 +60,7 @@ enum WindowLayoutPlanner {
             assignments.append(contentsOf: hiddenFrameAssignments(
                 state: state,
                 screen: screen,
+                otherScreenFrames: currentScreens.filter { $0.key != screen.key }.map(\.frame),
                 windowsByID: windowsByID,
                 floatingWindowIDs: floatingWindowIDs
             ))
@@ -134,26 +135,55 @@ enum WindowLayoutPlanner {
     private static func hiddenFrameAssignments(
         state: ScreenTileState,
         screen: ScreenInfo,
+        otherScreenFrames: [CGRect],
         windowsByID: [WindowIdentity: ManagedWindow],
         floatingWindowIDs: Set<WindowIdentity>
     ) -> [WindowFrameAssignment] {
         state.windowIDs.compactMap { id in
             guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { return nil }
-            return WindowFrameAssignment(window: window, frame: hiddenFrame(for: window, on: screen), kind: .hiddenPark)
+            let size = CGSize(
+                width: max(window.frame.width, TileLayout.minimumWindowFrameSize.width),
+                height: max(window.frame.height, TileLayout.minimumWindowFrameSize.height)
+            )
+            let frame = hiddenParkFrame(
+                windowSize: size,
+                screenFrame: screen.frame,
+                otherScreenFrames: otherScreenFrames
+            )
+            return WindowFrameAssignment(window: window, frame: frame, kind: .hiddenPark)
         }
     }
 
-    private static func hiddenFrame(for window: ManagedWindow, on screen: ScreenInfo) -> CGRect {
-        let size = CGSize(
-            width: max(window.frame.width, TileLayout.minimumWindowFrameSize.width),
-            height: max(window.frame.height, TileLayout.minimumWindowFrameSize.height)
-        )
-        return CGRect(
-            x: screen.frame.maxX - 1,
-            y: screen.frame.maxY - 1,
-            width: size.width,
-            height: size.height
-        )
+    static func hiddenParkFrame(
+        windowSize: CGSize,
+        screenFrame: CGRect,
+        otherScreenFrames: [CGRect]
+    ) -> CGRect {
+        let width = windowSize.width
+        let height = windowSize.height
+        let candidates = [
+            CGRect(x: screenFrame.maxX - 1, y: screenFrame.maxY - 1, width: width, height: height),
+            CGRect(x: screenFrame.minX - width + 1, y: screenFrame.maxY - 1, width: width, height: height),
+            CGRect(x: screenFrame.maxX - width, y: screenFrame.maxY - 1, width: width, height: height),
+            CGRect(x: screenFrame.maxX - 1, y: max(screenFrame.minY, screenFrame.maxY - height), width: width, height: height),
+            CGRect(x: screenFrame.minX - width + 1, y: max(screenFrame.minY, screenFrame.maxY - height), width: width, height: height)
+        ]
+        let viable = candidates.filter { candidate in
+            let onSource = candidate.intersection(screenFrame)
+            return onSource.width > 0 && onSource.height > 0
+        }
+        if let clear = viable.first(where: { candidate in
+            !otherScreenFrames.contains { candidate.intersects($0) }
+        }) {
+            return clear
+        }
+        let scored = viable.map { candidate in
+            (candidate, otherScreenFrames.reduce(CGFloat(0)) { total, other in
+                let overlap = candidate.intersection(other)
+                return total + max(0, overlap.width) * max(0, overlap.height)
+            })
+        }
+        return scored.min(by: { $0.1 < $1.1 })?.0 ?? candidates[0]
     }
 
 }

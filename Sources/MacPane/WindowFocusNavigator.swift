@@ -1,5 +1,10 @@
 import CoreGraphics
 
+enum CrossScreenFocusTarget: Equatable {
+    case window(WindowIdentity)
+    case emptyScreen(key: String)
+}
+
 enum WindowFocusNavigator {
     static func resolvedHotKeyFocusedID(
         in windows: [ManagedWindow],
@@ -53,27 +58,81 @@ enum WindowFocusNavigator {
     ) -> WindowIdentity? {
         guard let focusedWindow = windows.first(where: { $0.id == focusedID }) else { return nil }
         let sourceFrame = focusedWindow.frame
-        let sourcePoint = frameSideCenter(of: sourceFrame, leaving: direction)
-        var best: (id: WindowIdentity, score: CGFloat, overlap: CGFloat)?
+        let candidates = windows.filter { candidate in
+            candidate.id != focusedID &&
+                !floatingWindowIDs.contains(candidate.id) &&
+                candidate.screen.stateKey == focusedWindow.screen.stateKey &&
+                isFrameCandidate(candidate.frame, from: sourceFrame, direction: direction)
+        }
+        guard let index = bestScoredIndex(
+            sourceFrame: sourceFrame,
+            direction: direction,
+            frames: candidates.map(\.frame)
+        ) else {
+            return nil
+        }
+        return candidates[index].id
+    }
 
-        for candidate in windows where candidate.id != focusedID {
-            guard !floatingWindowIDs.contains(candidate.id),
-                  candidate.screen.stateKey == focusedWindow.screen.stateKey,
-                  isFrameCandidate(candidate.frame, from: sourceFrame, direction: direction) else {
-                continue
-            }
-            let targetPoint = frameSideCenter(of: candidate.frame, enteringFrom: direction)
+    static func crossScreenFocusTarget(
+        from focusedID: WindowIdentity,
+        direction: SnapDirection,
+        windows: [ManagedWindow],
+        screens: [ScreenInfo],
+        floatingWindowIDs: Set<WindowIdentity>
+    ) -> CrossScreenFocusTarget? {
+        guard let focusedWindow = windows.first(where: { $0.id == focusedID }) else { return nil }
+        let sourceScreen = screens.first(where: { $0.key == focusedWindow.screen.key })
+            ?? ScreenGeometry.bestScreenIndex(for: focusedWindow.frame, screens: screens.map(\.frame))
+                .map { screens[$0] }
+        guard let sourceScreen else { return nil }
+        let adjacentScreens = screens.filter { screen in
+            screen.key != sourceScreen.key &&
+                isFrameCandidate(screen.frame, from: sourceScreen.frame, direction: direction)
+        }
+        guard let adjacentIndex = bestScoredIndex(
+            sourceFrame: sourceScreen.frame,
+            direction: direction,
+            frames: adjacentScreens.map(\.frame)
+        ) else {
+            return nil
+        }
+        let adjacentScreen = adjacentScreens[adjacentIndex]
+        let candidates = windows.filter { candidate in
+            candidate.id != focusedID &&
+                !floatingWindowIDs.contains(candidate.id) &&
+                candidate.screen.stateKey == adjacentScreen.stateKey
+        }
+        if let index = bestScoredIndex(
+            sourceFrame: focusedWindow.frame,
+            direction: direction,
+            frames: candidates.map(\.frame)
+        ) {
+            return .window(candidates[index].id)
+        }
+        return .emptyScreen(key: adjacentScreen.key)
+    }
+
+    private static func bestScoredIndex(
+        sourceFrame: CGRect,
+        direction: SnapDirection,
+        frames: [CGRect]
+    ) -> Int? {
+        let sourcePoint = frameSideCenter(of: sourceFrame, leaving: direction)
+        var best: (index: Int, score: CGFloat, overlap: CGFloat)?
+        for (index, frame) in frames.enumerated() {
+            let targetPoint = frameSideCenter(of: frame, enteringFrom: direction)
             let dx = sourcePoint.x - targetPoint.x
             let dy = sourcePoint.y - targetPoint.y
             let distanceSquared = dx * dx + dy * dy
-            let overlap = framePerpendicularOverlap(sourceFrame, candidate.frame, direction: direction)
+            let overlap = framePerpendicularOverlap(sourceFrame, frame, direction: direction)
             let score = distanceSquared - overlap * overlap * 0.25
             if best == nil || score < best!.score - TileLayout.epsilon ||
                 (abs(score - best!.score) <= TileLayout.epsilon && overlap > best!.overlap) {
-                best = (candidate.id, score, overlap)
+                best = (index, score, overlap)
             }
         }
-        return best?.id
+        return best?.index
     }
 
     private static func frameSideCenter(of frame: CGRect, leaving direction: SnapDirection) -> CGPoint {

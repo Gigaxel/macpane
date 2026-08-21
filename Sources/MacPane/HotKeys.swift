@@ -35,7 +35,7 @@ enum HotKeyAction {
     var shouldShowWorkspaceSwitchIndicator: Bool {
         switch self {
         case .createWorkspace, .deleteWorkspace, .switchWorkspace, .cycleWorkspace,
-             .moveWindowToWorkspaceOnDisplay:
+             .moveWindowToWorkspaceOnDisplay, .focus:
             return true
         default:
             return false

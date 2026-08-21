@@ -72,6 +72,13 @@ struct SnapGeometryTests {
         testMissingWindowRetentionKeepsTransientDropouts()
         testCrossDisplayMovePlannerTargetsChosenDisplay()
         testCrossDisplayMovePlannerFallsBackToSourceWithoutMatch()
+        testHiddenParkFrameKeepsLegacyCornerOnSingleMonitor()
+        testHiddenParkFrameAvoidsNeighboringScreens()
+        testHiddenParkFrameFallsBackDeterministicallyWhenSurrounded()
+        testCrossScreenFocusTargetFocusesNearestWindow()
+        testCrossScreenFocusTargetIgnoresInactiveAndFloatingWindows()
+        testCrossScreenFocusTargetRequiresAdjacentDisplay()
+        testCrossScreenFocusTargetHandlesVerticalArrangement()
         print("SnapGeometryTests passed")
     }
     private static func testSnapGeometry() {
@@ -1645,6 +1652,196 @@ struct SnapGeometryTests {
             screens: screens
         ) == "display:1" else {
             fail("cross-display move without a target display should stay on the source display")
+        }
+    }
+    private static func testHiddenParkFrameKeepsLegacyCornerOnSingleMonitor() {
+        let screen = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let park = WindowLayoutPlanner.hiddenParkFrame(
+            windowSize: CGSize(width: 600, height: 500),
+            screenFrame: screen,
+            otherScreenFrames: []
+        )
+        guard park == CGRect(x: 999, y: 799, width: 600, height: 500) else {
+            fail("single-monitor park should keep the legacy bottom-right corner")
+        }
+    }
+    private static func testHiddenParkFrameAvoidsNeighboringScreens() {
+        let size = CGSize(width: 600, height: 500)
+        let left = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        let middle = CGRect(x: 1000, y: 0, width: 1000, height: 800)
+        let right = CGRect(x: 2000, y: 0, width: 1000, height: 800)
+        let below = CGRect(x: 0, y: 800, width: 1000, height: 800)
+
+        let fromLeft = WindowLayoutPlanner.hiddenParkFrame(
+            windowSize: size,
+            screenFrame: left,
+            otherScreenFrames: [middle]
+        )
+        guard fromLeft == CGRect(x: -599, y: 799, width: 600, height: 500),
+              !fromLeft.intersects(middle) else {
+            fail("park from left screen should extend away from the right neighbor")
+        }
+
+        let fromRight = WindowLayoutPlanner.hiddenParkFrame(
+            windowSize: size,
+            screenFrame: middle,
+            otherScreenFrames: [left]
+        )
+        guard fromRight == CGRect(x: 1999, y: 799, width: 600, height: 500),
+              !fromRight.intersects(left) else {
+            fail("park with only a left neighbor should keep the legacy corner")
+        }
+
+        let fromMiddle = WindowLayoutPlanner.hiddenParkFrame(
+            windowSize: size,
+            screenFrame: middle,
+            otherScreenFrames: [left, right]
+        )
+        guard fromMiddle == CGRect(x: 1400, y: 799, width: 600, height: 500),
+              !fromMiddle.intersects(left),
+              !fromMiddle.intersects(right) else {
+            fail("park from the middle screen should extend straight down")
+        }
+
+        let fromAbove = WindowLayoutPlanner.hiddenParkFrame(
+            windowSize: size,
+            screenFrame: left,
+            otherScreenFrames: [below]
+        )
+        guard fromAbove == CGRect(x: 999, y: 300, width: 600, height: 500),
+              !fromAbove.intersects(below) else {
+            fail("park with a neighbor below should extend sideways, never downward onto it")
+        }
+    }
+    private static func testHiddenParkFrameFallsBackDeterministicallyWhenSurrounded() {
+        let size = CGSize(width: 600, height: 500)
+        let source = CGRect(x: 1000, y: 800, width: 1000, height: 800)
+        let neighbors = [
+            CGRect(x: 0, y: 800, width: 1000, height: 800),
+            CGRect(x: 2000, y: 800, width: 1000, height: 800),
+            CGRect(x: 1000, y: 1600, width: 1000, height: 800)
+        ]
+        let first = WindowLayoutPlanner.hiddenParkFrame(
+            windowSize: size,
+            screenFrame: source,
+            otherScreenFrames: neighbors
+        )
+        let second = WindowLayoutPlanner.hiddenParkFrame(
+            windowSize: size,
+            screenFrame: source,
+            otherScreenFrames: neighbors
+        )
+        guard first == second else {
+            fail("surrounded park fallback should be deterministic")
+        }
+        let onSource = first.intersection(source)
+        guard onSource.width > 0, onSource.height > 0 else {
+            fail("surrounded park fallback should keep the window anchored on the source screen")
+        }
+    }
+    private static func crossScreenTestScreens() -> (left: ScreenInfo, right: ScreenInfo) {
+        (
+            ScreenInfo(
+                key: "display:1",
+                frame: CGRect(x: 0, y: 0, width: 1000, height: 800),
+                displayID: 1,
+                workspaceIndex: 0
+            ),
+            ScreenInfo(
+                key: "display:2",
+                frame: CGRect(x: 1000, y: 0, width: 1000, height: 800),
+                displayID: 2,
+                workspaceIndex: 0
+            )
+        )
+    }
+    private static func testCrossScreenFocusTargetFocusesNearestWindow() {
+        let (left, right) = crossScreenTestScreens()
+        let focused = testManagedWindow(serial: 1, frame: CGRect(x: 500, y: 100, width: 500, height: 600), screen: left)
+        let aligned = testManagedWindow(serial: 2, frame: CGRect(x: 1000, y: 0, width: 500, height: 800), screen: right)
+        let far = testManagedWindow(serial: 3, frame: CGRect(x: 1500, y: 0, width: 500, height: 800), screen: right)
+        let target = WindowFocusNavigator.crossScreenFocusTarget(
+            from: focused.id,
+            direction: .right,
+            windows: [focused, aligned, far],
+            screens: [left, right],
+            floatingWindowIDs: []
+        )
+        guard target == .window(aligned.id) else {
+            fail("cross-screen focus should pick the window nearest the crossing point")
+        }
+    }
+    private static func testCrossScreenFocusTargetIgnoresInactiveAndFloatingWindows() {
+        let (left, right) = crossScreenTestScreens()
+        let inactiveRight = ScreenInfo(
+            key: "display:2",
+            frame: right.frame,
+            displayID: 2,
+            workspaceIndex: 1
+        )
+        let focused = testManagedWindow(serial: 1, frame: CGRect(x: 500, y: 100, width: 500, height: 600), screen: left)
+        let parked = testManagedWindow(serial: 2, frame: CGRect(x: 1100, y: 100, width: 500, height: 600), screen: inactiveRight)
+        let floating = testManagedWindow(serial: 3, frame: CGRect(x: 1200, y: 100, width: 500, height: 600), screen: right)
+        let target = WindowFocusNavigator.crossScreenFocusTarget(
+            from: focused.id,
+            direction: .right,
+            windows: [focused, parked, floating],
+            screens: [left, right],
+            floatingWindowIDs: [floating.id]
+        )
+        guard target == .emptyScreen(key: "display:2") else {
+            fail("cross-screen focus should ignore inactive-workspace and floating windows")
+        }
+    }
+    private static func testCrossScreenFocusTargetRequiresAdjacentDisplay() {
+        let (left, right) = crossScreenTestScreens()
+        let focused = testManagedWindow(serial: 1, frame: CGRect(x: 0, y: 100, width: 500, height: 600), screen: left)
+        let other = testManagedWindow(serial: 2, frame: CGRect(x: 1100, y: 100, width: 500, height: 600), screen: right)
+        let target = WindowFocusNavigator.crossScreenFocusTarget(
+            from: focused.id,
+            direction: .left,
+            windows: [focused, other],
+            screens: [left, right],
+            floatingWindowIDs: []
+        )
+        guard target == nil else {
+            fail("cross-screen focus should return nil when no display lies in the direction")
+        }
+    }
+    private static func testCrossScreenFocusTargetHandlesVerticalArrangement() {
+        let top = ScreenInfo(
+            key: "display:1",
+            frame: CGRect(x: 0, y: 0, width: 1000, height: 800),
+            displayID: 1,
+            workspaceIndex: 0
+        )
+        let bottom = ScreenInfo(
+            key: "display:2",
+            frame: CGRect(x: 0, y: 800, width: 1000, height: 800),
+            displayID: 2,
+            workspaceIndex: 0
+        )
+        let focused = testManagedWindow(serial: 1, frame: CGRect(x: 100, y: 400, width: 500, height: 400), screen: top)
+        let belowWindow = testManagedWindow(serial: 2, frame: CGRect(x: 100, y: 800, width: 500, height: 400), screen: bottom)
+        let down = WindowFocusNavigator.crossScreenFocusTarget(
+            from: focused.id,
+            direction: .down,
+            windows: [focused, belowWindow],
+            screens: [top, bottom],
+            floatingWindowIDs: []
+        )
+        guard down == .window(belowWindow.id) else {
+            fail("cross-screen focus should cross downward in CG coordinates")
+        }
+        let up = WindowFocusNavigator.crossScreenFocusTarget(
+            from: belowWindow.id,
+            direction: .up,
+            windows: [focused, belowWindow],
+            screens: [top, bottom],
+            floatingWindowIDs: []
+        )
+        guard up == .window(focused.id) else {
+            fail("cross-screen focus should cross upward in CG coordinates")
         }
     }
     private static func approximatelyEqual(_ lhs: CGFloat, _ rhs: CGFloat) -> Bool {

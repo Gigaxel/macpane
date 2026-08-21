@@ -27,6 +27,7 @@ final class WindowTiler {
     private var windowDiscoveryReconcileGeneration = 0
     private var managedWindowCache: (windows: [ManagedWindow], createdAt: Date)?
     private let interactiveWindowCacheDuration: TimeInterval = 0.80
+    private let focusedContextCacheStaleness: TimeInterval = 10.0
     private let defaultWindowCacheDuration: TimeInterval = 0.12
     private let workspaceSwitchApplyDelay: TimeInterval = 0.045
     private let workspaceSlideAnimationDuration: TimeInterval = 0.18
@@ -1270,22 +1271,52 @@ final class WindowTiler {
                     floatingWindowIDs: self.floatingWindowIDs
                 )
             }
-            guard let targetID,
-                  let targetWindow = allWindows.first(where: { $0.id == targetID }) else {
+            let resolvedTargetID: WindowIdentity
+            if let targetID {
+                resolvedTargetID = targetID
+            } else {
+                switch WindowFocusNavigator.crossScreenFocusTarget(
+                    from: focusedID,
+                    direction: direction,
+                    windows: allWindows,
+                    screens: self.currentScreenInfos(),
+                    floatingWindowIDs: self.floatingWindowIDs
+                ) {
+                case .window(let id):
+                    resolvedTargetID = id
+                case .emptyScreen(let screenKey):
+                    return self.focusEmptyDisplay(screenKey: screenKey)
+                case nil:
+                    return false
+                }
+            }
+            guard let targetWindow = allWindows.first(where: { $0.id == resolvedTargetID }) else {
                 return false
             }
             if let key, var state = self.screenStates[key] {
-                state.markFocused(targetID)
+                state.markFocused(resolvedTargetID)
                 self.screenStates[key] = state
             }
             self.focus(window: targetWindow, updateTreeFocus: true)
-            if let targetKey = self.resolvedHotKeyStateKey(for: targetID, windows: allWindows),
+            if let targetKey = self.resolvedHotKeyStateKey(for: resolvedTargetID, windows: allWindows),
                var targetState = self.screenStates[targetKey] {
-                targetState.markFocused(targetID)
+                targetState.markFocused(resolvedTargetID)
                 self.screenStates[targetKey] = targetState
             }
             return true
         }
+    }
+    private func focusEmptyDisplay(screenKey: String) -> Bool {
+        guard let screen = currentScreenInfos().first(where: { $0.key == screenKey }) else { return false }
+        let context = workspaceContext(for: screen)
+        lastWorkspaceSwitchContext = context
+        focusTracker.reset()
+        CGWarpMouseCursorPosition(CGPoint(x: screen.frame.midX, y: screen.frame.midY))
+        pendingWorkspaceSwitchIndicator = WorkspaceSwitchIndicatorState(
+            workspaceIndex: context.activeWorkspaceIndex,
+            displayID: screen.displayID
+        )
+        return true
     }
     private func scheduleHotKeyReconcileBurst() {
         scheduleReconcile(delay: 0.03)
@@ -1496,11 +1527,7 @@ final class WindowTiler {
         DispatchQueue.main.asyncAfter(deadline: .now() + workspaceSwitchApplyDelay, execute: workItem)
     }
     private func workspaceSwitchContextFast() -> WorkspaceContext? {
-        if let lastKnownFocusedWindowID = focusTracker.lastKnownWindowID,
-           let managedWindowCache,
-           Date().timeIntervalSince(managedWindowCache.createdAt) <= interactiveWindowCacheDuration,
-           let focusedWindow = managedWindowCache.windows.first(where: { $0.id == lastKnownFocusedWindowID }) {
-            let context = workspaceContext(for: focusedWindow.screen)
+        if let context = lastFocusedWindowContext() {
             lastWorkspaceSwitchContext = context
             return context
         }
@@ -1523,6 +1550,17 @@ final class WindowTiler {
             lastWorkspaceSwitchContext = context
             return context
         }
+    }
+    private func lastFocusedWindowContext() -> WorkspaceContext? {
+        guard let lastKnownFocusedWindowID = focusTracker.lastKnownWindowID else { return nil }
+        if let managedWindowCache,
+           Date().timeIntervalSince(managedWindowCache.createdAt) <= focusedContextCacheStaleness,
+           let focusedWindow = managedWindowCache.windows.first(where: { $0.id == lastKnownFocusedWindowID }) {
+            return workspaceContext(for: focusedWindow.screen)
+        }
+        let windows = interactiveManagedWindows()
+        guard let focusedWindow = windows.first(where: { $0.id == lastKnownFocusedWindowID }) else { return nil }
+        return workspaceContext(for: focusedWindow.screen)
     }
     private func completeWorkspaceSwitchApply(allWindows: [ManagedWindow], plan: WorkspaceSwitchApplyPlan) {
         suppressExternalChanges(for: 0.45)
@@ -2259,15 +2297,14 @@ final class WindowTiler {
                 if result.writeFailed {
                     hadWriteFailure = true
                 }
-                if assignment.kind == .visibleTile {
-                    frameChecks[assignment.window.id] = FrameCheck(
-                        target: WindowFrameApplier.sanitizedFrame(assignment.frame),
-                        attempts: 0,
-                        pid: pid,
-                        windowNumber: assignment.window.windowNumber,
-                        element: assignment.window.element
-                    )
-                }
+                frameChecks[assignment.window.id] = FrameCheck(
+                    target: WindowFrameApplier.sanitizedFrame(assignment.frame),
+                    attempts: 0,
+                    pid: pid,
+                    windowNumber: assignment.window.windowNumber,
+                    element: assignment.window.element,
+                    kind: assignment.kind
+                )
             }
             suspension?.restore()
         }
@@ -2868,6 +2905,10 @@ final class WindowTiler {
         if let cursorScreen = screenContainingCursor() {
             return workspaceContext(for: screenInfo(forScreen: cursorScreen))
         }
+        if let cached = lastWorkspaceSwitchContext {
+            let activeIndex = settings.activeWorkspaceIndex(forNativeStateKey: cached.nativeStateKey)
+            return cached.withActiveWorkspaceIndex(activeIndex)
+        }
         if let main = NSScreen.main {
             return workspaceContext(for: screenInfo(forScreen: main))
         }
@@ -3228,8 +3269,10 @@ final class WindowTiler {
             case .applied:
                 pendingFrameChecks.removeValue(forKey: id)
             case .clamped(let observedMinimum):
-                recordObservedMinimum(observedMinimum, forPID: check.pid)
-                learnedClamp = true
+                if check.kind == .visibleTile {
+                    recordObservedMinimum(observedMinimum, forPID: check.pid)
+                    learnedClamp = true
+                }
                 pendingFrameChecks.removeValue(forKey: id)
             case .rejected:
                 guard check.attempts < maxFrameReassertAttempts,
@@ -3367,7 +3410,8 @@ final class WindowTiler {
                 attempts: 1,
                 pid: window.id.pid,
                 windowNumber: window.windowNumber,
-                element: window.element
+                element: window.element,
+                kind: .visibleTile
             )))
         }
         if !reassertions.isEmpty {
@@ -3412,6 +3456,7 @@ private struct FrameCheck {
     let pid: pid_t
     let windowNumber: Int?
     let element: AXUIElement
+    let kind: WindowFrameAssignment.Kind
 }
 
 /// Mutable state for an in-flight workspace slide so it can absorb rapid chained presses
