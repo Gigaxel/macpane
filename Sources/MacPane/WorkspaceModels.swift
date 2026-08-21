@@ -37,6 +37,24 @@ struct WorkspaceOverview {
     let workspaceCount: Int
     let items: [WorkspaceOverviewItem]
 }
+struct MonitorPickerOption {
+    let displayID: CGDirectDisplayID?
+    let name: String
+    let isSource: Bool
+}
+enum CrossDisplayMovePlanner {
+    static func targetNativeStateKey(
+        sourceNativeStateKey: String,
+        targetDisplayID: CGDirectDisplayID?,
+        screens: [ScreenInfo]
+    ) -> String {
+        guard let targetDisplayID,
+              let match = screens.first(where: { $0.displayID == targetDisplayID }) else {
+            return sourceNativeStateKey
+        }
+        return match.nativeStateKey
+    }
+}
 struct WorkspaceOverviewItem {
     let index: Int
     let name: String?

@@ -28,11 +28,6 @@ final class WorkspaceDotView: NSView {
     }
 }
 
-private final class WorkspaceOverviewPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
-}
-
 private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
     override func drawingRect(forBounds rect: NSRect) -> NSRect {
         centeredTextFrame(for: super.drawingRect(forBounds: rect), bounds: rect)
@@ -56,7 +51,7 @@ private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
 }
 
 final class WorkspaceOverviewOverlay {
-    private var panel: WorkspaceOverviewPanel?
+    private var panel: OverlayPanel?
     private var onDismiss: (() -> Void)?
     private var overview: WorkspaceOverview?
     var workspaceCount: Int? {
@@ -74,22 +69,7 @@ final class WorkspaceOverviewOverlay {
         view.autoresizingMask = [.width, .height]
         panel.contentView = view
         panel.ignoresMouseEvents = false
-        // Start slightly smaller and clear, then spring to full size with a fade.
-        let startFrame = CGRect(
-            x: frame.midX - frame.width * 0.94 / 2,
-            y: frame.midY - frame.height * 0.94 / 2,
-            width: frame.width * 0.94,
-            height: frame.height * 0.94
-        )
-        panel.setFrame(startFrame, display: true)
-        panel.alphaValue = 0
-        panel.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.18
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            panel.animator().alphaValue = 1
-            panel.animator().setFrame(frame, display: true)
-        }
+        panel.presentWithSpringFade(frame: frame)
     }
     @discardableResult
     func beginRename(onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) -> Bool {
@@ -135,21 +115,10 @@ final class WorkspaceOverviewOverlay {
         panel?.close()
         panel = nil
     }
-    private func ensurePanel() -> WorkspaceOverviewPanel {
+    private func ensurePanel() -> OverlayPanel {
         if let panel { return panel }
-        let panel = WorkspaceOverviewPanel(
-            contentRect: .zero,
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
+        let panel = OverlayPanel.make()
         panel.ignoresMouseEvents = true
-        panel.level = .statusBar
-        panel.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle, .transient]
-        panel.hidesOnDeactivate = false
-        panel.hasShadow = true
         self.panel = panel
         return panel
     }
@@ -185,190 +154,6 @@ final class WorkspaceOverviewOverlay {
     }
 }
 
-private final class WorkspaceGlassBackgroundView: NSView {
-    private let gradientLayer = CAGradientLayer()
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        layerContentsRedrawPolicy = .duringViewResize
-        gradientLayer.cornerRadius = 22
-        layer?.addSublayer(gradientLayer)
-    }
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) is not available")
-    }
-    override func layout() {
-        super.layout()
-        gradientLayer.frame = bounds
-        if gradientLayer.colors == nil {
-            let (top, bottom): (CGFloat, CGFloat)
-            if effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
-                (top, bottom) = (0.07, 0.03)
-            } else {
-                (top, bottom) = (0.11, 0.045)
-            }
-            gradientLayer.colors = [
-                NSColor.white.withAlphaComponent(top).cgColor,
-                NSColor.white.withAlphaComponent(bottom).cgColor
-            ]
-        }
-    }
-}
-
-private final class WorkspaceCardView: NSView {
-    private let onSelect: () -> Void
-    private let isActive: Bool
-    private var isHovered = false
-    private var isRenaming = false
-    private var isPressed = false
-    private var trackingArea: NSTrackingArea?
-    private let glassLayer = CALayer()
-    private let strokeLayer = CALayer()
-    fileprivate let content: NSView
-
-    init(title: String, isActive: Bool, onSelect: @escaping () -> Void) {
-        self.onSelect = onSelect
-        self.isActive = isActive
-        self.content = NSView()
-        super.init(frame: .zero)
-        wantsLayer = true
-        layer?.masksToBounds = false
-        glassLayer.cornerRadius = 14
-        strokeLayer.cornerRadius = 14
-        layer?.addSublayer(glassLayer)
-        layer?.addSublayer(strokeLayer)
-        addSubview(content)
-        content.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: leadingAnchor),
-            content.trailingAnchor.constraint(equalTo: trailingAnchor),
-            content.topAnchor.constraint(equalTo: topAnchor),
-            content.bottomAnchor.constraint(equalTo: bottomAnchor)
-        ])
-        setAccessibilityElement(true)
-        setAccessibilityRole(.button)
-        setAccessibilityLabel(title)
-        setAccessibilityValue(isActive ? "Current workspace" : nil)
-        updateStyle()
-    }
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) is not available")
-    }
-    override func layout() {
-        super.layout()
-        glassLayer.frame = bounds
-        strokeLayer.frame = bounds.insetBy(dx: 0.5, dy: 0.5)
-    }
-    override func updateTrackingAreas() {
-        if let trackingArea {
-            removeTrackingArea(trackingArea)
-        }
-        super.updateTrackingAreas()
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(area)
-        trackingArea = area
-    }
-    override func mouseEntered(with event: NSEvent) {
-        isHovered = true
-        updateStyle()
-    }
-    override func mouseExited(with event: NSEvent) {
-        isHovered = false
-        isPressed = false
-        updateStyle()
-    }
-    override func mouseDown(with event: NSEvent) {
-        isPressed = true
-        updateStyle()
-    }
-    override func mouseUp(with event: NSEvent) {
-        let wasPressed = isPressed
-        isPressed = false
-        updateStyle()
-        if wasPressed, bounds.contains(convert(event.locationInWindow, from: nil)) {
-            select()
-        }
-    }
-    override func resetCursorRects() {
-        addCursorRect(bounds, cursor: isRenaming ? .arrow : .pointingHand)
-    }
-    func setRenaming(_ renaming: Bool) {
-        isRenaming = renaming
-        setAccessibilityEnabled(!renaming)
-        updateStyle()
-        window?.invalidateCursorRects(for: self)
-    }
-    override func accessibilityPerformPress() -> Bool {
-        guard !isRenaming else { return false }
-        select()
-        return true
-    }
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
-        true
-    }
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        // The card owns all clicks except during rename, where the
-        // text field must receive them directly.
-        guard super.hitTest(point) != nil else { return nil }
-        if isRenaming {
-            return super.hitTest(point)
-        }
-        return self
-    }
-    private func updateStyle() {
-        let hover = isHovered && !isRenaming
-        let pressed = isPressed && !isRenaming
-        let borderColor: NSColor
-        let borderWidth: CGFloat
-        let shadowColor: NSColor?
-        let shadowOpacity: CGFloat
-        let shadowBlur: CGFloat
-        if isActive {
-            borderColor = NSColor.controlAccentColor
-            borderWidth = 1.6
-            shadowColor = NSColor.controlAccentColor
-            shadowOpacity = pressed ? 0.5 : (hover ? 0.45 : 0.30)
-            shadowBlur = pressed ? 16 : (hover ? 18 : 14)
-        } else if pressed {
-            borderColor = NSColor.white.withAlphaComponent(0.30)
-            borderWidth = 1
-            shadowColor = NSColor.black
-            shadowOpacity = 0.22
-            shadowBlur = 12
-        } else if hover {
-            borderColor = NSColor.white.withAlphaComponent(0.30)
-            borderWidth = 1
-            shadowColor = NSColor.black
-            shadowOpacity = 0.20
-            shadowBlur = 14
-        } else {
-            borderColor = NSColor.white.withAlphaComponent(0.08)
-            borderWidth = 1
-            shadowColor = NSColor.black
-            shadowOpacity = 0.12
-            shadowBlur = 10
-        }
-        strokeLayer.borderColor = borderColor.cgColor
-        strokeLayer.borderWidth = borderWidth
-        layer?.shadowColor = shadowColor?.cgColor
-        layer?.shadowOpacity = Float(shadowOpacity)
-        layer?.shadowRadius = shadowBlur
-        layer?.shadowOffset = CGSize(width: 0, height: -2)
-        glassLayer.backgroundColor = NSColor.white.withAlphaComponent(isActive ? 0.10 : 0.055).cgColor
-    }
-    private func select() {
-        guard !isRenaming else { return }
-        onSelect()
-    }
-}
-
 private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelegate {
     private let overview: WorkspaceOverview
     private let cardHeight: CGFloat
@@ -378,7 +163,7 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
     private var activeDetailViews: [NSView] = []
     private var onRenameCommit: ((String) -> Void)?
     private var onRenameCancel: (() -> Void)?
-    private var workspaceCards: [WorkspaceCardView] = []
+    private var workspaceCards: [OverlayCardView] = []
     init(overview: WorkspaceOverview, cardHeight: CGFloat, onWorkspaceSelected: @escaping (Int) -> Void) {
         self.overview = overview
         self.cardHeight = cardHeight
@@ -392,140 +177,29 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
     }
     private func buildView() {
         activeDetailViews.removeAll()
-        material = .underWindowBackground
-        blendingMode = .behindWindow
-        state = .active
-        wantsLayer = true
-        layer?.cornerRadius = 22
-        layer?.masksToBounds = true
-        layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
-        layer?.borderWidth = 1
-        let glass = WorkspaceGlassBackgroundView()
-        glass.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(glass)
-        let contentView = NSView()
-        contentView.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(contentView)
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.alignment = .width
-        root.spacing = 18
-        root.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(root)
-        let title = label(
-            "Workspaces",
-            font: .systemFont(ofSize: 20, weight: .bold),
-            color: .labelColor
-        )
-        let subtitle = label(
-            "\(overview.displayName) · Workspace \(overview.activeWorkspaceIndex + 1) of \(overview.workspaceCount)",
-            font: .systemFont(ofSize: 12, weight: .medium),
-            color: .secondaryLabelColor
-        )
-        let titleColumn = NSStackView(views: [title, subtitle])
-        titleColumn.orientation = .vertical
-        titleColumn.alignment = .leading
-        titleColumn.spacing = 3
-        let headerRow = NSStackView(views: [titleColumn, NSView()])
-        headerRow.orientation = .horizontal
-        headerRow.alignment = .top
-        headerRow.spacing = 12
-        headerRow.distribution = .fill
-        root.addArrangedSubview(headerRow)
-        let grid = workspaceGrid()
+        OverlayControls.configureContainer(self)
+        let root = OverlayControls.makeContentRoot(in: self, topInset: 22, bottomInset: 16, spacing: 18)
+        root.addArrangedSubview(OverlayControls.headerRow(
+            title: "Workspaces",
+            titleSize: 20,
+            subtitle: "\(overview.displayName) · Workspace \(overview.activeWorkspaceIndex + 1) of \(overview.workspaceCount)"
+        ))
+        let grid = OverlayControls.cardsGrid(itemCount: overview.items.count) { index in
+            card(for: overview.items[index])
+        }
         root.addArrangedSubview(grid)
         grid.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
-        let footerRow = footerHintsRow()
-        root.addArrangedSubview(footerRow)
-        NSLayoutConstraint.activate([
-            glass.leadingAnchor.constraint(equalTo: leadingAnchor),
-            glass.trailingAnchor.constraint(equalTo: trailingAnchor),
-            glass.topAnchor.constraint(equalTo: topAnchor),
-            glass.bottomAnchor.constraint(equalTo: bottomAnchor),
-            contentView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
-            contentView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -24),
-            contentView.topAnchor.constraint(equalTo: topAnchor, constant: 22),
-            contentView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16),
-            root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            root.topAnchor.constraint(equalTo: contentView.topAnchor),
-            root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-        ])
+        root.addArrangedSubview(OverlayControls.hintPillsRow([
+            OverlayControls.hintPill(key: "1–9", text: "Switch"),
+            OverlayControls.hintPill(key: "R", text: "Rename"),
+            OverlayControls.hintPill(key: "esc", text: "Close")
+        ]))
     }
-    private func footerHintsRow() -> NSView {
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 14
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(hintPill(key: "1–9", text: "Switch"))
-        stack.addArrangedSubview(hintPill(key: "R", text: "Rename"))
-        stack.addArrangedSubview(hintPill(key: "esc", text: "Close"))
-        return stack
-    }
-    private func hintPill(key: String, text: String) -> NSView {
-        let keyLabel = NSTextField(labelWithString: key)
-        keyLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
-        keyLabel.textColor = .secondaryLabelColor
-        keyLabel.translatesAutoresizingMaskIntoConstraints = false
-        let textLabel = label(
-            text,
-            font: .systemFont(ofSize: 11, weight: .medium),
-            color: .tertiaryLabelColor
-        )
-        let stack = NSStackView(views: [keyLabel, textLabel])
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 5
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        let pill = NSView()
-        pill.translatesAutoresizingMaskIntoConstraints = false
-        pill.wantsLayer = true
-        pill.layer?.cornerRadius = 6
-        pill.layer?.borderWidth = 1
-        pill.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
-        pill.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.03).cgColor
-        pill.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 8),
-            stack.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -8),
-            stack.topAnchor.constraint(equalTo: pill.topAnchor, constant: 4),
-            stack.bottomAnchor.constraint(equalTo: pill.bottomAnchor, constant: -4)
-        ])
-        return pill
-    }
-    private func workspaceGrid() -> NSStackView {
-        let columns = min(3, max(1, overview.items.count))
-        let grid = NSStackView()
-        grid.orientation = .vertical
-        grid.alignment = .width
-        grid.spacing = 14
-        grid.translatesAutoresizingMaskIntoConstraints = false
-        var index = 0
-        while index < overview.items.count {
-            let row = NSStackView()
-            row.orientation = .horizontal
-            row.alignment = .top
-            row.distribution = .fillEqually
-            row.spacing = 14
-            row.translatesAutoresizingMaskIntoConstraints = false
-            for _ in 0..<columns {
-                if index < overview.items.count {
-                    row.addArrangedSubview(card(for: overview.items[index]))
-                    index += 1
-                } else {
-                    row.addArrangedSubview(NSView())
-                }
-            }
-            grid.addArrangedSubview(row)
-            row.widthAnchor.constraint(equalTo: grid.widthAnchor).isActive = true
-        }
-        return grid
-    }
-    private func card(for item: WorkspaceOverviewItem) -> WorkspaceCardView {
-        let card = WorkspaceCardView(
-            title: workspaceTitle(for: item),
-            isActive: item.isActive,
+    private func card(for item: WorkspaceOverviewItem) -> OverlayCardView {
+        let card = OverlayCardView(
+            accessibilityLabel: workspaceTitle(for: item),
+            accessibilityValue: item.isActive ? "Current workspace" : nil,
+            isProminent: item.isActive,
             onSelect: { [weak self] in
                 self?.onWorkspaceSelected(item.index)
             }
@@ -539,9 +213,9 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
         top.spacing = 6
         top.translatesAutoresizingMaskIntoConstraints = false
         card.content.addSubview(top)
-        let chip = workspaceNumberChip(for: item)
+        let chip = OverlayControls.numberChip(number: item.index + 1, isProminent: item.isActive)
         top.addArrangedSubview(chip)
-        let header = label(
+        let header = OverlayControls.label(
             workspaceTitle(for: item),
             font: .systemFont(ofSize: 13.5, weight: .semibold),
             color: .labelColor
@@ -567,8 +241,8 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
         }
         card.content.addSubview(detail)
         let pill = item.isActive
-            ? statusPill(text: "Current", filled: true)
-            : statusPill(text: "Idle", filled: false)
+            ? OverlayControls.statusPill(text: "Current", filled: true)
+            : OverlayControls.statusPill(text: "Idle", filled: false)
         card.content.addSubview(pill)
         if item.isActive {
             activeDetailViews.append(pill)
@@ -587,52 +261,6 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
         ])
         return card
     }
-    private func statusPill(text: String, filled: Bool) -> NSView {
-        let label = NSTextField(labelWithString: text)
-        label.font = .systemFont(ofSize: 10, weight: .semibold)
-        label.textColor = filled ? NSColor.controlAccentColor : .tertiaryLabelColor
-        label.translatesAutoresizingMaskIntoConstraints = false
-        let pill = NSView()
-        pill.translatesAutoresizingMaskIntoConstraints = false
-        pill.wantsLayer = true
-        pill.layer?.cornerRadius = 999
-        pill.layer?.borderWidth = 1
-        pill.layer?.borderColor = (filled ? NSColor.controlAccentColor.withAlphaComponent(0.4) : NSColor.white.withAlphaComponent(0.10)).cgColor
-        pill.layer?.backgroundColor = (filled ? NSColor.controlAccentColor.withAlphaComponent(0.12) : NSColor.white.withAlphaComponent(0.03)).cgColor
-        pill.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: pill.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
-            pill.widthAnchor.constraint(greaterThanOrEqualTo: label.widthAnchor, constant: 16),
-            pill.heightAnchor.constraint(equalToConstant: 18)
-        ])
-        return pill
-    }
-    private func workspaceNumberChip(for item: WorkspaceOverviewItem) -> NSView {
-        let number = NSTextField(labelWithString: "\(item.index + 1)")
-        number.font = .monospacedDigitSystemFont(ofSize: 11, weight: .bold)
-        number.alignment = .center
-        number.translatesAutoresizingMaskIntoConstraints = false
-        number.textColor = item.isActive ? .white : .secondaryLabelColor
-        let chip = NSView()
-        chip.translatesAutoresizingMaskIntoConstraints = false
-        chip.wantsLayer = true
-        chip.layer?.cornerRadius = 8
-        chip.layer?.backgroundColor = (item.isActive ? NSColor.controlAccentColor : NSColor.white.withAlphaComponent(0.07)).cgColor
-        if item.isActive {
-            chip.layer?.borderWidth = 1
-            chip.layer?.borderColor = NSColor.white.withAlphaComponent(0.35).cgColor
-        }
-        chip.addSubview(number)
-        NSLayoutConstraint.activate([
-            chip.widthAnchor.constraint(equalToConstant: 34),
-            chip.heightAnchor.constraint(equalToConstant: 24),
-            number.centerXAnchor.constraint(equalTo: chip.centerXAnchor),
-            number.centerYAnchor.constraint(equalTo: chip.centerYAnchor)
-        ])
-        number.sizeToFit()
-        return chip
-    }
     private func emptyStateView() -> NSView {
         let glyph = NSImageView()
         glyph.translatesAutoresizingMaskIntoConstraints = false
@@ -642,7 +270,7 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
         glyph.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
         glyph.contentTintColor = NSColor.tertiaryLabelColor
         glyph.imageScaling = .scaleProportionallyDown
-        let text = label(
+        let text = OverlayControls.label(
             "No tiled windows",
             font: .systemFont(ofSize: 11, weight: .medium),
             color: .tertiaryLabelColor
@@ -690,7 +318,7 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
     }
     func beginRenaming(text: String, onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
         guard let activeRenameField else { return }
-        workspaceCards.forEach { $0.setRenaming(true) }
+        workspaceCards.forEach { $0.setInteractionSuspended(true) }
         onRenameCommit = onCommit
         onRenameCancel = onCancel
         activeHeaderLabel?.isHidden = true
@@ -704,7 +332,7 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
         }
     }
     func endRenaming() {
-        workspaceCards.forEach { $0.setRenaming(false) }
+        workspaceCards.forEach { $0.setInteractionSuspended(false) }
         activeRenameField?.isHidden = true
         activeHeaderLabel?.isHidden = false
         activeDetailViews.forEach { $0.isHidden = false }
@@ -866,14 +494,4 @@ private final class AppIconProvider {
         return image
     }
 }
-    private func label(_ text: String, font: NSFont, color: NSColor) -> NSTextField {
-        let label = NSTextField(labelWithString: text)
-        label.font = font
-        label.textColor = color
-        label.lineBreakMode = .byTruncatingTail
-        label.maximumNumberOfLines = 1
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        return label
-    }
 }

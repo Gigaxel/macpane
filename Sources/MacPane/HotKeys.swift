@@ -13,11 +13,14 @@ enum HotKeyAction {
     case deleteWorkspace
     case switchWorkspace(Int)
     case moveWindowToWorkspace(Int)
+    case moveWindowToWorkspaceOnDisplay(index: Int, displayID: CGDirectDisplayID?, windowID: WindowIdentity?)
     case cycleWorkspace(Int)
     case showWorkspaceOverview
     case hideWorkspaceOverview
     case overviewSwitchWorkspace(Int)
     case overviewRenameStart
+    case pickerSelectMonitor(Int)
+    case hideMonitorPicker
     case toggleOrientation
     case toggleFloating
     case toggleZoom
@@ -31,7 +34,8 @@ enum HotKeyAction {
     case resetGap
     var shouldShowWorkspaceSwitchIndicator: Bool {
         switch self {
-        case .createWorkspace, .deleteWorkspace, .switchWorkspace, .cycleWorkspace:
+        case .createWorkspace, .deleteWorkspace, .switchWorkspace, .cycleWorkspace,
+             .moveWindowToWorkspaceOnDisplay:
             return true
         default:
             return false
@@ -39,7 +43,8 @@ enum HotKeyAction {
     }
     var isWorkspaceMutation: Bool {
         switch self {
-        case .createWorkspace, .deleteWorkspace, .switchWorkspace, .cycleWorkspace, .moveWindowToWorkspace:
+        case .createWorkspace, .deleteWorkspace, .switchWorkspace, .cycleWorkspace,
+             .moveWindowToWorkspace, .moveWindowToWorkspaceOnDisplay:
             return true
         default:
             return false
@@ -47,7 +52,7 @@ enum HotKeyAction {
     }
     var shouldDropWhenStale: Bool {
         switch self {
-        case .focus, .overviewSwitchWorkspace:
+        case .focus, .overviewSwitchWorkspace, .pickerSelectMonitor:
             return true
         default:
             return false
@@ -74,6 +79,8 @@ final class HotKeyManager {
     private var hotKeyRefs: [EventHotKeyRef?] = []
     private var overviewHotKeyRefs: [EventHotKeyRef?] = []
     private var overviewActionIDs: Set<UInt32> = []
+    private var pickerHotKeyRefs: [EventHotKeyRef?] = []
+    private var pickerActionIDs: Set<UInt32> = []
     private var hotKeysByID: [UInt32: RegisteredHotKey] = [:]
     private var recordingSuppressionCount = 0
     private var nextID: UInt32 = 1
@@ -102,6 +109,7 @@ final class HotKeyManager {
     func stop() {
         delegate = nil
         unregisterWorkspaceOverviewHotKeys()
+        unregisterMonitorPickerHotKeys()
         unregisterMainHotKeys()
         recordingSuppressionCount = 0
         nextID = 1
@@ -130,23 +138,72 @@ final class HotKeyManager {
     func registerWorkspaceOverviewHotKeys(workspaceCount: Int) {
         unregisterWorkspaceOverviewHotKeys()
         for item in workspaceKeyCodes.prefix(min(max(workspaceCount, 0), 9)) {
-            registerOverviewHotKey(keyCode: item.keyCode, modifiers: 0, action: .overviewSwitchWorkspace(item.index))
+            registerTransient(
+                keyCode: item.keyCode,
+                modifiers: 0,
+                action: .overviewSwitchWorkspace(item.index),
+                refs: &overviewHotKeyRefs,
+                actionIDs: &overviewActionIDs
+            )
         }
-        registerOverviewHotKey(keyCode: UInt32(kVK_ANSI_R), modifiers: 0, action: .overviewRenameStart)
-        registerOverviewHotKey(keyCode: UInt32(kVK_ANSI_R), modifiers: UInt32(shiftKey), action: .overviewRenameStart)
-        registerOverviewHotKey(keyCode: UInt32(kVK_Escape), modifiers: 0, action: .hideWorkspaceOverview)
+        registerTransient(
+            keyCode: UInt32(kVK_ANSI_R),
+            modifiers: 0,
+            action: .overviewRenameStart,
+            refs: &overviewHotKeyRefs,
+            actionIDs: &overviewActionIDs
+        )
+        registerTransient(
+            keyCode: UInt32(kVK_ANSI_R),
+            modifiers: UInt32(shiftKey),
+            action: .overviewRenameStart,
+            refs: &overviewHotKeyRefs,
+            actionIDs: &overviewActionIDs
+        )
+        registerTransient(
+            keyCode: UInt32(kVK_Escape),
+            modifiers: 0,
+            action: .hideWorkspaceOverview,
+            refs: &overviewHotKeyRefs,
+            actionIDs: &overviewActionIDs
+        )
     }
     func unregisterWorkspaceOverviewHotKeys() {
-        for hotKeyRef in overviewHotKeyRefs {
+        unregisterTransient(refs: &overviewHotKeyRefs, actionIDs: &overviewActionIDs)
+    }
+    func registerMonitorPickerHotKeys(monitorCount: Int) {
+        unregisterMonitorPickerHotKeys()
+        for index in 0..<min(max(monitorCount, 0), workspaceKeyCodes.count) {
+            registerTransient(
+                keyCode: workspaceKeyCodes[index].keyCode,
+                modifiers: 0,
+                action: .pickerSelectMonitor(index),
+                refs: &pickerHotKeyRefs,
+                actionIDs: &pickerActionIDs
+            )
+        }
+        registerTransient(
+            keyCode: UInt32(kVK_Escape),
+            modifiers: 0,
+            action: .hideMonitorPicker,
+            refs: &pickerHotKeyRefs,
+            actionIDs: &pickerActionIDs
+        )
+    }
+    func unregisterMonitorPickerHotKeys() {
+        unregisterTransient(refs: &pickerHotKeyRefs, actionIDs: &pickerActionIDs)
+    }
+    private func unregisterTransient(refs: inout [EventHotKeyRef?], actionIDs: inout Set<UInt32>) {
+        for hotKeyRef in refs {
             if let hotKeyRef {
                 UnregisterEventHotKey(hotKeyRef)
             }
         }
-        overviewHotKeyRefs.removeAll()
-        for id in overviewActionIDs {
+        refs.removeAll()
+        for id in actionIDs {
             hotKeysByID.removeValue(forKey: id)
         }
-        overviewActionIDs.removeAll()
+        actionIDs.removeAll()
     }
     func handleHotKey(id: UInt32, eventAge: TimeInterval) {
         guard let hotKey = hotKeysByID[id] else { return }
@@ -165,7 +222,9 @@ final class HotKeyManager {
             }
         }
         hotKeyRefs.removeAll()
-        let mainIDs = Set(hotKeysByID.keys).subtracting(overviewActionIDs)
+        let mainIDs = Set(hotKeysByID.keys)
+            .subtracting(overviewActionIDs)
+            .subtracting(pickerActionIDs)
         for id in mainIDs {
             hotKeysByID.removeValue(forKey: id)
         }
@@ -190,7 +249,13 @@ final class HotKeyManager {
             NSLog("MacPane failed to register hotkey id=\(id) key=\(keyCode) modifiers=\(modifiers): \(status)")
         }
     }
-    private func registerOverviewHotKey(keyCode: UInt32, modifiers: UInt32, action: HotKeyAction) {
+    private func registerTransient(
+        keyCode: UInt32,
+        modifiers: UInt32,
+        action: HotKeyAction,
+        refs: inout [EventHotKeyRef?],
+        actionIDs: inout Set<UInt32>
+    ) {
         let id = nextID
         nextID += 1
         let hotKeyID = EventHotKeyID(signature: signature, id: id)
@@ -205,10 +270,10 @@ final class HotKeyManager {
         )
         if status == noErr {
             hotKeysByID[id] = RegisteredHotKey(action: action, keyCode: keyCode)
-            overviewActionIDs.insert(id)
-            overviewHotKeyRefs.append(hotKeyRef)
+            refs.append(hotKeyRef)
+            actionIDs.insert(id)
         } else {
-            NSLog("MacPane failed to register overview hotkey id=\(id) key=\(keyCode) modifiers=\(modifiers): \(status)")
+            NSLog("MacPane failed to register transient hotkey id=\(id) key=\(keyCode) modifiers=\(modifiers): \(status)")
         }
     }
 }

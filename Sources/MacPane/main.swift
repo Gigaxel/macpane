@@ -7,6 +7,7 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
     private var statusItem: NSStatusItem?
     private let tiler = WindowTiler()
     private let workspaceOverviewOverlay = WorkspaceOverviewOverlay()
+    private let monitorPickerOverlay = MonitorPickerOverlay()
     private let workspaceSwitchIndicatorOverlay = WorkspaceSwitchIndicatorOverlay()
     private lazy var settingsStore = SettingsStore(tiler: tiler)
     private lazy var settingsWindowController = SettingsWindowController(store: settingsStore)
@@ -44,12 +45,23 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         perform(action: action, rebuildMenu: false)
     }
     private func perform(action: HotKeyAction, rebuildMenu shouldRebuildMenu: Bool) {
+        if case .moveWindowToWorkspace(let index) = action,
+           NSScreen.screens.count > 1,
+           showMonitorPicker(workspaceIndex: index) {
+            return
+        }
         switch action {
         case .showWorkspaceOverview:
             showWorkspaceOverview()
             return
         case .hideWorkspaceOverview:
             workspaceOverviewOverlay.hide()
+            return
+        case .pickerSelectMonitor(let index):
+            monitorPickerOverlay.choose(index: index)
+            return
+        case .hideMonitorPicker:
+            monitorPickerOverlay.hide()
             return
         case .overviewSwitchWorkspace(let index):
             workspaceOverviewOverlay.hide()
@@ -256,7 +268,59 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
     @objc private func showWorkspaceOverviewFromMenu() {
         showWorkspaceOverview()
     }
+    private func showMonitorPicker(workspaceIndex: Int) -> Bool {
+        guard tiler.isWorkspaceIndexAvailable(workspaceIndex) else {
+            NSSound.beep()
+            return true
+        }
+        guard let request = tiler.monitorMoveRequest() else {
+            NSSound.beep()
+            return true
+        }
+        workspaceOverviewOverlay.hide()
+        let screens = NSScreen.screens
+            .filter { $0.displayID != nil }
+            .sorted { lhs, rhs in
+                lhs.frame.minX == rhs.frame.minX
+                    ? lhs.frame.minY < rhs.frame.minY
+                    : lhs.frame.minX < rhs.frame.minX
+            }
+        let options = screens.map { screen in
+            MonitorPickerOption(
+                displayID: screen.displayID,
+                name: screen.localizedName,
+                isSource: screen.displayID == request.sourceDisplayID
+            )
+        }
+        monitorPickerOverlay.show(
+            options: options,
+            subtitle: "Workspace \(workspaceIndex + 1)",
+            onSelect: { [weak self] index in
+                guard let self,
+                      options.indices.contains(index),
+                      let displayID = options[index].displayID,
+                      NSScreen.screens.contains(where: { $0.displayID == displayID }) else {
+                    NSSound.beep()
+                    return
+                }
+                self.perform(
+                    action: .moveWindowToWorkspaceOnDisplay(
+                        index: workspaceIndex,
+                        displayID: displayID,
+                        windowID: request.windowID
+                    ),
+                    rebuildMenu: true
+                )
+            },
+            onDismiss: {
+                HotKeyManager.shared.unregisterMonitorPickerHotKeys()
+            }
+        )
+        HotKeyManager.shared.registerMonitorPickerHotKeys(monitorCount: options.count)
+        return true
+    }
     private func showWorkspaceOverview() {
+        monitorPickerOverlay.hide()
         guard let overview = tiler.workspaceOverview() else {
             NSSound.beep()
             return
@@ -315,6 +379,7 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
             self.statusItem = nil
         }
         workspaceOverviewOverlay.close()
+        monitorPickerOverlay.close()
         workspaceSwitchIndicatorOverlay.close()
     }
 }

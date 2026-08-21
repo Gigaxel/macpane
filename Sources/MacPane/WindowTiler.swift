@@ -381,13 +381,17 @@ final class WindowTiler {
             switchVirtualWorkspace(to: index)
         case .moveWindowToWorkspace(let index):
             moveFocusedWindowToWorkspace(index: index)
+        case .moveWindowToWorkspaceOnDisplay(let index, let displayID, let windowID):
+            moveFocusedWindowToWorkspace(index: index, targetDisplayID: displayID, preferredWindowID: windowID)
         case .cycleWorkspace(let delta):
             cycleVirtualWorkspace(by: delta)
         case .showWorkspaceOverview:
             break
         case .hideWorkspaceOverview,
              .overviewSwitchWorkspace,
-             .overviewRenameStart:
+             .overviewRenameStart,
+             .pickerSelectMonitor,
+             .hideMonitorPicker:
             break
         case .toggleOrientation:
             toggleFocusedSplitOrientation()
@@ -434,6 +438,33 @@ final class WindowTiler {
         guard !isStopping else { return }
         settings.setGap(value)
         scheduleReconcile(delay: 0.01)
+    }
+    struct MonitorMoveRequest {
+        let windowID: WindowIdentity
+        let sourceDisplayID: CGDirectDisplayID?
+    }
+    func monitorMoveRequest() -> MonitorMoveRequest? {
+        guard !isStopping else { return nil }
+        guard hasAccessibilityPermission(prompt: false) else {
+            startPermissionPolling()
+            return nil
+        }
+        if isSystemUIUnsettled() {
+            pauseLayoutForSystemUI(duration: 0.6, preserveLayout: true)
+            return nil
+        }
+        startWatching()
+        let allWindows = interactiveManagedWindows()
+        guard let focusedID = focusTracker.focusedWindowID(in: allWindows),
+              let window = allWindows.first(where: { $0.id == focusedID }) else {
+            return nil
+        }
+        syncStates(with: tiledWindows(from: allWindows), focusedID: focusedID)
+        guard stateKey(containing: focusedID) != nil else { return nil }
+        return MonitorMoveRequest(windowID: focusedID, sourceDisplayID: window.screen.displayID)
+    }
+    func isWorkspaceIndexAvailable(_ index: Int) -> Bool {
+        settings.availableWorkspaceIndex(index) != nil
     }
     func workspaceOverview() -> WorkspaceOverview? {
         guard !isStopping else { return nil }
@@ -1805,10 +1836,14 @@ final class WindowTiler {
         }
         scheduleReconcile(delay: 0.15)
     }
-    private func moveFocusedWindowToWorkspace(index requestedIndex: Int) {
+    private func moveFocusedWindowToWorkspace(
+        index requestedIndex: Int,
+        targetDisplayID: CGDirectDisplayID? = nil,
+        preferredWindowID: WindowIdentity? = nil
+    ) {
         cancelPendingWorkspaceSwitchApply()
         let allWindows = managedWindows()
-        let focusedID = focusTracker.focusedWindowID(in: allWindows)
+        let focusedID = preferredWindowID ?? focusTracker.focusedWindowID(in: allWindows)
         syncStates(with: tiledWindows(from: allWindows), focusedID: focusedID)
         guard let focusedID,
               let focusedWindow = allWindows.first(where: { $0.id == focusedID }),
@@ -1822,7 +1857,12 @@ final class WindowTiler {
             NSSound.beep()
             return
         }
-        let targetKey = ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: targetIndex)
+        let targetNativeStateKey = CrossDisplayMovePlanner.targetNativeStateKey(
+            sourceNativeStateKey: nativeStateKey,
+            targetDisplayID: targetDisplayID,
+            screens: currentScreenInfos()
+        )
+        let targetKey = ScreenInfo.workspaceStateKey(nativeStateKey: targetNativeStateKey, workspaceIndex: targetIndex)
         guard sourceKey != targetKey else { return }
         sourceState.remove(focusedID)
         if sourceState.isEmpty {
@@ -1838,9 +1878,16 @@ final class WindowTiler {
         invalidateDepartedLayout(forStateKey: targetKey)
         suppressExternalChanges(for: 0.65)
         applyLayout(to: allWindows)
+        let targetActiveIndex = settings.activeWorkspaceIndex(forNativeStateKey: targetNativeStateKey)
+        if targetNativeStateKey != nativeStateKey, targetIndex == targetActiveIndex {
+            pendingWorkspaceSwitchIndicator = WorkspaceSwitchIndicatorState(
+                workspaceIndex: targetIndex,
+                displayID: targetDisplayID
+            )
+        }
         let activeTargetKey = ScreenInfo.workspaceStateKey(
-            nativeStateKey: nativeStateKey,
-            workspaceIndex: settings.activeWorkspaceIndex(forNativeStateKey: nativeStateKey)
+            nativeStateKey: targetNativeStateKey,
+            workspaceIndex: targetActiveIndex
         )
         if targetKey == activeTargetKey {
             focus(window: focusedWindow, updateTreeFocus: true)

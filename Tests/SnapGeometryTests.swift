@@ -70,6 +70,8 @@ struct SnapGeometryTests {
         testAppSizeConstraintsStorePersistsAfterConsistentObservations()
         testResolveIdentityReportsNewlyCreated()
         testMissingWindowRetentionKeepsTransientDropouts()
+        testCrossDisplayMovePlannerTargetsChosenDisplay()
+        testCrossDisplayMovePlannerFallsBackToSourceWithoutMatch()
         print("SnapGeometryTests passed")
     }
     private static func testSnapGeometry() {
@@ -1592,6 +1594,58 @@ struct SnapGeometryTests {
     private static func fail(_ message: String) -> Never {
         fputs("\(message)\n", stderr)
         exit(1)
+    }
+    private static func testCrossDisplayMovePlannerTargetsChosenDisplay() {
+        let screens = [
+            ScreenInfo(
+                key: "display:1",
+                frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+                displayID: 1,
+                workspaceIndex: 0
+            ),
+            ScreenInfo(
+                key: "display:2",
+                frame: CGRect(x: 1440, y: 0, width: 2560, height: 1440),
+                displayID: 2,
+                workspaceIndex: 0
+            )
+        ]
+        let targetNativeStateKey = CrossDisplayMovePlanner.targetNativeStateKey(
+            sourceNativeStateKey: "display:1",
+            targetDisplayID: 2,
+            screens: screens
+        )
+        guard targetNativeStateKey == "display:2" else {
+            fail("cross-display move should target the chosen display's native state key")
+        }
+        let targetKey = ScreenInfo.workspaceStateKey(nativeStateKey: targetNativeStateKey, workspaceIndex: 2)
+        guard targetKey == "display:2\(ScreenInfo.workspaceStateSeparator)2" else {
+            fail("target state key should combine the chosen display with the requested workspace index")
+        }
+    }
+    private static func testCrossDisplayMovePlannerFallsBackToSourceWithoutMatch() {
+        let screens = [
+            ScreenInfo(
+                key: "display:1",
+                frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
+                displayID: 1,
+                workspaceIndex: 0
+            )
+        ]
+        guard CrossDisplayMovePlanner.targetNativeStateKey(
+            sourceNativeStateKey: "display:1",
+            targetDisplayID: 99,
+            screens: screens
+        ) == "display:1" else {
+            fail("cross-display move should fall back to the source display when the target is unknown")
+        }
+        guard CrossDisplayMovePlanner.targetNativeStateKey(
+            sourceNativeStateKey: "display:1",
+            targetDisplayID: nil,
+            screens: screens
+        ) == "display:1" else {
+            fail("cross-display move without a target display should stay on the source display")
+        }
     }
     private static func approximatelyEqual(_ lhs: CGFloat, _ rhs: CGFloat) -> Bool {
         abs(lhs - rhs) <= 0.001
