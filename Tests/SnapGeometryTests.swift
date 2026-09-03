@@ -70,6 +70,13 @@ struct SnapGeometryTests {
         testAppSizeConstraintsStorePersistsAfterConsistentObservations()
         testResolveIdentityReportsNewlyCreated()
         testMissingWindowRetentionKeepsTransientDropouts()
+        testMissingWindowRetentionSkipsGraceForMinimizedWindows()
+        testMinimizedWindowRemovalPromotesSibling()
+        testAXIOSchedulerCoalescesLatestWritePerKey()
+        testAppResponsivenessTrackerExpires()
+        testLiveWindowConsistencyDetectsUnknownAndMissingWindows()
+        testLiveWindowRefreshUpdatesFramesAndRetainsBriefDropouts()
+        testLiveWindowInsertReplacesExistingIdentity()
         testCrossDisplayMovePlannerTargetsChosenDisplay()
         testCrossDisplayMovePlannerFallsBackToSourceWithoutMatch()
         testHiddenParkFrameKeepsLegacyCornerOnSingleMonitor()
@@ -1485,6 +1492,202 @@ struct SnapGeometryTests {
             guard retention.missingSinceByID[id] == nil else {
                 fail("only retained windows should stay tracked, but \(id) is tracked")
             }
+        }
+    }
+    private static func testMissingWindowRetentionSkipsGraceForMinimizedWindows() {
+        let key = "display:1:workspace:0"
+        let a = windowID(1)
+        let minimized = windowID(2)
+        let dropout = windowID(3)
+        let now = Date(timeIntervalSince1970: 20_000)
+        let retention = WindowStateSyncPlanner.missingWindowRetention(
+            idsByScreen: [key: [a]],
+            activeStateKeys: [key],
+            screenStates: [key: screenState([a, minimized, dropout])],
+            visibleIDs: [a],
+            missingSinceByID: [:],
+            confirmedRemovedIDs: [minimized],
+            isProcessRunning: { _ in true },
+            grace: 1.0,
+            now: now
+        )
+        guard retention.retainedIDsByStateKey[key] == [dropout] else {
+            fail("a minimized window must be dropped immediately while a plain dropout is retained, got \(retention.retainedIDsByStateKey)")
+        }
+        guard retention.missingSinceByID[minimized] == nil else {
+            fail("a minimized window must not start a grace clock")
+        }
+    }
+    private static func testMinimizedWindowRemovalPromotesSibling() {
+        let key = "display:1:workspace:0"
+        let inactiveKey = "display:1:workspace:1"
+        let a = windowID(1)
+        let b = windowID(2)
+        let c = windowID(3)
+        let states = [key: screenState([a, b], focused: a), inactiveKey: screenState([c])]
+        guard let removal = WindowStateSyncPlanner.removingMinimizedWindow(a, screenStates: states, activeStateKeys: [key]) else {
+            fail("minimizing a tiled window must produce a removal")
+        }
+        guard removal.stateKey == key, removal.remainingIDs == [b] else {
+            fail("removal must target the containing state and keep the sibling, got \(removal.stateKey) \(removal.remainingIDs)")
+        }
+        let slots = removal.state.resolvedSlots(in: CGRect(x: 0, y: 0, width: 1000, height: 1000), gap: 0, accommodating: [:])
+        guard let slot = slots[b], slot.width == 1, slot.height == 1 else {
+            fail("the sibling must take the full slot after minimize, got \(slots)")
+        }
+        guard states[key]?.windowIDs == [a, b] else {
+            fail("removal must not mutate the stored state")
+        }
+        guard WindowStateSyncPlanner.removingMinimizedWindow(c, screenStates: states, activeStateKeys: [key]) == nil else {
+            fail("windows on inactive workspaces must not be removed")
+        }
+        guard WindowStateSyncPlanner.removingMinimizedWindow(windowID(9), screenStates: states, activeStateKeys: [key]) == nil else {
+            fail("unknown windows must not produce a removal")
+        }
+    }
+    private static func testAXIOSchedulerCoalescesLatestWritePerKey() {
+        let scheduler = AXIOScheduler()
+        let lock = NSLock()
+        var observed: [Int] = []
+        let gate = DispatchSemaphore(value: 0)
+        scheduler.async(pid: 7) { gate.wait() }
+        for value in 1...5 {
+            scheduler.enqueueCoalesced(pid: 7, key: "window-a") {
+                lock.lock()
+                observed.append(value)
+                lock.unlock()
+            }
+        }
+        scheduler.enqueueCoalesced(pid: 7, key: "window-b") {
+            lock.lock()
+            observed.append(100)
+            lock.unlock()
+        }
+        gate.signal()
+        guard scheduler.flush(timeout: 2.0) else {
+            fail("scheduler must drain queued work")
+        }
+        lock.lock()
+        let result = observed
+        lock.unlock()
+        guard result.count == 2, result.contains(5), result.contains(100) else {
+            fail("only the latest write per key must run, got \(result)")
+        }
+    }
+    private static func testAppResponsivenessTrackerExpires() {
+        let tracker = AppResponsivenessTracker()
+        let now = Date(timeIntervalSince1970: 50_000)
+        guard tracker.isResponsive(3, now: now) else {
+            fail("unknown apps are responsive")
+        }
+        tracker.markUnresponsive(3, for: 2.0, now: now)
+        guard !tracker.isResponsive(3, now: now.addingTimeInterval(1.0)) else {
+            fail("an app must stay skipped during its cooldown")
+        }
+        guard tracker.isResponsive(3, now: now.addingTimeInterval(2.5)) else {
+            fail("an app must recover after its cooldown")
+        }
+        tracker.markUnresponsive(4, for: 2.0, now: now)
+        tracker.markResponsive(4)
+        guard tracker.isResponsive(4, now: now) else {
+            fail("a successful scan clears the cooldown")
+        }
+    }
+    private static func liveWindow(serial: Int, pid: pid_t = 42, number: Int?, frame: CGRect, rank: Int? = nil) -> ManagedWindow {
+        ManagedWindow(
+            id: WindowIdentity(pid: pid, serial: serial),
+            windowNumber: number,
+            element: AXUIElementCreateSystemWide(),
+            screen: ScreenInfo(key: "display:1", frame: CGRect(x: 0, y: 0, width: 1000, height: 1000), displayID: nil, workspaceIndex: 0),
+            layoutIdentity: nil,
+            frame: frame,
+            bundleIdentifier: "com.local.test",
+            title: nil,
+            orderRank: rank,
+            scanIndex: serial
+        )
+    }
+    private static func testLiveWindowConsistencyDetectsUnknownAndMissingWindows() {
+        let a = liveWindow(serial: 1, number: 10, frame: CGRect(x: 0, y: 0, width: 10, height: 10))
+        let b = liveWindow(serial: 2, number: 11, frame: CGRect(x: 0, y: 0, width: 10, height: 10))
+        let consistent = LiveWindowPlanner.consistency(
+            liveWindows: [a, b],
+            visibleNumbersByPID: [42: [10, 11, 12], 77: [5]],
+            manageablePIDs: [42],
+            knownUnmanageableKeys: [WindowOrderKey(pid: 42, number: 12)]
+        )
+        guard consistent.isConsistent else {
+            fail("known unmanageable and non-manageable app windows must not break consistency, got \(consistent)")
+        }
+        let unknown = LiveWindowPlanner.consistency(
+            liveWindows: [a, b],
+            visibleNumbersByPID: [42: [10, 11, 13]],
+            manageablePIDs: [42],
+            knownUnmanageableKeys: []
+        )
+        guard unknown.unknownKeys == [WindowOrderKey(pid: 42, number: 13)], unknown.missingIDs.isEmpty else {
+            fail("an unexplained on-screen window must be reported, got \(unknown)")
+        }
+        let missing = LiveWindowPlanner.consistency(
+            liveWindows: [a, b],
+            visibleNumbersByPID: [42: [10]],
+            manageablePIDs: [42],
+            knownUnmanageableKeys: []
+        )
+        guard missing.missingIDs == [b.id], missing.unknownKeys.isEmpty else {
+            fail("a live window absent from the screen must be reported, got \(missing)")
+        }
+        let learned = LiveWindowPlanner.unmanageableKeys(
+            visibleNumbersByPID: [42: [10, 11, 99], 43: [7]],
+            scannedPIDs: [42],
+            liveWindows: [a, b]
+        )
+        guard learned == [WindowOrderKey(pid: 42, number: 99)] else {
+            fail("only scanned apps' unexplained windows are learned as unmanageable, got \(learned)")
+        }
+    }
+    private static func testLiveWindowRefreshUpdatesFramesAndRetainsBriefDropouts() {
+        let now = Date(timeIntervalSince1970: 90_000)
+        let a = liveWindow(serial: 1, number: 10, frame: CGRect(x: 0, y: 0, width: 10, height: 10), rank: 5)
+        let b = liveWindow(serial: 2, number: 11, frame: CGRect(x: 0, y: 0, width: 10, height: 10), rank: 1)
+        let gone = liveWindow(serial: 3, number: 12, frame: CGRect(x: 0, y: 0, width: 10, height: 10))
+        let expired = liveWindow(serial: 4, number: 13, frame: CGRect(x: 0, y: 0, width: 10, height: 10))
+        let removed = liveWindow(serial: 5, number: 14, frame: CGRect(x: 0, y: 0, width: 10, height: 10))
+        let newFrame = CGRect(x: 100, y: 100, width: 500, height: 400)
+        let refresh = LiveWindowPlanner.refreshed(
+            liveWindows: [a, b, gone, expired, removed],
+            framesByWindow: [
+                WindowOrderKey(pid: 42, number: 10): newFrame,
+                WindowOrderKey(pid: 42, number: 11): CGRect(x: 0, y: 0, width: 10, height: 10),
+                WindowOrderKey(pid: 42, number: 14): newFrame
+            ],
+            rankByWindow: [WindowOrderKey(pid: 42, number: 10): 0, WindowOrderKey(pid: 42, number: 11): 3],
+            missingSinceByID: [expired.id: now.addingTimeInterval(-5)],
+            removedIDs: [removed.id],
+            expiry: 2.0,
+            now: now
+        )
+        guard refresh.visible.map(\.id) == [b.id, a.id] else {
+            fail("visible windows must be re-sorted back-to-front from the snapshot, got \(refresh.visible.map(\.id))")
+        }
+        guard refresh.visible.first(where: { $0.id == a.id })?.frame == newFrame else {
+            fail("frames must be refreshed from the snapshot")
+        }
+        guard refresh.retained.map(\.id) == [gone.id], refresh.missingSinceByID[gone.id] == now else {
+            fail("a briefly missing window is retained with a fresh clock, got \(refresh.retained.map(\.id))")
+        }
+        guard refresh.missingSinceByID[expired.id] == nil, !refresh.retained.contains(where: { $0.id == expired.id }) else {
+            fail("an expired window must be dropped")
+        }
+    }
+    private static func testLiveWindowInsertReplacesExistingIdentity() {
+        let a = liveWindow(serial: 1, number: 10, frame: CGRect(x: 0, y: 0, width: 10, height: 10), rank: 2)
+        let stale = liveWindow(serial: 2, number: 11, frame: CGRect(x: 0, y: 0, width: 10, height: 10), rank: 1)
+        let fresh = liveWindow(serial: 2, number: 11, frame: CGRect(x: 5, y: 5, width: 50, height: 50), rank: 0)
+        let updated = LiveWindowPlanner.inserting(fresh, into: [a, stale])
+        guard updated.count == 2, updated.map(\.id) == [a.id, fresh.id],
+              updated.last?.frame == fresh.frame else {
+            fail("insert must replace the same identity and keep back-to-front order, got \(updated.map { ($0.id, $0.frame) })")
         }
     }
     private static func windowSignature(pid: pid_t, title: String, stateKey: String = "display-a") -> WindowSignature {

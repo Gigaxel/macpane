@@ -121,6 +121,9 @@ struct ManagedWindow {
     let orderRank: Int?
     let scanIndex: Int
     func withFrame(_ frame: CGRect) -> ManagedWindow {
+        with(frame: frame, orderRank: orderRank)
+    }
+    func with(frame: CGRect, orderRank: Int?) -> ManagedWindow {
         ManagedWindow(
             id: id,
             windowNumber: windowNumber,
@@ -133,6 +136,46 @@ struct ManagedWindow {
             orderRank: orderRank,
             scanIndex: scanIndex
         )
+    }
+    func withScreen(_ screen: ScreenInfo) -> ManagedWindow {
+        ManagedWindow(
+            id: id,
+            windowNumber: windowNumber,
+            element: element,
+            screen: screen,
+            layoutIdentity: layoutIdentity,
+            frame: frame,
+            bundleIdentifier: bundleIdentifier,
+            title: title,
+            orderRank: orderRank,
+            scanIndex: scanIndex
+        )
+    }
+    static func shouldOrderBefore(_ lhs: ManagedWindow, _ rhs: ManagedWindow) -> Bool {
+        switch (lhs.orderRank, rhs.orderRank) {
+        case (.some(let lhsRank), .some(let rhsRank)) where lhsRank != rhsRank:
+            return lhsRank > rhsRank
+        case (.some, .none):
+            return true
+        case (.none, .some):
+            return false
+        default:
+            break
+        }
+        let lhsApp = lhs.bundleIdentifier ?? ""
+        let rhsApp = rhs.bundleIdentifier ?? ""
+        if lhsApp != rhsApp { return lhsApp < rhsApp }
+        if lhs.id.pid != rhs.id.pid { return lhs.id.pid < rhs.id.pid }
+        switch (lhs.windowNumber, rhs.windowNumber) {
+        case (.some(let lhsNumber), .some(let rhsNumber)) where lhsNumber != rhsNumber:
+            return lhsNumber < rhsNumber
+        case (.some, .none):
+            return true
+        case (.none, .some):
+            return false
+        default:
+            return lhs.scanIndex < rhs.scanIndex
+        }
     }
 }
 struct PersistedScreenLayout {

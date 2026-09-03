@@ -8,6 +8,51 @@ struct WindowDiscoveryResult {
     let newlyCreatedIDs: Set<WindowIdentity>
     let rawWindowsByPID: [pid_t: [AXUIElement]]
     let hasDeferredCandidates: Bool
+    let minimizedIDs: Set<WindowIdentity>
+    let cleanlyScannedPIDs: Set<pid_t>
+}
+
+struct MinimizedWindowKey {
+    let elementKey: WindowElementKey
+    let windowKey: WindowOrderKey?
+}
+
+struct WindowProbe {
+    let candidate: ManagedWindowCandidate?
+    let deferred: Bool
+    let isMinimized: Bool
+    let isExcluded: Bool
+}
+
+struct AppScan {
+    var candidates: [ManagedWindowCandidate] = []
+    var rawWindows: [AXUIElement]?
+    var deferred = false
+    var failed = false
+    var minimizedKeys: [MinimizedWindowKey] = []
+}
+
+final class AppScanCollector {
+    private let lock = NSLock()
+    private var scans: [AppScan?]
+
+    init(count: Int) {
+        scans = Array(repeating: nil, count: count)
+    }
+
+    func store(_ scan: AppScan, at index: Int) {
+        lock.lock()
+        if index < scans.count {
+            scans[index] = scan
+        }
+        lock.unlock()
+    }
+
+    func snapshot() -> [AppScan?] {
+        lock.lock()
+        defer { lock.unlock() }
+        return scans
+    }
 }
 
 struct WindowDiscovery {
@@ -15,6 +60,10 @@ struct WindowDiscovery {
     let metadataCache: WindowElementMetadataCache
     let screenCatalog: ScreenCatalog
     let accessibilityMessagingTimeout: Float
+    let ioScheduler: AXIOScheduler
+    let responsiveness: AppResponsivenessTracker
+    let scanTimeout: TimeInterval = 0.35
+    let unresponsiveAppCooldown: TimeInterval = 2.0
 
     private static let knownWindowDynamicAttributes: [String] = [
         kAXTitleAttribute,
@@ -42,16 +91,20 @@ struct WindowDiscovery {
         snapshot: OnScreenWindowSnapshot,
         screens: [ScreenInfo],
         retainedOffscreenIDs: Set<WindowIdentity>,
+        trackedPIDs: Set<pid_t> = [],
         identityRegistry: inout WindowIdentityRegistry,
         knownStateKey: (WindowIdentity) -> String?,
         screenForKnownStateKey: (String, ScreenInfo) -> ScreenInfo
     ) -> WindowDiscoveryResult {
         let scan = windowCandidates(
             screens: screens,
-            visiblePIDs: Set(snapshot.visibleNumbersByPID.keys),
+            visiblePIDs: Set(snapshot.visibleNumbersByPID.keys).union(trackedPIDs),
             snapshot: snapshot
         )
         let candidates = visibleCandidates(from: scan.candidates, snapshot: snapshot)
+        let minimizedIDs = Set(scan.minimizedKeys.compactMap {
+            identityRegistry.identityForStrongAlias(windowKey: $0.windowKey, elementKey: $0.elementKey)
+        })
 
         let stronglyVisibleIDs = stronglyVisibleIDs(from: candidates, identityRegistry: identityRegistry)
         identityRegistry.retainAliases(for: stronglyVisibleIDs.union(retainedOffscreenIDs))
@@ -72,7 +125,9 @@ struct WindowDiscovery {
             retainedIDs: retainedIDs,
             newlyCreatedIDs: resolution.newlyCreatedIDs,
             rawWindowsByPID: scan.rawWindowsByPID,
-            hasDeferredCandidates: scan.hasDeferredCandidates
+            hasDeferredCandidates: scan.hasDeferredCandidates,
+            minimizedIDs: minimizedIDs,
+            cleanlyScannedPIDs: scan.cleanlyScannedPIDs
         )
     }
 
@@ -83,7 +138,9 @@ struct WindowDiscovery {
     ) -> (
         candidates: [ManagedWindowCandidate],
         rawWindowsByPID: [pid_t: [AXUIElement]],
-        hasDeferredCandidates: Bool
+        hasDeferredCandidates: Bool,
+        minimizedKeys: [MinimizedWindowKey],
+        cleanlyScannedPIDs: Set<pid_t>
     ) {
         let apps = NSWorkspace.shared.runningApplications
             .filter { visiblePIDs.contains($0.processIdentifier) && metadataReader.isManageableApp($0) }
@@ -91,43 +148,164 @@ struct WindowDiscovery {
                 (lhs.localizedName ?? lhs.bundleIdentifier ?? "") < (rhs.localizedName ?? rhs.bundleIdentifier ?? "")
             }
 
+        let collector = AppScanCollector(count: apps.count)
+        let group = DispatchGroup()
+        var skippedIndices: Set<Int> = []
+        for (index, app) in apps.enumerated() {
+            let pid = app.processIdentifier
+            guard responsiveness.isResponsive(pid) else {
+                skippedIndices.insert(index)
+                continue
+            }
+            group.enter()
+            ioScheduler.async(pid: pid) { [self] in
+                let scan = scanApp(app, screens: screens, snapshot: snapshot)
+                collector.store(scan, at: index)
+                group.leave()
+            }
+        }
+        _ = group.wait(timeout: .now() + scanTimeout)
+        let scans = collector.snapshot()
+
         var candidates: [ManagedWindowCandidate] = []
         var rawWindowsByPID: [pid_t: [AXUIElement]] = [:]
         var scanIndex = 0
         var hasDeferredCandidates = false
-        for app in apps {
-            let appElement = AXUIElementCreateApplication(app.processIdentifier)
-            AXUIElementSetMessagingTimeout(appElement, accessibilityMessagingTimeout)
-            switch AXReader.elementsChecked(appElement, attribute: kAXWindowsAttribute) {
-            case .value(let appWindows):
-                rawWindowsByPID[app.processIdentifier] = appWindows
-                for window in appWindows {
-                    guard let candidate = windowCandidate(
-                        window,
-                        app: app,
-                        screens: screens,
-                        snapshot: snapshot,
-                        scanIndex: scanIndex,
-                        hasDeferredCandidates: &hasDeferredCandidates
-                    ) else {
-                        continue
-                    }
+        var minimizedKeys: [MinimizedWindowKey] = []
+        var cleanlyScannedPIDs: Set<pid_t> = []
+        for (index, app) in apps.enumerated() {
+            let pid = app.processIdentifier
+            if let scan = scans[index], !scan.failed {
+                responsiveness.markResponsive(pid)
+                if !scan.deferred {
+                    cleanlyScannedPIDs.insert(pid)
+                }
+                if let rawWindows = scan.rawWindows {
+                    rawWindowsByPID[pid] = rawWindows
+                }
+                for var candidate in scan.candidates {
+                    candidate.scanIndex = scanIndex
                     candidates.append(candidate)
                     scanIndex += 1
                 }
-            case .missing:
+                hasDeferredCandidates = hasDeferredCandidates || scan.deferred
+                minimizedKeys.append(contentsOf: scan.minimizedKeys)
                 continue
-            case .failed:
-                hasDeferredCandidates = true
-                candidates.append(contentsOf: synthesizedCandidates(
-                    for: app,
+            }
+            if !skippedIndices.contains(index) {
+                responsiveness.markUnresponsive(pid, for: unresponsiveAppCooldown)
+            }
+            hasDeferredCandidates = true
+            candidates.append(contentsOf: synthesizedCandidates(
+                for: app,
+                screens: screens,
+                snapshot: snapshot,
+                scanIndex: &scanIndex
+            ))
+        }
+        return (candidates, rawWindowsByPID, hasDeferredCandidates, minimizedKeys, cleanlyScannedPIDs)
+    }
+
+    private func scanApp(
+        _ app: NSRunningApplication,
+        screens: [ScreenInfo],
+        snapshot: OnScreenWindowSnapshot
+    ) -> AppScan {
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(appElement, accessibilityMessagingTimeout)
+        var scan = AppScan()
+        switch AXReader.elementsChecked(appElement, attribute: kAXWindowsAttribute) {
+        case .value(let appWindows):
+            scan.rawWindows = appWindows
+            for (index, window) in appWindows.enumerated() {
+                var excluded = false
+                guard let candidate = windowCandidate(
+                    window,
+                    app: app,
                     screens: screens,
                     snapshot: snapshot,
-                    scanIndex: &scanIndex
-                ))
+                    scanIndex: index,
+                    hasDeferredCandidates: &scan.deferred,
+                    minimizedKeys: &scan.minimizedKeys,
+                    excludedByPolicy: &excluded
+                ) else {
+                    continue
+                }
+                scan.candidates.append(candidate)
             }
+        case .missing:
+            break
+        case .failed:
+            scan.deferred = true
+            scan.failed = true
         }
-        return (candidates, rawWindowsByPID, hasDeferredCandidates)
+        return scan
+    }
+
+    func probeWindow(
+        _ window: AXUIElement,
+        app: NSRunningApplication,
+        screens: [ScreenInfo],
+        snapshot: OnScreenWindowSnapshot
+    ) -> WindowProbe {
+        var deferred = false
+        var excluded = false
+        var minimizedKeys: [MinimizedWindowKey] = []
+        let candidate = windowCandidate(
+            window,
+            app: app,
+            screens: screens,
+            snapshot: snapshot,
+            scanIndex: 0,
+            hasDeferredCandidates: &deferred,
+            minimizedKeys: &minimizedKeys,
+            excludedByPolicy: &excluded
+        )
+        return WindowProbe(
+            candidate: candidate,
+            deferred: deferred,
+            isMinimized: !minimizedKeys.isEmpty,
+            isExcluded: excluded
+        )
+    }
+
+    func resolvedWindow(
+        from candidate: ManagedWindowCandidate,
+        snapshot: OnScreenWindowSnapshot,
+        excludingNumbers: Set<Int>,
+        isSignatureUnique: Bool,
+        identityRegistry: inout WindowIdentityRegistry,
+        avoidingIdentities: Set<WindowIdentity>,
+        knownStateKey: (WindowIdentity) -> String?,
+        screenForKnownStateKey: (String, ScreenInfo) -> ScreenInfo
+    ) -> (window: ManagedWindow, isNewlyCreated: Bool)? {
+        var visible = candidate
+        if let number = candidate.windowNumber {
+            guard snapshot.visibleNumbersByPID[candidate.pid]?.contains(number) == true else { return nil }
+        } else {
+            guard let matched = snapshot.matchWindowNumber(
+                pid: candidate.pid,
+                frame: candidate.frame,
+                title: candidate.title,
+                excluding: excludingNumbers
+            ) else {
+                return nil
+            }
+            visible.windowNumber = matched
+        }
+        if let number = visible.windowNumber {
+            visible.orderRank = snapshot.rankByWindow[WindowOrderKey(pid: candidate.pid, number: number)]
+        }
+        let resolution = managedWindows(
+            from: [visible],
+            signatureCounts: visible.signature.map { [$0: isSignatureUnique ? 1 : 2] } ?? [:],
+            identityRegistry: &identityRegistry,
+            knownStateKey: knownStateKey,
+            screenForKnownStateKey: screenForKnownStateKey,
+            avoidingIdentities: avoidingIdentities
+        )
+        guard let window = resolution.windows.first else { return nil }
+        return (window, resolution.newlyCreatedIDs.contains(window.id))
     }
 
     private func windowCandidate(
@@ -136,7 +314,9 @@ struct WindowDiscovery {
         screens: [ScreenInfo],
         snapshot: OnScreenWindowSnapshot,
         scanIndex: Int,
-        hasDeferredCandidates: inout Bool
+        hasDeferredCandidates: inout Bool,
+        minimizedKeys: inout [MinimizedWindowKey],
+        excludedByPolicy: inout Bool
     ) -> ManagedWindowCandidate? {
         let pid = app.processIdentifier
         let elementKey = WindowElementKey(pid: pid, hash: CFHash(window))
@@ -148,7 +328,9 @@ struct WindowDiscovery {
                 elementKey: elementKey,
                 screens: screens,
                 snapshot: snapshot,
-                scanIndex: scanIndex
+                scanIndex: scanIndex,
+                minimizedKeys: &minimizedKeys,
+                excludedByPolicy: &excludedByPolicy
             )
         }
         return newWindowCandidate(
@@ -158,7 +340,9 @@ struct WindowDiscovery {
             screens: screens,
             snapshot: snapshot,
             scanIndex: scanIndex,
-            hasDeferredCandidates: &hasDeferredCandidates
+            hasDeferredCandidates: &hasDeferredCandidates,
+            minimizedKeys: &minimizedKeys,
+            excludedByPolicy: &excludedByPolicy
         )
     }
 
@@ -169,26 +353,38 @@ struct WindowDiscovery {
         elementKey: WindowElementKey,
         screens: [ScreenInfo],
         snapshot: OnScreenWindowSnapshot,
-        scanIndex: Int
+        scanIndex: Int,
+        minimizedKeys: inout [MinimizedWindowKey],
+        excludedByPolicy: inout Bool
     ) -> ManagedWindowCandidate? {
         let pid = app.processIdentifier
+        let windowNumber = cached.windowNumber ?? AXReader.windowID(of: window)
         let dynamics = AXReader.multipleChecked(window, attributes: Self.knownWindowDynamicAttributes)
         var title: String?
         var document: String?
         if let dynamics {
-            for flagAttribute in [kAXMinimizedAttribute, "AXFullScreen", "AXModal"] {
+            if case .value(true) = AXReader.boolReadFromBatch(dynamics[kAXMinimizedAttribute]) {
+                minimizedKeys.append(MinimizedWindowKey(
+                    elementKey: elementKey,
+                    windowKey: windowNumber.map { WindowOrderKey(pid: pid, number: $0) }
+                ))
+                return nil
+            }
+            for flagAttribute in ["AXFullScreen", "AXModal"] {
                 if case .value(true) = AXReader.boolReadFromBatch(dynamics[flagAttribute]) {
+                    excludedByPolicy = true
                     return nil
                 }
             }
             title = AXReader.stringFromBatch(dynamics[kAXTitleAttribute])
             document = AXReader.stringFromBatch(dynamics[kAXDocumentAttribute])
             if WindowManageabilityPlanner.isExcludedTitle(title) {
+                excludedByPolicy = true
                 return nil
             }
         }
         var frame: CGRect?
-        if let number = cached.windowNumber {
+        if let number = windowNumber {
             frame = snapshot.frame(pid: pid, number: number)
         }
         if frame == nil,
@@ -205,6 +401,9 @@ struct WindowDiscovery {
         }
         metadataCache.update(elementKey, element: window) { entry in
             entry.lastKnownFrame = frame
+            if entry.windowNumber == nil {
+                entry.windowNumber = windowNumber
+            }
         }
 
         let screen = screenCatalog.info(for: frame, screens: screens)
@@ -218,7 +417,7 @@ struct WindowDiscovery {
         )
         return ManagedWindowCandidate(
             pid: pid,
-            windowNumber: cached.windowNumber,
+            windowNumber: windowNumber,
             elementKey: elementKey,
             signature: descriptors.signature,
             layoutIdentity: descriptors.layoutIdentity,
@@ -239,7 +438,9 @@ struct WindowDiscovery {
         screens: [ScreenInfo],
         snapshot: OnScreenWindowSnapshot,
         scanIndex: Int,
-        hasDeferredCandidates: inout Bool
+        hasDeferredCandidates: inout Bool,
+        minimizedKeys: inout [MinimizedWindowKey],
+        excludedByPolicy: inout Bool
     ) -> ManagedWindowCandidate? {
         let pid = app.processIdentifier
         guard let reads = AXReader.multipleChecked(window, attributes: Self.newWindowAttributes) else {
@@ -247,6 +448,16 @@ struct WindowDiscovery {
             return nil
         }
 
+        if case .value(true) = AXReader.boolReadFromBatch(reads[kAXMinimizedAttribute]) {
+            let number = AXReader.windowID(of: window)
+                ?? AXReader.intFromBatch(reads["AXWindowNumber"])
+                ?? AXReader.intFromBatch(reads["_AXWindowNumber"])
+            minimizedKeys.append(MinimizedWindowKey(
+                elementKey: elementKey,
+                windowKey: number.map { WindowOrderKey(pid: pid, number: $0) }
+            ))
+            return nil
+        }
         let title = AXReader.stringFromBatch(reads[kAXTitleAttribute])
         var inputs = WindowManageabilityPlanner.Inputs(
             role: AXReader.stringReadFromBatch(reads[kAXRoleAttribute]),
@@ -260,6 +471,7 @@ struct WindowDiscovery {
         )
         switch WindowManageabilityPlanner.manageability(inputs) {
         case .excluded:
+            excludedByPolicy = true
             return nil
         case .unknown:
             hasDeferredCandidates = true
@@ -271,6 +483,7 @@ struct WindowDiscovery {
         inputs.sizeSettable = settableRead(window, attribute: kAXSizeAttribute)
         switch WindowManageabilityPlanner.manageability(inputs) {
         case .excluded:
+            excludedByPolicy = true
             return nil
         case .unknown:
             hasDeferredCandidates = true
@@ -279,7 +492,8 @@ struct WindowDiscovery {
             break
         }
 
-        let windowNumber = AXReader.intFromBatch(reads["AXWindowNumber"])
+        let windowNumber = AXReader.windowID(of: window)
+            ?? AXReader.intFromBatch(reads["AXWindowNumber"])
             ?? AXReader.intFromBatch(reads["_AXWindowNumber"])
         var frame: CGRect?
         if let position = AXReader.pointFromBatch(reads[kAXPositionAttribute]),
@@ -435,10 +649,11 @@ struct WindowDiscovery {
         signatureCounts: [WindowSignature: Int],
         identityRegistry: inout WindowIdentityRegistry,
         knownStateKey: (WindowIdentity) -> String?,
-        screenForKnownStateKey: (String, ScreenInfo) -> ScreenInfo
+        screenForKnownStateKey: (String, ScreenInfo) -> ScreenInfo,
+        avoidingIdentities: Set<WindowIdentity> = []
     ) -> (windows: [ManagedWindow], newlyCreatedIDs: Set<WindowIdentity>) {
         var windows: [ManagedWindow] = []
-        var seenIDs: Set<WindowIdentity> = []
+        var seenIDs: Set<WindowIdentity> = avoidingIdentities
         var newlyCreatedIDs: Set<WindowIdentity> = []
         for candidate in candidates {
             let windowKey = candidate.windowNumber.map { WindowOrderKey(pid: candidate.pid, number: $0) }
@@ -475,37 +690,12 @@ struct WindowDiscovery {
         return (windows, newlyCreatedIDs)
     }
 
-    private static func shouldOrderBefore(_ lhs: ManagedWindow, _ rhs: ManagedWindow) -> Bool {
-        // CGWindowList is front-to-back. Syncing back-to-front makes a newly frontmost window insert last.
-        switch (lhs.orderRank, rhs.orderRank) {
-        case (.some(let lhsRank), .some(let rhsRank)) where lhsRank != rhsRank:
-            return lhsRank > rhsRank
-        case (.some, .none):
-            return true
-        case (.none, .some):
-            return false
-        default:
-            break
-        }
-
-        let lhsApp = lhs.bundleIdentifier ?? ""
-        let rhsApp = rhs.bundleIdentifier ?? ""
-        if lhsApp != rhsApp { return lhsApp < rhsApp }
-        if lhs.id.pid != rhs.id.pid { return lhs.id.pid < rhs.id.pid }
-        switch (lhs.windowNumber, rhs.windowNumber) {
-        case (.some(let lhsNumber), .some(let rhsNumber)) where lhsNumber != rhsNumber:
-            return lhsNumber < rhsNumber
-        case (.some, .none):
-            return true
-        case (.none, .some):
-            return false
-        default:
-            return lhs.scanIndex < rhs.scanIndex
-        }
+    static func shouldOrderBefore(_ lhs: ManagedWindow, _ rhs: ManagedWindow) -> Bool {
+        ManagedWindow.shouldOrderBefore(lhs, rhs)
     }
 }
 
-private struct ManagedWindowCandidate {
+struct ManagedWindowCandidate {
     let pid: pid_t
     var windowNumber: Int?
     let elementKey: WindowElementKey
@@ -517,5 +707,5 @@ private struct ManagedWindowCandidate {
     let bundleIdentifier: String?
     let title: String?
     var orderRank: Int?
-    let scanIndex: Int
+    var scanIndex: Int
 }

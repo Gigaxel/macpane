@@ -1,5 +1,6 @@
 import ApplicationServices
 import CoreGraphics
+import Foundation
 
 enum AXRead<T> {
     case value(T)
@@ -21,6 +22,27 @@ extension AXRead {
 }
 
 enum AXReader {
+    private typealias WindowIDFunction = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+    private static let windowIDFunction: WindowIDFunction? = {
+        guard let handle = dlopen(nil, RTLD_LAZY), let symbol = dlsym(handle, "_AXUIElementGetWindow") else {
+            return nil
+        }
+        return unsafeBitCast(symbol, to: WindowIDFunction.self)
+    }()
+
+    static func windowID(of element: AXUIElement) -> Int? {
+        guard let windowIDFunction else { return nil }
+        var identifier: CGWindowID = 0
+        guard windowIDFunction(element, &identifier) == .success, identifier != 0 else { return nil }
+        return Int(identifier)
+    }
+
+    static func windowNumber(of element: AXUIElement) -> Int? {
+        windowID(of: element)
+            ?? int(element, attribute: "AXWindowNumber")
+            ?? int(element, attribute: "_AXWindowNumber")
+    }
+
     static func element(_ element: AXUIElement, attribute: String) -> AXUIElement? {
         var rawValue: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &rawValue)

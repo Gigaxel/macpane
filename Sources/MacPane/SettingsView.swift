@@ -168,6 +168,22 @@ private struct GeneralSettingsView: View {
                 }
             }
 
+            Section("Experimental") {
+                Toggle(
+                    "Instant window focus (private API)",
+                    isOn: Binding(
+                        get: { store.fastFocusEnabled },
+                        set: { store.setFastFocusEnabled($0) }
+                    )
+                )
+                .disabled(!store.isFastFocusAvailable)
+                Text(store.isFastFocusAvailable
+                    ? "Focuses windows through a private macOS window server call. It is faster than the standard path but may stop working after a macOS update. MacPane falls back to the standard path when the call fails."
+                    : "Not available on this macOS version. MacPane uses the standard focus path.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Maintenance") {
                 Button("Retile Windows Now") { store.retileNow() }
                 LabeledContent("Learned app size limits") {

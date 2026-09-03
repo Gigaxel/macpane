@@ -10,8 +10,27 @@ struct MissingWindowRetention {
     let missingSinceByID: [WindowIdentity: Date]
 }
 
+struct MinimizedWindowRemoval {
+    let stateKey: String
+    let state: ScreenTileState
+    let remainingIDs: Set<WindowIdentity>
+}
+
 enum WindowStateSyncPlanner {
     static let departedLayoutExpiry: TimeInterval = 6 * 60 * 60
+
+    static func removingMinimizedWindow(
+        _ id: WindowIdentity,
+        screenStates: [String: ScreenTileState],
+        activeStateKeys: Set<String>
+    ) -> MinimizedWindowRemoval? {
+        guard let (key, state) = screenStates.first(where: { activeStateKeys.contains($0.key) && $0.value.contains(id) }) else {
+            return nil
+        }
+        var updated = state
+        updated.remove(id)
+        return MinimizedWindowRemoval(stateKey: key, state: updated, remainingIDs: updated.windowIDs)
+    }
 
     static func missingWindowRetention(
         idsByScreen: [String: Set<WindowIdentity>],

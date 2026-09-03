@@ -4,14 +4,18 @@ import ApplicationServices
 final class WindowFocusTracker {
     private let appBundleIdentifier: String
     private let messagingTimeout: Float
+    private let ioScheduler: AXIOScheduler?
     private(set) var lastKnownWindowID: WindowIdentity?
+    var fastFocusEnabled: () -> Bool = { false }
 
     init(
         appBundleIdentifier: String = Bundle.main.bundleIdentifier ?? "com.gigaxel.macpane",
-        messagingTimeout: Float = 0.15
+        messagingTimeout: Float = 0.15,
+        ioScheduler: AXIOScheduler? = nil
     ) {
         self.appBundleIdentifier = appBundleIdentifier
         self.messagingTimeout = messagingTimeout
+        self.ioScheduler = ioScheduler
     }
 
     func reset() {
@@ -43,7 +47,7 @@ final class WindowFocusTracker {
 
         var focusedPID: pid_t = 0
         guard AXUIElementGetPid(focusedWindow, &focusedPID) == .success else { return nil }
-        if let number = AXReader.int(focusedWindow, attribute: "AXWindowNumber") ?? AXReader.int(focusedWindow, attribute: "_AXWindowNumber") {
+        if let number = AXReader.windowNumber(of: focusedWindow) {
             let focusedID = windows.first { $0.id.pid == focusedPID && $0.windowNumber == number }?.id
             if let focusedID { lastKnownWindowID = focusedID }
             return focusedID
@@ -62,7 +66,7 @@ final class WindowFocusTracker {
         }
         var pid: pid_t = 0
         guard AXUIElementGetPid(element, &pid) == .success else { return nil }
-        if let number = AXReader.int(element, attribute: "AXWindowNumber") ?? AXReader.int(element, attribute: "_AXWindowNumber") {
+        if let number = AXReader.windowNumber(of: element) {
             return windows.first { $0.id.pid == pid && $0.windowNumber == number }
         }
         return windows.first { candidate in
@@ -72,21 +76,39 @@ final class WindowFocusTracker {
 
     func focus(_ window: ManagedWindow) {
         lastKnownWindowID = window.id
-        if NSWorkspace.shared.frontmostApplication?.processIdentifier != window.id.pid,
-           let app = NSRunningApplication(processIdentifier: window.id.pid) {
+        let pid = window.id.pid
+        let element = window.element
+        let timeout = messagingTimeout
+        let useFastPath = fastFocusEnabled() && PrivateWindowServer.shared.isAvailable
+        let windowNumber = window.windowNumber
+        let needsActivation = NSWorkspace.shared.frontmostApplication?.processIdentifier != pid
+        let activate: () -> Void = {
+            guard needsActivation, let app = NSRunningApplication(processIdentifier: pid) else { return }
             if #available(macOS 14.0, *) {
                 app.activate()
             } else {
                 app.activate(options: [.activateIgnoringOtherApps])
             }
         }
-
-        let appElement = AXUIElementCreateApplication(window.id.pid)
-        AXUIElementSetMessagingTimeout(appElement, messagingTimeout)
-        AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window.element)
-        AXUIElementSetAttributeValue(window.element, kAXMainAttribute as CFString, kCFBooleanTrue)
-        AXUIElementSetAttributeValue(window.element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-        AXUIElementPerformAction(window.element, kAXRaiseAction as CFString)
+        let work: () -> Void = {
+            if useFastPath, let windowNumber, PrivateWindowServer.shared.focusWindow(pid: pid, windowNumber: windowNumber) {
+                AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+                PerformanceTrace.event("focus-fast", "pid \(pid) window \(windowNumber)")
+                return
+            }
+            DispatchQueue.main.async(execute: activate)
+            let appElement = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(appElement, timeout)
+            AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, element)
+            AXUIElementSetAttributeValue(element, kAXMainAttribute as CFString, kCFBooleanTrue)
+            AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+        }
+        if let ioScheduler {
+            ioScheduler.async(pid: pid, work)
+        } else {
+            work()
+        }
     }
 
     private func focusedWindow() -> AXUIElement? {
@@ -105,8 +127,8 @@ final class WindowFocusTracker {
 
     private func windowsRepresentSameWindow(_ lhs: AXUIElement, _ rhs: AXUIElement) -> Bool {
         if CFEqual(lhs, rhs) { return true }
-        let lhsWindowNumber = AXReader.int(lhs, attribute: "AXWindowNumber") ?? AXReader.int(lhs, attribute: "_AXWindowNumber")
-        let rhsWindowNumber = AXReader.int(rhs, attribute: "AXWindowNumber") ?? AXReader.int(rhs, attribute: "_AXWindowNumber")
+        let lhsWindowNumber = AXReader.windowNumber(of: lhs)
+        let rhsWindowNumber = AXReader.windowNumber(of: rhs)
         if let lhsWindowNumber, let rhsWindowNumber {
             return lhsWindowNumber == rhsWindowNumber
         }

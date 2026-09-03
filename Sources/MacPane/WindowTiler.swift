@@ -9,7 +9,13 @@ private let axWindowNotificationCallback: AXObserverCallback = { _, element, not
 
 final class WindowTiler {
     private let settings = WindowTilerSettings()
-    private let focusTracker = WindowFocusTracker()
+    private let axIO = AXIOScheduler()
+    private let appResponsiveness = AppResponsivenessTracker()
+    private lazy var focusTracker: WindowFocusTracker = {
+        let tracker = WindowFocusTracker(ioScheduler: axIO)
+        tracker.fastFocusEnabled = { [weak self] in self?.settings.fastFocusEnabled ?? false }
+        return tracker
+    }()
     private let metadataReader = WindowMetadataReader()
     private var appObservers: [pid_t: AppObserverRegistration] = [:]
     private var workspaceObservers: [NSObjectProtocol] = []
@@ -32,7 +38,7 @@ final class WindowTiler {
     private let workspaceSwitchApplyDelay: TimeInterval = 0.045
     private let workspaceSlideAnimationDuration: TimeInterval = 0.18
     private let workspaceSlideChainedDuration: TimeInterval = 0.14
-    private let windowDiscoveryReconcileOffsets: [TimeInterval] = [0, 0.10, 0.28, 0.70, 1.50, 3.00]
+    private let windowDiscoveryReconcileOffsets: [TimeInterval] = [0, 0.12, 0.40, 1.00]
     private let accessibilityMessagingTimeout: Float = 0.15
     private let globalAccessibilityMessagingTimeout: Float = 0.25
     private let accessibilityPermissionCacheDuration: TimeInterval = 0.50
@@ -57,8 +63,21 @@ final class WindowTiler {
     private let screenInfoCacheDuration: TimeInterval = 0.25
     private var lastWindowNotificationSweep = Date.distantPast
     private let windowNotificationSweepInterval: TimeInterval = 1.0
-    private let visibilityScanInterval: TimeInterval = 2.0
+    private let visibilityScanInterval: TimeInterval = 1.0
     private let observerRecoveryInterval: TimeInterval = 15.0
+    private var liveWindows: [ManagedWindow] = []
+    private var liveMissingSinceByID: [WindowIdentity: Date] = [:]
+    private var knownUnmanageableWindowKeys: Set<WindowOrderKey> = []
+    private var lastFullScanAt = Date.distantPast
+    private var pendingLiveReconcile: DispatchWorkItem?
+    private let fullScanInterval: TimeInterval = 5.0
+    private let liveWindowExpiry: TimeInterval = 2.0
+    private let createdProbeMaxAttempts = 40
+    private let createdProbeFastAttempts = 20
+    private let createdProbeSlowRetryInterval: TimeInterval = 0.05
+    private var liveSettleGeneration = 0
+    private let liveSettleOffsets: [TimeInterval] = [0.12, 0.40, 1.00]
+    private let createdProbeRetryInterval: TimeInterval = 0.016
     private var lastVisibleWindowSignature = VisibleWindowSignature()
     private var lastSyncedVisibleWindowSignature = VisibleWindowSignature()
     private var lastAppliedFrameByWindowID: [WindowIdentity: CGRect] = [:]
@@ -76,7 +95,10 @@ final class WindowTiler {
     private let maxFrameReassertAttempts = 2
     private var pendingAppDrivenReasserts: [WindowElementKey: AXUIElement] = [:]
     private var pendingAppDrivenReassertDrain: DispatchWorkItem?
-    private let appDrivenReassertDelay: TimeInterval = 0.25
+    private let appDrivenReassertDelay: TimeInterval = 0.08
+    private var pointerReleaseMonitor: Any?
+    private var pendingMoveElement: AXUIElement?
+    private var pendingResizeElement: AXUIElement?
     private var lastUserDragEventAt = Date.distantPast
     private let userDragEventGrace: TimeInterval = 1.0
     private var reassertBudget = ReassertBudget()
@@ -165,6 +187,16 @@ final class WindowTiler {
         settings.setAutoFloatSmallWindowsEnabled(value)
         scheduleReconcile(delay: 0.01)
     }
+    var fastFocusEnabled: Bool {
+        settings.fastFocusEnabled
+    }
+    var isFastFocusAvailable: Bool {
+        PrivateWindowServer.shared.isAvailable
+    }
+    func setFastFocusEnabled(_ value: Bool) {
+        guard !isStopping else { return }
+        settings.setFastFocusEnabled(value)
+    }
     var autoFloatWidthThreshold: Int {
         settings.autoFloatWidthThreshold
     }
@@ -204,12 +236,16 @@ final class WindowTiler {
     private func cancelPendingWork() {
         pendingReconcile?.cancel()
         pendingReconcile = nil
+        pendingLiveReconcile?.cancel()
+        pendingLiveReconcile = nil
         pendingFocusRemember?.cancel()
         pendingFocusRemember = nil
         pendingMove?.cancel()
         pendingMove = nil
+        pendingMoveElement = nil
         pendingResize?.cancel()
         pendingResize = nil
+        pendingResizeElement = nil
         pendingSystemUISettle?.cancel()
         pendingSystemUISettle = nil
         pendingWorkspaceSwitchApply?.cancel()
@@ -244,6 +280,10 @@ final class WindowTiler {
         }
         for pid in Array(appObservers.keys) {
             removeObserver(for: pid)
+        }
+        if let pointerReleaseMonitor {
+            NSEvent.removeMonitor(pointerReleaseMonitor)
+            self.pointerReleaseMonitor = nil
         }
     }
     private func resetRuntimeState() {
@@ -284,6 +324,11 @@ final class WindowTiler {
         hasCompletedInitialDiscovery = false
         missingTiledWindowSinceByID.removeAll()
         confirmedRemovedWindowIDs.removeAll()
+        liveWindows.removeAll()
+        liveMissingSinceByID.removeAll()
+        knownUnmanageableWindowKeys.removeAll()
+        lastFullScanAt = .distantPast
+        appResponsiveness.removeAll()
     }
     private func restoreAllWorkspacesBeforeStopping() {
         guard hasAccessibilityPermission(prompt: false) else { return }
@@ -312,6 +357,7 @@ final class WindowTiler {
            let focusedWindow = allWindows.first(where: { $0.id == focusedID }) {
             focus(window: focusedWindow, updateTreeFocus: true)
         }
+        axIO.flush(timeout: 1.0)
     }
 
     // MARK: - Accessibility Permission
@@ -542,19 +588,33 @@ final class WindowTiler {
         guard !isStopping, !shouldPauseLayoutForSystemUI(), frozenSystemUIScreenStates == nil else { return }
         switch notification {
         case kAXWindowCreatedNotification:
+            PerformanceTrace.markEvent("window-created")
             invalidateManagedWindowCache(clearAppliedFrames: true)
-            registerWindowNotifications(forCreatedElement: element)
-            scheduleWindowDiscoveryReconcileBurst(initialDelay: 0.025)
+            probeAndInsertWindow(element, attempt: 0)
         case kAXUIElementDestroyedNotification:
+            PerformanceTrace.markEvent("window-destroyed")
             invalidateManagedWindowCache(clearAppliedFrames: true)
-            removeDestroyedWindowState(forElement: element)
-            scheduleReconcile(delay: 0.015)
+            if let id = removeDestroyedWindowState(forElement: element) {
+                removeLiveWindow(id)
+            }
+            scheduleLiveReconcile()
+        case kAXWindowMiniaturizedNotification:
+            PerformanceTrace.markEvent("window-minimized")
+            handleWindowMinimized(element: element)
+        case kAXWindowDeminiaturizedNotification:
+            PerformanceTrace.markEvent("window-restored")
+            invalidateManagedWindowCache(clearAppliedFrames: false)
+            if let id = identity(forElement: element) {
+                confirmedRemovedWindowIDs.remove(id)
+            }
+            probeAndInsertWindow(element, attempt: 0)
         case kAXFocusedWindowChangedNotification,
              kAXApplicationActivatedNotification,
              kAXMainWindowChangedNotification:
             guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
             scheduleFocusRemember(delay: 0.01)
         case kAXMovedNotification:
+            confirmPendingFrameCheck(for: element)
             guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
             recordSystemDrivenAXEventIfApplicable(element: element)
             invalidateManagedWindowCache(clearAppliedFrames: true)
@@ -565,6 +625,7 @@ final class WindowTiler {
                 scheduleAppDrivenReassert(element: element)
             }
         case kAXResizedNotification:
+            confirmPendingFrameCheck(for: element)
             guard !isApplyingLayout, !isSuppressingExternalChanges else { return }
             recordSystemDrivenAXEventIfApplicable(element: element)
             invalidateManagedWindowCache(clearAppliedFrames: true)
@@ -689,6 +750,11 @@ final class WindowTiler {
             self?.performPeriodicVisibilityScan()
         }
         scanTimer?.tolerance = visibilityScanInterval * 0.25
+        pointerReleaseMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseUp, .rightMouseUp, .otherMouseUp]
+        ) { [weak self] _ in
+            self?.handlePointerReleased()
+        }
     }
     private func recordScreenParameterChangeForWorkspaceMigration() {
         let currentNativeStateKeys = Set(currentScreenInfos().map(\.nativeStateKey))
@@ -713,6 +779,9 @@ final class WindowTiler {
         removeFloatingWindowIDs(forTerminatedPIDs: stalePIDs)
         pruneDepartedLayouts(forTerminatedPIDs: stalePIDs)
         elementMetadataCache.removeEntries(forPIDs: stalePIDs)
+        if !stalePIDs.isEmpty {
+            liveWindows.removeAll { stalePIDs.contains($0.id.pid) }
+        }
         for app in runningApps where appObservers[app.processIdentifier] == nil {
             installObserver(for: app)
         }
@@ -801,7 +870,13 @@ final class WindowTiler {
         guard !tokens.contains(where: registration.observedWindowTokens.contains) else { return }
         let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         var registered = false
-        for notification in [kAXMovedNotification, kAXResizedNotification, kAXUIElementDestroyedNotification] {
+        for notification in [
+            kAXMovedNotification,
+            kAXResizedNotification,
+            kAXUIElementDestroyedNotification,
+            kAXWindowMiniaturizedNotification,
+            kAXWindowDeminiaturizedNotification
+        ] {
             let error = AXObserverAddNotification(registration.observer, window, notification as CFString, refcon)
             if error == .success || error == .notificationAlreadyRegistered {
                 registered = true
@@ -812,6 +887,8 @@ final class WindowTiler {
         }
     }
     private func removeObserver(for pid: pid_t) {
+        axIO.removeQueues(forPIDs: [pid])
+        appResponsiveness.markResponsive(pid)
         guard let registration = appObservers.removeValue(forKey: pid) else { return }
         CFRunLoopRemoveSource(CFRunLoopGetMain(), registration.source, .defaultMode)
     }
@@ -855,7 +932,12 @@ final class WindowTiler {
         guard !shouldPauseLayoutForSystemUI() else { return }
         let snapshot = WindowSnapshotReader.readOnScreenWindows()
         refreshAppObserversIfNeeded(visiblePIDs: Set(snapshot.visibleNumbersByPID.keys))
-        scheduleReconcileIfVisibleWindowSetChanged(snapshot: snapshot, delay: 0.01)
+        let userIsDragging = isPointerButtonDown || isWithinUserDragGrace
+        if !liveModelIsConsistent(snapshot: snapshot) {
+            scheduleReconcile(delay: 0.01)
+        } else if !userIsDragging, Date().timeIntervalSince(lastFullScanAt) >= fullScanInterval {
+            scheduleReconcile(delay: 0.01)
+        }
     }
     private func refreshAppObserversIfNeeded(visiblePIDs: Set<pid_t>) {
         let observedPIDs = Set(appObservers.keys)
@@ -867,13 +949,6 @@ final class WindowTiler {
         if shouldRunRecoveryRefresh {
             scheduleReconcileIfWindowSetChanged(delay: 0.01)
         }
-    }
-    private func scheduleReconcileIfVisibleWindowSetChanged(snapshot: OnScreenWindowSnapshot, delay: TimeInterval) {
-        let signature = VisibleWindowSignature(snapshot: snapshot)
-        guard signature != lastVisibleWindowSignature else { return }
-        guard !shouldPauseLayoutForSystemUI() else { return }
-        lastVisibleWindowSignature = signature
-        scheduleWindowDiscoveryReconcileBurst(initialDelay: delay)
     }
     private func scheduleFocusRemember(delay: TimeInterval) {
         guard !isStopping else { return }
@@ -888,8 +963,10 @@ final class WindowTiler {
     private func scheduleExternalMove(element: AXUIElement, userInitiated: Bool) {
         guard !isStopping, tilingEnabled, userInitiated, frozenSystemUIScreenStates == nil else { return }
         pendingMove?.cancel()
+        pendingMoveElement = element
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, !self.isStopping else { return }
+            self.pendingMoveElement = nil
             guard AXReader.string(element, attribute: kAXRoleAttribute) == kAXWindowRole else { return }
             self.handleExternalMove(element: element, userInitiated: userInitiated)
         }
@@ -899,13 +976,40 @@ final class WindowTiler {
     private func scheduleExternalResize(element: AXUIElement, userInitiated: Bool) {
         guard !isStopping, tilingEnabled, userInitiated, frozenSystemUIScreenStates == nil else { return }
         pendingResize?.cancel()
+        pendingResizeElement = element
         let workItem = DispatchWorkItem { [weak self] in
             guard let self, !self.isStopping else { return }
+            self.pendingResizeElement = nil
             guard AXReader.string(element, attribute: kAXRoleAttribute) == kAXWindowRole else { return }
             self.handleExternalResize(element: element, userInitiated: userInitiated)
         }
         pendingResize = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: workItem)
+    }
+    private func handlePointerReleased() {
+        guard !isStopping else { return }
+        if pendingMoveElement != nil {
+            PerformanceTrace.markEvent("pointer-released-move")
+            pendingMove?.cancel()
+            pendingMove = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                guard let self, !self.isStopping, let element = self.pendingMoveElement else { return }
+                self.pendingMoveElement = nil
+                guard AXReader.string(element, attribute: kAXRoleAttribute) == kAXWindowRole else { return }
+                self.handleExternalMove(element: element, userInitiated: true)
+            }
+        }
+        if pendingResizeElement != nil {
+            PerformanceTrace.markEvent("pointer-released-resize")
+            pendingResize?.cancel()
+            pendingResize = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                guard let self, !self.isStopping, let element = self.pendingResizeElement else { return }
+                self.pendingResizeElement = nil
+                guard AXReader.string(element, attribute: kAXRoleAttribute) == kAXWindowRole else { return }
+                self.handleExternalResize(element: element, userInitiated: true)
+            }
+        }
     }
 
     // MARK: - Reconciliation
@@ -943,11 +1047,12 @@ final class WindowTiler {
         guard tilingEnabled else { return }
         guard !shouldPauseLayoutForSystemUI(), frozenSystemUIScreenStates == nil else { return }
         let snapshot = WindowSnapshotReader.readOnScreenWindows()
-        let visibleSignatureChanged = VisibleWindowSignature(snapshot: snapshot) != lastVisibleWindowSignature
-        let windows = managedWindows(snapshot: snapshot)
-        managedWindowCache = (windows, Date())
-        if visibleSignatureChanged {
-            scheduleWindowDiscoveryReconcileBurst(initialDelay: 0.01)
+        let windows: [ManagedWindow]
+        if let live = liveManagedWindows(snapshot: snapshot) {
+            windows = live
+        } else {
+            windows = managedWindows(snapshot: snapshot)
+            managedWindowCache = (windows, Date())
         }
         let tiled = tiledWindows(from: windows)
         if hasWindowSetChanged(tiled) {
@@ -969,7 +1074,7 @@ final class WindowTiler {
               !isSuppressingExternalChanges,
               frozenSystemUIScreenStates == nil,
               !shouldPauseLayoutForSystemUI() else { return }
-        let allWindows = managedWindows()
+        let allWindows = interactiveManagedWindows()
         guard let changedWindow = focusTracker.window(matching: element, in: allWindows),
               !floatingWindowIDs.contains(changedWindow.id) else {
             return
@@ -992,7 +1097,7 @@ final class WindowTiler {
               !isSuppressingExternalChanges,
               frozenSystemUIScreenStates == nil,
               !shouldPauseLayoutForSystemUI() else { return }
-        let allWindows = managedWindows()
+        let allWindows = interactiveManagedWindows()
         guard let changedWindow = focusTracker.window(matching: element, in: allWindows),
               !floatingWindowIDs.contains(changedWindow.id),
               let key = stateKey(containing: changedWindow.id),
@@ -1123,14 +1228,11 @@ final class WindowTiler {
         )
     }
     private func interactiveManagedWindows() -> [ManagedWindow] {
-        let cachedWindows = managedWindows(useCache: true, cacheDuration: interactiveWindowCacheDuration)
-        let cachedTiled = tiledWindows(from: cachedWindows)
-        let shouldRefresh =
-            lastVisibleWindowSignature != lastSyncedVisibleWindowSignature ||
-            hasWindowSetChanged(cachedTiled)
-        guard shouldRefresh else { return cachedWindows }
-        let refreshedWindows = managedWindows()
-        return refreshedWindows.isEmpty ? cachedWindows : refreshedWindows
+        let snapshot = WindowSnapshotReader.readOnScreenWindows()
+        if let windows = liveManagedWindows(snapshot: snapshot) {
+            return windows
+        }
+        return managedWindows(snapshot: snapshot)
     }
 
     // MARK: - Hot Keys
@@ -1521,10 +1623,8 @@ final class WindowTiler {
             )
         }
         pendingWorkspaceSwitchApply = workItem
-        // The 45 ms delay only matters for the cold first press (it lets Mission Control
-        // settle — see commit b686597). Chained presses go through the reseat path above
-        // and never hit this branch.
-        DispatchQueue.main.asyncAfter(deadline: .now() + workspaceSwitchApplyDelay, execute: workItem)
+        let applyDelay = isSystemUIUnsettled() ? workspaceSwitchApplyDelay : 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + applyDelay, execute: workItem)
     }
     private func workspaceSwitchContextFast() -> WorkspaceContext? {
         if let context = lastFocusedWindowContext() {
@@ -1705,24 +1805,28 @@ final class WindowTiler {
     private func applyWorkspaceSlideInitialFrames(_ transitions: [WorkspaceSlideTransition]) {
         let initialTransitions = transitions.filter(\.needsInitialFrame)
         guard !initialTransitions.isEmpty else { return }
-        let previousIsApplyingLayout = isApplyingLayout
-        isApplyingLayout = true
-        defer { isApplyingLayout = previousIsApplyingLayout }
+        var writesByPID: [pid_t: [FrameWrite]] = [:]
         for transition in initialTransitions {
-            WindowFrameApplier.applyFrame(transition.startFrame, to: transition.window.element)
+            let frame = WindowFrameApplier.sanitizedFrame(transition.startFrame)
+            writesByPID[transition.window.id.pid, default: []].append(
+                FrameWrite(element: transition.window.element, frame: frame, mode: .full)
+            )
         }
+        dispatchFrameWrites(writesByPID, label: "slide-initial")
     }
     private func applyChainSlideStep(chain: SlideChain, progress: CGFloat) {
         let transitions = chain.transitions
         guard !transitions.isEmpty else { return }
-        // AXUIElementSetAttributeValue must run on the main thread.
         for transition in transitions {
             let origin = WorkspaceSlidePlanner.interpolatedOrigin(
                 from: transition.startFrame,
                 to: transition.endFrame,
                 progress: progress
             )
-            WindowFrameApplier.applyPosition(origin, to: transition.window.element)
+            let element = transition.window.element
+            axIO.enqueueCoalesced(pid: transition.window.id.pid, key: transition.window.id) {
+                WindowFrameApplier.applyPosition(origin, to: element)
+            }
         }
     }
     private func handleSlideChainFinished(chain: SlideChain) {
@@ -2115,19 +2219,13 @@ final class WindowTiler {
             }
         }
     }
-    private func removeDestroyedWindowState(forElement element: AXUIElement) {
+    @discardableResult
+    private func removeDestroyedWindowState(forElement element: AXUIElement) -> WindowIdentity? {
         var pid: pid_t = 0
-        guard AXUIElementGetPid(element, &pid) == .success else { return }
-        let elementKey = WindowElementKey(pid: pid, hash: CFHash(element))
-        let cachedNumber = elementMetadataCache.entry(for: elementKey)?.windowNumber
-        elementMetadataCache.removeEntry(for: elementKey)
-        let windowKey = (cachedNumber
-            ?? AXReader.int(element, attribute: "AXWindowNumber")
-            ?? AXReader.int(element, attribute: "_AXWindowNumber"))
-            .map { WindowOrderKey(pid: pid, number: $0) }
-        guard let id = identityRegistry.identityForStrongAlias(windowKey: windowKey, elementKey: elementKey) else {
-            return
-        }
+        guard AXUIElementGetPid(element, &pid) == .success else { return nil }
+        let id = identity(forElement: element)
+        elementMetadataCache.removeEntry(for: WindowElementKey(pid: pid, hash: CFHash(element)))
+        guard let id else { return nil }
         autoFloatedRecently.removeValue(forKey: id)
         confirmedRemovedWindowIDs.insert(id)
         missingTiledWindowSinceByID.removeValue(forKey: id)
@@ -2135,6 +2233,56 @@ final class WindowTiler {
             removeFloatingWindowIDs([id])
         }
         pruneDepartedLayouts { $0 == id }
+        return id
+    }
+    private func identity(forElement element: AXUIElement) -> WindowIdentity? {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success else { return nil }
+        let elementKey = WindowElementKey(pid: pid, hash: CFHash(element))
+        let windowKey = (elementMetadataCache.entry(for: elementKey)?.windowNumber
+            ?? AXReader.windowNumber(of: element))
+            .map { WindowOrderKey(pid: pid, number: $0) }
+        return identityRegistry.identityForStrongAlias(windowKey: windowKey, elementKey: elementKey)
+    }
+    private func handleWindowMinimized(element: AXUIElement) {
+        invalidateManagedWindowCache(clearAppliedFrames: false)
+        guard let id = identity(forElement: element) else {
+            scheduleReconcile(delay: 0)
+            return
+        }
+        confirmedRemovedWindowIDs.insert(id)
+        missingTiledWindowSinceByID.removeValue(forKey: id)
+        pendingFrameChecks.removeValue(forKey: id)
+        applyMinimizedRemovalFast(id: id)
+        removeLiveWindow(id)
+        scheduleLiveReconcile()
+    }
+    private func applyMinimizedRemovalFast(id: WindowIdentity) {
+        guard tilingEnabled, pendingWorkspaceSwitchApply == nil, activeSlideChain == nil, !isApplyingLayout else { return }
+        let activeStateKeys = Set(currentScreenInfos().map(\.stateKey))
+        guard let removal = WindowStateSyncPlanner.removingMinimizedWindow(
+            id,
+            screenStates: screenStates,
+            activeStateKeys: activeStateKeys
+        ) else {
+            return
+        }
+        rememberDepartedLayouts(idsByScreen: [removal.stateKey: removal.remainingIDs], activeStateKeys: [removal.stateKey])
+        guard !removal.state.isEmpty else {
+            screenStates.removeValue(forKey: removal.stateKey)
+            return
+        }
+        screenStates[removal.stateKey] = removal.state
+        let snapshot = WindowSnapshotReader.readOnScreenWindows()
+        let windows = liveWindows.compactMap { window -> ManagedWindow? in
+            guard window.id != id else { return nil }
+            guard let number = window.windowNumber,
+                  let frame = snapshot.frame(pid: window.id.pid, number: number) else {
+                return window
+            }
+            return window.withFrame(frame)
+        }
+        applyLayout(to: windows, limitingToStateKeys: [removal.stateKey])
     }
     private func mergeAllWorkspaceStatesIntoActiveWorkspaces(focusedID: WindowIdentity?) -> Bool {
         let screens = currentScreenInfos()
@@ -2269,46 +2417,81 @@ final class WindowTiler {
         isApplyingLayout = true
         var appliedFramesByID: [WindowIdentity: CGRect] = [:]
         var frameChecks: [WindowIdentity: FrameCheck] = [:]
-        var hadWriteFailure = false
-        defer {
-            isApplyingLayout = false
-            updateManagedWindowCache(withAppliedFrames: appliedFramesByID)
-            updateLastAppliedWorkspaceIndices(using: currentScreens)
-            suppressExternalChanges(for: 0.45)
-            replaceFrameChecks(with: frameChecks, merging: stateKeyLimit != nil)
-            if plan.skippedIncompleteState {
-                scheduleReconcile(delay: 0.12)
-            } else if hadWriteFailure, pendingReconcile == nil {
-                scheduleReconcile(delay: 0.4)
+        var writesByPID: [pid_t: [FrameWrite]] = [:]
+        for assignment in plan.assignments {
+            let window = assignment.window
+            let frame = WindowFrameApplier.sanitizedFrame(assignment.frame)
+            let mode = FrameWritePlanner.mode(current: window.frame, target: frame)
+            lastAppliedFrameByWindowID[window.id] = frame
+            if mode != .skip {
+                appliedFramesByID[window.id] = frame
+                writesByPID[window.id.pid, default: []].append(FrameWrite(element: window.element, frame: frame, mode: mode))
             }
+            frameChecks[window.id] = FrameCheck(
+                target: frame,
+                attempts: 0,
+                pid: window.id.pid,
+                windowNumber: window.windowNumber,
+                element: window.element,
+                kind: assignment.kind
+            )
         }
-        let assignmentsByPID = Dictionary(grouping: plan.assignments) { $0.window.id.pid }
-        for pid in assignmentsByPID.keys.sorted() {
-            var suspension: EnhancedUserInterfaceSuspension?
-            for assignment in assignmentsByPID[pid] ?? [] {
-                let result = set(window: assignment.window, frame: assignment.frame) {
+        isApplyingLayout = false
+        updateManagedWindowCache(withAppliedFrames: appliedFramesByID)
+        updateLastAppliedWorkspaceIndices(using: currentScreens)
+        suppressExternalChanges(for: 0.45)
+        replaceFrameChecks(with: frameChecks, merging: stateKeyLimit != nil)
+        if plan.skippedIncompleteState {
+            scheduleReconcile(delay: 0.12)
+        }
+        dispatchFrameWrites(writesByPID, label: "layout")
+        rememberPersistedLayouts(using: windows, limitingToStateKeys: stateKeyLimit)
+    }
+    private func dispatchFrameWrites(_ writesByPID: [pid_t: [FrameWrite]], label: StaticString) {
+        guard !writesByPID.isEmpty else { return }
+        let start = PerformanceTrace.now()
+        let group = DispatchGroup()
+        let failures = FrameWriteFailures()
+        let timeout = accessibilityMessagingTimeout
+        for (pid, writes) in writesByPID {
+            group.enter()
+            axIO.async(pid: pid) {
+                var suspension: EnhancedUserInterfaceSuspension?
+                var failed = false
+                for write in writes {
                     if suspension == nil {
-                        suspension = EnhancedUserInterfaceSuspension(pid: pid, messagingTimeout: accessibilityMessagingTimeout)
+                        suspension = EnhancedUserInterfaceSuspension(pid: pid, messagingTimeout: timeout)
+                    }
+                    let error: AXError
+                    switch write.mode {
+                    case .positionOnly:
+                        error = WindowFrameApplier.applyPosition(write.frame.origin, to: write.element)
+                    case .full, .skip:
+                        error = WindowFrameApplier.applyFrame(write.frame, to: write.element)
+                    }
+                    if error != .success {
+                        failed = true
                     }
                 }
-                if let applied = result.applied {
-                    appliedFramesByID[assignment.window.id] = applied
+                suspension?.restore()
+                if failed {
+                    failures.record(pid)
                 }
-                if result.writeFailed {
-                    hadWriteFailure = true
-                }
-                frameChecks[assignment.window.id] = FrameCheck(
-                    target: WindowFrameApplier.sanitizedFrame(assignment.frame),
-                    attempts: 0,
-                    pid: pid,
-                    windowNumber: assignment.window.windowNumber,
-                    element: assignment.window.element,
-                    kind: assignment.kind
-                )
+                group.leave()
             }
-            suspension?.restore()
         }
-        rememberPersistedLayouts(using: windows, limitingToStateKeys: stateKeyLimit)
+        let windowCount = writesByPID.values.reduce(0) { $0 + $1.count }
+        group.notify(queue: .main) { [weak self] in
+            guard let self, !self.isStopping else { return }
+            PerformanceTrace.event(
+                label,
+                "\(windowCount) windows across \(writesByPID.count) apps in \(String(format: "%.2f", PerformanceTrace.milliseconds(since: start)))ms"
+            )
+            PerformanceTrace.reportEventLatency("frames-written")
+            if failures.hasFailures, self.pendingReconcile == nil {
+                self.scheduleReconcile(delay: 0.4)
+            }
+        }
     }
     private func minimumSizesByWindowID(for windows: [ManagedWindow]) -> [WindowIdentity: CGSize] {
         var minimums: [WindowIdentity: CGSize] = [:]
@@ -3019,10 +3202,11 @@ final class WindowTiler {
             assumingWorkspaceIndex: workspaceIndex,
             forNativeStateKey: nativeStateKey
         )
-        return managedWindows(
-            snapshot: WindowSnapshotReader.readOnScreenWindows(),
-            catalog: catalog
-        )
+        let snapshot = WindowSnapshotReader.readOnScreenWindows()
+        if let windows = liveManagedWindows(snapshot: snapshot, catalog: catalog) {
+            return windows
+        }
+        return managedWindows(snapshot: snapshot, catalog: catalog)
     }
     private func invalidateManagedWindowCache(clearAppliedFrames: Bool = false) {
         managedWindowCache = nil
@@ -3031,7 +3215,11 @@ final class WindowTiler {
         }
     }
     private func updateManagedWindowCache(withAppliedFrames framesByID: [WindowIdentity: CGRect]) {
-        guard !framesByID.isEmpty, let managedWindowCache else { return }
+        guard !framesByID.isEmpty else { return }
+        liveWindows = liveWindows.map { window in
+            framesByID[window.id].map(window.withFrame) ?? window
+        }
+        guard let managedWindowCache else { return }
         let windows = managedWindowCache.windows.map { window -> ManagedWindow in
             guard let frame = framesByID[window.id] else { return window }
             return window.withFrame(frame)
@@ -3062,25 +3250,37 @@ final class WindowTiler {
         )
 
         var registry = identityRegistry
-        let discovery = WindowDiscovery(
-            metadataReader: metadataReader,
-            metadataCache: elementMetadataCache,
-            screenCatalog: catalog,
-            accessibilityMessagingTimeout: accessibilityMessagingTimeout
-        )
+        let discovery = makeDiscovery(catalog: catalog)
         let stateKeyByWindowID = stateKeyIndex(activeStateKeys: activeStateKeys)
-        let result = discovery.managedWindows(
-            snapshot: snapshot,
-            screens: screens,
-            retainedOffscreenIDs: retainedOffscreenIDs,
-            identityRegistry: &registry,
-            knownStateKey: { stateKeyByWindowID[$0] },
-            screenForKnownStateKey: { self.screenInfo(forKnownStateKey: $0, fallback: $1, screens: screens) }
-        )
+        let trackedPIDs = Set(stateKeyByWindowID.keys.map(\.pid))
+        let result = PerformanceTrace.interval("discovery", detail: "\(snapshot.visibleNumbersByPID.count) apps") {
+            discovery.managedWindows(
+                snapshot: snapshot,
+                screens: screens,
+                retainedOffscreenIDs: retainedOffscreenIDs,
+                trackedPIDs: trackedPIDs,
+                identityRegistry: &registry,
+                knownStateKey: { stateKeyByWindowID[$0] },
+                screenForKnownStateKey: { self.screenInfo(forKnownStateKey: $0, fallback: $1, screens: screens) }
+            )
+        }
         identityRegistry = registry
         lastDiscoveredRawWindows = (result.rawWindowsByPID, Date())
+        confirmedRemovedWindowIDs.formUnion(result.minimizedIDs)
+        for id in result.minimizedIDs {
+            missingTiledWindowSinceByID.removeValue(forKey: id)
+        }
 
         let windows = result.windows
+        liveWindows = windows
+        liveMissingSinceByID.removeAll()
+        lastFullScanAt = Date()
+        knownUnmanageableWindowKeys = LiveWindowPlanner.unmanageableKeys(
+            visibleNumbersByPID: snapshot.visibleNumbersByPID,
+            scannedPIDs: result.cleanlyScannedPIDs,
+            liveWindows: windows
+        )
+        confirmedRemovedWindowIDs.subtract(Set(windows.map(\.id)))
         newlyDiscoveredWindowIDs.formUnion(result.newlyCreatedIDs)
         newlyDiscoveredWindowIDs.formIntersection(Set(windows.map(\.id)))
         elementMetadataCache.pruneIfNeeded(keepingPIDs: Set(snapshot.visibleNumbersByPID.keys))
@@ -3102,6 +3302,199 @@ final class WindowTiler {
         guard pendingReconcile == nil else { return }
         let delay = min(0.35 * pow(2.0, Double(deferredDiscoveryRetries - 1)), 5.0)
         scheduleReconcile(delay: delay)
+    }
+
+    private func makeDiscovery(catalog: ScreenCatalog) -> WindowDiscovery {
+        WindowDiscovery(
+            metadataReader: metadataReader,
+            metadataCache: elementMetadataCache,
+            screenCatalog: catalog,
+            accessibilityMessagingTimeout: accessibilityMessagingTimeout,
+            ioScheduler: axIO,
+            responsiveness: appResponsiveness
+        )
+    }
+    private func liveModelIsConsistent(snapshot: OnScreenWindowSnapshot) -> Bool {
+        let manageablePIDs = Set(
+            NSWorkspace.shared.runningApplications
+                .filter(metadataReader.isManageableApp)
+                .map(\.processIdentifier)
+        )
+        let consistency = LiveWindowPlanner.consistency(
+            liveWindows: liveWindows,
+            visibleNumbersByPID: snapshot.visibleNumbersByPID,
+            manageablePIDs: manageablePIDs,
+            knownUnmanageableKeys: knownUnmanageableWindowKeys
+        )
+        if !consistency.isConsistent {
+            PerformanceTrace.event(
+                "live-model-inconsistent",
+                "unknown \(consistency.unknownKeys.count) missing \(consistency.missingIDs.count)"
+            )
+        }
+        return consistency.isConsistent
+    }
+    private func liveManagedWindows(snapshot: OnScreenWindowSnapshot, catalog: ScreenCatalog? = nil) -> [ManagedWindow]? {
+        guard !liveWindows.isEmpty, liveModelIsConsistent(snapshot: snapshot) else { return nil }
+        let refresh = LiveWindowPlanner.refreshed(
+            liveWindows: liveWindows,
+            framesByWindow: snapshot.framesByWindow,
+            rankByWindow: snapshot.rankByWindow,
+            missingSinceByID: liveMissingSinceByID,
+            removedIDs: confirmedRemovedWindowIDs,
+            expiry: liveWindowExpiry,
+            now: Date()
+        )
+        liveMissingSinceByID = refresh.missingSinceByID
+        liveWindows = refresh.visible + refresh.retained
+        lastVisibleWindowSignature = VisibleWindowSignature(snapshot: snapshot)
+        let windows = reassignScreens(refresh.visible, catalog: catalog)
+        correctAutoFloatedWindows(using: windows)
+        if catalog == nil {
+            managedWindowCache = (windows, Date())
+        }
+        return windows
+    }
+    private func reassignScreens(_ windows: [ManagedWindow], catalog: ScreenCatalog?) -> [ManagedWindow] {
+        let screens = catalog?.currentInfos() ?? currentScreenInfos()
+        let catalog = catalog ?? screenCatalog
+        let stateKeyByWindowID = stateKeyIndex(activeStateKeys: Set(screens.map(\.stateKey)))
+        return windows.map { window in
+            let geometry = catalog.info(for: window.frame, screens: screens)
+            let screen = stateKeyByWindowID[window.id]
+                .map { screenInfo(forKnownStateKey: $0, fallback: geometry, screens: screens) }
+                ?? geometry
+            return window.withScreen(screen)
+        }
+    }
+    private func removeLiveWindow(_ id: WindowIdentity) {
+        liveWindows.removeAll { $0.id == id }
+        liveMissingSinceByID.removeValue(forKey: id)
+    }
+    private func scheduleLiveReconcile() {
+        guard !isStopping, pendingLiveReconcile == nil else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingLiveReconcile = nil
+            guard !self.isStopping else { return }
+            self.reconcileFromLive()
+        }
+        pendingLiveReconcile = workItem
+        DispatchQueue.main.async(execute: workItem)
+    }
+    private func reconcileFromLive(preferLastKnownFocus: Bool = false) {
+        guard !isStopping, hasAccessibilityPermission(prompt: false), tilingEnabled else { return }
+        guard pendingWorkspaceSwitchApply == nil, activeSlideChain == nil else {
+            scheduleReconcile(delay: workspaceSlideAnimationDuration + 0.05)
+            return
+        }
+        guard !shouldPauseLayoutForSystemUI(), frozenSystemUIScreenStates == nil else {
+            scheduleReconcile(delay: 0.70)
+            return
+        }
+        let snapshot = WindowSnapshotReader.readOnScreenWindows()
+        guard let allWindows = liveManagedWindows(snapshot: snapshot) else {
+            reconcileAndApplyLayout()
+            return
+        }
+        PerformanceTrace.interval("reconcile-live", detail: "\(allWindows.count) windows") {
+            let tiled = tiledWindows(from: allWindows)
+            let lastKnownID = focusTracker.lastKnownWindowID
+            let focusedID: WindowIdentity?
+            if preferLastKnownFocus, let lastKnownID, allWindows.contains(where: { $0.id == lastKnownID }) {
+                focusedID = lastKnownID
+            } else {
+                focusedID = focusTracker.focusedWindowID(in: allWindows)
+            }
+            syncStates(with: tiled, focusedID: focusedID)
+            applyLayout(to: allWindows)
+        }
+    }
+    private func probeAndInsertWindow(_ element: AXUIElement, attempt: Int) {
+        guard !isStopping, tilingEnabled, frozenSystemUIScreenStates == nil, !shouldPauseLayoutForSystemUI() else { return }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success,
+              let app = NSRunningApplication(processIdentifier: pid),
+              metadataReader.isManageableApp(app) else {
+            return
+        }
+        let snapshot = WindowSnapshotReader.readOnScreenWindows()
+        if let existing = identity(forElement: element),
+           let live = liveWindows.first(where: { $0.id == existing }),
+           let number = live.windowNumber,
+           snapshot.visibleNumbersByPID[pid]?.contains(number) == true {
+            scheduleLiveReconcile()
+            return
+        }
+        let screens = currentScreenInfos()
+        let discovery = makeDiscovery(catalog: screenCatalog)
+        let probe = discovery.probeWindow(element, app: app, screens: screens, snapshot: snapshot)
+        guard !probe.isMinimized else { return }
+        guard let candidate = probe.candidate else {
+            if probe.isExcluded {
+                if let number = AXReader.windowNumber(of: element) {
+                    knownUnmanageableWindowKeys.insert(WindowOrderKey(pid: pid, number: number))
+                }
+            } else if attempt < createdProbeMaxAttempts {
+                scheduleProbeRetry(element, attempt: attempt + 1)
+            } else {
+                scheduleWindowDiscoveryReconcileBurst(initialDelay: 0.02)
+            }
+            return
+        }
+        let stateKeyByWindowID = stateKeyIndex(activeStateKeys: Set(screens.map(\.stateKey)))
+        let claimedNumbers = Set(liveWindows.filter { $0.id.pid == pid }.compactMap(\.windowNumber))
+        let isSignatureUnique = candidate.layoutIdentity == nil || !liveWindows.contains {
+            $0.id.pid == pid && $0.layoutIdentity == candidate.layoutIdentity
+        }
+        var registry = identityRegistry
+        guard let resolved = discovery.resolvedWindow(
+            from: candidate,
+            snapshot: snapshot,
+            excludingNumbers: claimedNumbers,
+            isSignatureUnique: isSignatureUnique,
+            identityRegistry: &registry,
+            avoidingIdentities: Set(liveWindows.map(\.id)),
+            knownStateKey: { stateKeyByWindowID[$0] },
+            screenForKnownStateKey: { self.screenInfo(forKnownStateKey: $0, fallback: $1, screens: screens) }
+        ) else {
+            if attempt < createdProbeMaxAttempts {
+                scheduleProbeRetry(element, attempt: attempt + 1)
+            } else {
+                scheduleWindowDiscoveryReconcileBurst(initialDelay: 0.02)
+            }
+            return
+        }
+        identityRegistry = registry
+        let window = resolved.window
+        if resolved.isNewlyCreated {
+            newlyDiscoveredWindowIDs.insert(window.id)
+        }
+        confirmedRemovedWindowIDs.remove(window.id)
+        liveMissingSinceByID.removeValue(forKey: window.id)
+        liveWindows = LiveWindowPlanner.inserting(window, into: liveWindows)
+        PerformanceTrace.event("live-insert", "pid \(pid) attempt \(attempt)")
+        reconcileFromLive(preferLastKnownFocus: true)
+        registerWindowNotifications(forCreatedElement: element)
+        scheduleLiveSettleBurst()
+    }
+    private func scheduleLiveSettleBurst() {
+        guard !isStopping else { return }
+        liveSettleGeneration += 1
+        let generation = liveSettleGeneration
+        for offset in liveSettleOffsets {
+            DispatchQueue.main.asyncAfter(deadline: .now() + offset) { [weak self] in
+                guard let self, !self.isStopping, self.liveSettleGeneration == generation else { return }
+                self.invalidateManagedWindowCache(clearAppliedFrames: false)
+                self.reconcileFromLive()
+            }
+        }
+    }
+    private func scheduleProbeRetry(_ element: AXUIElement, attempt: Int) {
+        let interval = attempt <= createdProbeFastAttempts ? createdProbeRetryInterval : createdProbeSlowRetryInterval
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval) { [weak self] in
+            self?.probeAndInsertWindow(element, attempt: attempt)
+        }
     }
 
     // MARK: - Auto-Float Heuristics
@@ -3150,7 +3543,7 @@ final class WindowTiler {
             unfloatedAny = true
         }
         if unfloatedAny {
-            scheduleWindowDiscoveryReconcileBurst(initialDelay: 0.01)
+            scheduleLiveReconcile()
         }
     }
     private func shouldAutoFloat(_ frame: CGRect) -> Bool {
@@ -3164,29 +3557,6 @@ final class WindowTiler {
             screenStates[key] = state
         }
     }
-    private func set(
-        window: ManagedWindow,
-        frame: CGRect,
-        beforeWrite: () -> Void = {}
-    ) -> (applied: CGRect?, writeFailed: Bool) {
-        let frame = WindowFrameApplier.sanitizedFrame(frame)
-        switch FrameWritePlanner.mode(current: window.frame, target: frame) {
-        case .skip:
-            lastAppliedFrameByWindowID[window.id] = frame
-            return (nil, false)
-        case .positionOnly:
-            beforeWrite()
-            let error = WindowFrameApplier.applyPosition(frame.origin, to: window.element)
-            lastAppliedFrameByWindowID[window.id] = frame
-            return (frame, error != .success)
-        case .full:
-            beforeWrite()
-            let error = WindowFrameApplier.applyFrame(frame, to: window.element)
-            lastAppliedFrameByWindowID[window.id] = frame
-            return (frame, error != .success)
-        }
-    }
-
     // MARK: - Frame Verification
 
     private func replaceFrameChecks(with checks: [WindowIdentity: FrameCheck], merging: Bool) {
@@ -3210,6 +3580,29 @@ final class WindowTiler {
         }
         pendingFrameVerification = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+    private func confirmPendingFrameCheck(for element: AXUIElement) {
+        guard !pendingFrameChecks.isEmpty else { return }
+        guard let (id, check) = pendingFrameChecks.first(where: { CFEqual($0.value.element, element) }) else { return }
+        var observed: CGRect?
+        if let number = check.windowNumber {
+            observed = WindowSnapshotReader.readOnScreenWindows().frame(pid: check.pid, number: number)
+        }
+        if observed == nil {
+            observed = axFrame(of: element)
+        }
+        guard let observed else { return }
+        switch FrameVerificationClassifier.classify(target: check.target, observed: observed, tolerance: frameVerificationTolerance) {
+        case .applied:
+            pendingFrameChecks.removeValue(forKey: id)
+            PerformanceTrace.event("frame-confirmed", "pid \(check.pid)")
+            if pendingFrameChecks.isEmpty {
+                pendingFrameVerification?.cancel()
+                pendingFrameVerification = nil
+            }
+        case .clamped, .rejected:
+            scheduleFrameVerification(delay: 0.06)
+        }
     }
     private func runFrameVerification(generation: Int) {
         pendingFrameVerification = nil
@@ -3296,24 +3689,13 @@ final class WindowTiler {
         }
     }
     private func performReassertions(_ reassertions: [(id: WindowIdentity, check: FrameCheck)]) {
-        isApplyingLayout = true
         suppressExternalChanges(for: 0.45)
-        defer {
-            isApplyingLayout = false
-            suppressExternalChanges(for: 0.45)
+        var writesByPID: [pid_t: [FrameWrite]] = [:]
+        for (id, check) in reassertions {
+            lastAppliedFrameByWindowID[id] = check.target
+            writesByPID[check.pid, default: []].append(FrameWrite(element: check.element, frame: check.target, mode: .full))
         }
-        let byPID = Dictionary(grouping: reassertions, by: { $0.check.pid })
-        for pid in byPID.keys.sorted() {
-            var suspension: EnhancedUserInterfaceSuspension?
-            for (id, check) in byPID[pid] ?? [] {
-                if suspension == nil {
-                    suspension = EnhancedUserInterfaceSuspension(pid: pid, messagingTimeout: accessibilityMessagingTimeout)
-                }
-                WindowFrameApplier.applyFrame(check.target, to: check.element)
-                lastAppliedFrameByWindowID[id] = check.target
-            }
-            suspension?.restore()
-        }
+        dispatchFrameWrites(writesByPID, label: "reassert")
     }
     private func recordObservedMinimum(_ observedMinimum: CGSize, forPID pid: pid_t) {
         guard let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier else { return }
@@ -3380,7 +3762,7 @@ final class WindowTiler {
         let elements = Array(pendingAppDrivenReasserts.values)
         pendingAppDrivenReasserts.removeAll()
         guard hasAccessibilityPermission(prompt: false) else { return }
-        let allWindows = managedWindows()
+        let allWindows = interactiveManagedWindows()
         let screensByKey = currentScreenInfosByKey()
         let minimums = minimumSizesByWindowID(for: allWindows)
         var reassertions: [(id: WindowIdentity, check: FrameCheck)] = []
@@ -3457,6 +3839,27 @@ private struct FrameCheck {
     let windowNumber: Int?
     let element: AXUIElement
     let kind: WindowFrameAssignment.Kind
+}
+
+private struct FrameWrite {
+    let element: AXUIElement
+    let frame: CGRect
+    let mode: FrameWriteMode
+}
+
+private final class FrameWriteFailures {
+    private let lock = NSLock()
+    private var failedPIDs: Set<pid_t> = []
+    func record(_ pid: pid_t) {
+        lock.lock()
+        failedPIDs.insert(pid)
+        lock.unlock()
+    }
+    var hasFailures: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !failedPIDs.isEmpty
+    }
 }
 
 /// Mutable state for an in-flight workspace slide so it can absorb rapid chained presses

@@ -28,6 +28,8 @@ xcrun swiftc \
   "$ROOT_DIR/Sources/MacPane/WorkspaceSwitchPlanner.swift" \
   "$ROOT_DIR/Sources/MacPane/WorkspaceStateKeys.swift" \
   "$ROOT_DIR/Sources/MacPane/WindowStateSyncPlanner.swift" \
+  "$ROOT_DIR/Sources/MacPane/AXIOScheduler.swift" \
+  "$ROOT_DIR/Sources/MacPane/LiveWindowPlanner.swift" \
   "$ROOT_DIR/Sources/MacPane/LayoutRestorePlanner.swift" \
   "$ROOT_DIR/Sources/MacPane/WorkspaceStateMigrator.swift" \
   "$ROOT_DIR/Sources/MacPane/WindowLayoutPlanner.swift" \

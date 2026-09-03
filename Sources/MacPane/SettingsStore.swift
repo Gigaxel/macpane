@@ -61,6 +61,14 @@ final class SettingsStore: ObservableObject {
         tiler.setAutoFloatSmallWindowsEnabled(value)
     }
 
+    var fastFocusEnabled: Bool { tiler.fastFocusEnabled }
+    var isFastFocusAvailable: Bool { tiler.isFastFocusAvailable }
+
+    func setFastFocusEnabled(_ value: Bool) {
+        objectWillChange.send()
+        tiler.setFastFocusEnabled(value)
+    }
+
     func setAutoFloatWidthThreshold(_ value: Int) {
         objectWillChange.send()
         tiler.setAutoFloatWidthThreshold(value)

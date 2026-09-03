@@ -10,6 +10,7 @@ final class WindowTilerSettings {
         static let accessibilityPrompted = "accessibilityPrompted"
         static let onboardingCompleted = "onboardingCompleted"
         static let autoFloatSmallWindowsEnabled = "autoFloatSmallWindowsEnabled"
+        static let fastFocusEnabled = "fastFocusEnabled"
         static let autoFloatWidthThreshold = "autoFloatWidthThreshold"
         static let autoFloatHeightThreshold = "autoFloatHeightThreshold"
     }
@@ -82,6 +83,14 @@ final class WindowTilerSettings {
 
     func setAutoFloatSmallWindowsEnabled(_ value: Bool) {
         defaults.set(value, forKey: DefaultsKey.autoFloatSmallWindowsEnabled)
+    }
+
+    var fastFocusEnabled: Bool {
+        defaults.bool(forKey: DefaultsKey.fastFocusEnabled)
+    }
+
+    func setFastFocusEnabled(_ value: Bool) {
+        defaults.set(value, forKey: DefaultsKey.fastFocusEnabled)
     }
 
     var autoFloatWidthThreshold: Int {
