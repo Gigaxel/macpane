@@ -35,7 +35,7 @@ Use the menu bar item to increase, decrease, or reset the configurable gap aroun
 
 Small new windows, such as OAuth pop-ups and pickers, float instead of splitting the focused tile. Set the size limits in Settings under "Pop-up Windows". The float shortcut tiles a floating window.
 
-MacPane learns an app's minimum size when the app rejects a smaller frame. It then grows that app's tile to fit. Reset the saved sizes in Settings under Maintenance if a tile is too large.
+MacPane learns an app's minimum size when the app rejects a smaller frame. It then grows that app's tile to fit. A minimum is only learned after the app has processed a MacPane write and held the larger frame twice, sizes that could not fit alongside any other tile are discarded, and a learned minimum is forgotten again when a tiled window of that app is seen below it. Reset the saved sizes in Settings under Maintenance if a tile is still too large.
 
 ## Build
 

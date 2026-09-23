@@ -87,12 +87,12 @@ final class WindowTiler {
     private let elementMetadataCache = WindowElementMetadataCache()
     private let appSizeConstraints = AppSizeConstraintsStore()
     private var pendingFrameChecks: [WindowIdentity: FrameCheck] = [:]
-    private var pendingFrameVerification: DispatchWorkItem?
+    private var pendingFrameVerification: (workItem: DispatchWorkItem, deadline: Date)?
     private var frameVerificationGeneration = 0
-    private let frameVerificationDelay: TimeInterval = 0.30
+    private var frameWriteToken = 0
+    private let frameVerificationPolicy = FrameVerificationPlanner.Policy()
     private let frameVerificationRetryDelay: TimeInterval = 0.35
     private let frameVerificationTolerance: CGFloat = 2
-    private let maxFrameReassertAttempts = 2
     private var pendingAppDrivenReasserts: [WindowElementKey: AXUIElement] = [:]
     private var pendingAppDrivenReassertDrain: DispatchWorkItem?
     private let appDrivenReassertDelay: TimeInterval = 0.08
@@ -250,7 +250,7 @@ final class WindowTiler {
         pendingSystemUISettle = nil
         pendingWorkspaceSwitchApply?.cancel()
         pendingWorkspaceSwitchApply = nil
-        pendingFrameVerification?.cancel()
+        pendingFrameVerification?.workItem.cancel()
         pendingFrameVerification = nil
         pendingFrameChecks.removeAll()
         frameVerificationGeneration += 1
@@ -1809,10 +1809,10 @@ final class WindowTiler {
         for transition in initialTransitions {
             let frame = WindowFrameApplier.sanitizedFrame(transition.startFrame)
             writesByPID[transition.window.id.pid, default: []].append(
-                FrameWrite(element: transition.window.element, frame: frame, mode: .full)
+                FrameWrite(id: transition.window.id, element: transition.window.element, frame: frame, mode: .full)
             )
         }
-        dispatchFrameWrites(writesByPID, label: "slide-initial")
+        dispatchFrameWrites(writesByPID, label: "slide-initial", token: nil)
     }
     private func applyChainSlideStep(chain: SlideChain, progress: CGFloat) {
         let transitions = chain.transitions
@@ -2418,6 +2418,8 @@ final class WindowTiler {
         var appliedFramesByID: [WindowIdentity: CGRect] = [:]
         var frameChecks: [WindowIdentity: FrameCheck] = [:]
         var writesByPID: [pid_t: [FrameWrite]] = [:]
+        let token = nextFrameWriteToken()
+        let now = Date()
         for assignment in plan.assignments {
             let window = assignment.window
             let frame = WindowFrameApplier.sanitizedFrame(assignment.frame)
@@ -2425,15 +2427,23 @@ final class WindowTiler {
             lastAppliedFrameByWindowID[window.id] = frame
             if mode != .skip {
                 appliedFramesByID[window.id] = frame
-                writesByPID[window.id.pid, default: []].append(FrameWrite(element: window.element, frame: frame, mode: mode))
+                writesByPID[window.id.pid, default: []].append(
+                    FrameWrite(id: window.id, element: window.element, frame: frame, mode: mode)
+                )
             }
             frameChecks[window.id] = FrameCheck(
-                target: frame,
-                attempts: 0,
+                state: FrameCheckState(
+                    target: frame,
+                    kind: assignment.kind,
+                    screenFrame: window.screen.frame,
+                    writeState: mode == .skip ? .notNeeded : .pending,
+                    writeToken: token,
+                    createdAt: now,
+                    writeCompletedAt: mode == .skip ? now : nil
+                ),
                 pid: window.id.pid,
                 windowNumber: window.windowNumber,
-                element: window.element,
-                kind: assignment.kind
+                element: window.element
             )
         }
         isApplyingLayout = false
@@ -2444,10 +2454,14 @@ final class WindowTiler {
         if plan.skippedIncompleteState {
             scheduleReconcile(delay: 0.12)
         }
-        dispatchFrameWrites(writesByPID, label: "layout")
+        dispatchFrameWrites(writesByPID, label: "layout", token: token)
         rememberPersistedLayouts(using: windows, limitingToStateKeys: stateKeyLimit)
     }
-    private func dispatchFrameWrites(_ writesByPID: [pid_t: [FrameWrite]], label: StaticString) {
+    private func nextFrameWriteToken() -> Int {
+        frameWriteToken += 1
+        return frameWriteToken
+    }
+    private func dispatchFrameWrites(_ writesByPID: [pid_t: [FrameWrite]], label: StaticString, token: Int?) {
         guard !writesByPID.isEmpty else { return }
         let start = PerformanceTrace.now()
         let group = DispatchGroup()
@@ -2455,9 +2469,9 @@ final class WindowTiler {
         let timeout = accessibilityMessagingTimeout
         for (pid, writes) in writesByPID {
             group.enter()
-            axIO.async(pid: pid) {
+            axIO.async(pid: pid) { [weak self] in
                 var suspension: EnhancedUserInterfaceSuspension?
-                var failed = false
+                var results: [WindowIdentity: Bool] = [:]
                 for write in writes {
                     if suspension == nil {
                         suspension = EnhancedUserInterfaceSuspension(pid: pid, messagingTimeout: timeout)
@@ -2469,13 +2483,17 @@ final class WindowTiler {
                     case .full, .skip:
                         error = WindowFrameApplier.applyFrame(write.frame, to: write.element)
                     }
-                    if error != .success {
-                        failed = true
-                    }
+                    results[write.id] = error == .success
                 }
                 suspension?.restore()
-                if failed {
+                if results.values.contains(false) {
                     failures.record(pid)
+                }
+                if let token {
+                    let completedAt = Date()
+                    DispatchQueue.main.async {
+                        self?.handleFrameWriteCompletion(results, token: token, completedAt: completedAt)
+                    }
                 }
                 group.leave()
             }
@@ -2493,14 +2511,48 @@ final class WindowTiler {
             }
         }
     }
+    private func handleFrameWriteCompletion(_ results: [WindowIdentity: Bool], token: Int, completedAt: Date) {
+        guard !isStopping, !pendingFrameChecks.isEmpty else { return }
+        var states = pendingFrameChecks.mapValues(\.state)
+        let updatedIDs = FrameVerificationPlanner.applyingWriteResults(
+            results,
+            token: token,
+            completedAt: completedAt,
+            to: &states
+        )
+        guard !updatedIDs.isEmpty else { return }
+        for id in updatedIDs {
+            guard let state = states[id] else { continue }
+            pendingFrameChecks[id]?.state = state
+        }
+        scheduleFrameVerification(delay: frameVerificationPolicy.settleDelay)
+    }
     private func minimumSizesByWindowID(for windows: [ManagedWindow]) -> [WindowIdentity: CGSize] {
+        let screens = currentScreenInfos()
+        let largestScreenSize = CGSize(
+            width: screens.map(\.frame.width).max() ?? 0,
+            height: screens.map(\.frame.height).max() ?? 0
+        )
+        if largestScreenSize.width > 0, largestScreenSize.height > 0 {
+            appSizeConstraints.pruneImplausibleMinimums(within: largestScreenSize)
+        }
         var minimums: [WindowIdentity: CGSize] = [:]
         for window in windows {
             guard let bundleID = window.bundleIdentifier,
-                  let learned = appSizeConstraints.minimumSize(forBundleIdentifier: bundleID) else { continue }
+                  appSizeConstraints.minimumSize(forBundleIdentifier: bundleID) != nil else { continue }
+            if !floatingWindowIDs.contains(window.id), stateKey(containing: window.id) != nil {
+                appSizeConstraints.recordObservedFrameSize(
+                    window.frame.size,
+                    forBundleIdentifier: bundleID,
+                    windowKey: window.id
+                )
+            }
+            guard let learned = appSizeConstraints.minimumSize(forBundleIdentifier: bundleID) else { continue }
+            let applicable = AppSizeConstraintsStore.applicableMinimum(learned, within: window.screen.frame.size)
+            guard applicable.width > 0 || applicable.height > 0 else { continue }
             minimums[window.id] = CGSize(
-                width: max(learned.width, TileLayout.minimumWindowFrameSize.width),
-                height: max(learned.height, TileLayout.minimumWindowFrameSize.height)
+                width: max(applicable.width, TileLayout.minimumWindowFrameSize.width),
+                height: max(applicable.height, TileLayout.minimumWindowFrameSize.height)
             )
         }
         return minimums
@@ -3561,24 +3613,35 @@ final class WindowTiler {
 
     private func replaceFrameChecks(with checks: [WindowIdentity: FrameCheck], merging: Bool) {
         frameVerificationGeneration += 1
+        var checks = checks
+        for (id, check) in checks {
+            checks[id]?.state = FrameVerificationPlanner.inheritingClampCandidate(
+                check.state,
+                from: pendingFrameChecks[id]?.state
+            )
+        }
         if merging {
             pendingFrameChecks.merge(checks) { _, new in new }
         } else {
             pendingFrameChecks = checks
         }
-        pendingFrameVerification?.cancel()
+        pendingFrameVerification?.workItem.cancel()
         pendingFrameVerification = nil
         guard !pendingFrameChecks.isEmpty, !isStopping else { return }
-        scheduleFrameVerification(delay: frameVerificationDelay)
+        scheduleFrameVerification(delay: frameVerificationPolicy.settleDelay)
     }
     private func scheduleFrameVerification(delay: TimeInterval) {
         guard !isStopping, !pendingFrameChecks.isEmpty else { return }
-        pendingFrameVerification?.cancel()
+        let deadline = Date().addingTimeInterval(delay)
+        if let pendingFrameVerification, pendingFrameVerification.deadline <= deadline {
+            return
+        }
+        pendingFrameVerification?.workItem.cancel()
         let generation = frameVerificationGeneration
         let workItem = DispatchWorkItem { [weak self] in
             self?.runFrameVerification(generation: generation)
         }
-        pendingFrameVerification = workItem
+        pendingFrameVerification = (workItem, deadline)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
     }
     private func confirmPendingFrameCheck(for element: AXUIElement) {
@@ -3591,17 +3654,19 @@ final class WindowTiler {
         if observed == nil {
             observed = axFrame(of: element)
         }
-        guard let observed else { return }
-        switch FrameVerificationClassifier.classify(target: check.target, observed: observed, tolerance: frameVerificationTolerance) {
-        case .applied:
-            pendingFrameChecks.removeValue(forKey: id)
-            PerformanceTrace.event("frame-confirmed", "pid \(check.pid)")
-            if pendingFrameChecks.isEmpty {
-                pendingFrameVerification?.cancel()
-                pendingFrameVerification = nil
-            }
-        case .clamped, .rejected:
-            scheduleFrameVerification(delay: 0.06)
+        guard let observed,
+              FrameVerificationClassifier.classify(
+                  target: check.state.target,
+                  observed: observed,
+                  tolerance: frameVerificationTolerance
+              ) == .applied else {
+            return
+        }
+        pendingFrameChecks.removeValue(forKey: id)
+        PerformanceTrace.event("frame-confirmed", "pid \(check.pid)")
+        if pendingFrameChecks.isEmpty {
+            pendingFrameVerification?.workItem.cancel()
+            pendingFrameVerification = nil
         }
     }
     private func runFrameVerification(generation: Int) {
@@ -3621,9 +3686,10 @@ final class WindowTiler {
             return
         }
         let snapshot = WindowSnapshotReader.readOnScreenWindows()
-        let verificationStartedAt = Date()
+        let now = Date()
         var reassertions: [(id: WindowIdentity, check: FrameCheck)] = []
         var learnedClamp = false
+        var keptAny = false
         for (id, var check) in pendingFrameChecks {
             var observedViaCG = false
             var observed: CGRect?
@@ -3634,48 +3700,42 @@ final class WindowTiler {
             if observed == nil {
                 observed = axFrame(of: check.element)
             }
-            guard var observed else {
-                check.attempts += 1
-                if check.attempts > maxFrameReassertAttempts {
-                    pendingFrameChecks.removeValue(forKey: id)
-                } else {
-                    pendingFrameChecks[id] = check
-                }
-                continue
+            if let cgObserved = observed, observedViaCG,
+               case .rejected = FrameVerificationClassifier.classify(
+                   target: check.state.target,
+                   observed: cgObserved,
+                   tolerance: frameVerificationTolerance
+               ),
+               let axObserved = axFrame(of: check.element) {
+                observed = axObserved
             }
-            var verdict = FrameVerificationClassifier.classify(
-                target: check.target,
+            let decision = FrameVerificationPlanner.decide(
+                check: check.state,
                 observed: observed,
-                tolerance: frameVerificationTolerance
+                now: now,
+                policy: frameVerificationPolicy
             )
-            if case .rejected = verdict, observedViaCG {
-                if let axObserved = axFrame(of: check.element) {
-                    observed = axObserved
-                    verdict = FrameVerificationClassifier.classify(
-                        target: check.target,
-                        observed: axObserved,
-                        tolerance: frameVerificationTolerance
-                    )
-                }
-            }
-            switch verdict {
+            switch decision {
+            case .keep(let state):
+                check.state = state
+                pendingFrameChecks[id] = check
+                keptAny = true
             case .applied:
                 pendingFrameChecks.removeValue(forKey: id)
-            case .clamped(let observedMinimum):
-                if check.kind == .visibleTile {
-                    recordObservedMinimum(observedMinimum, forPID: check.pid)
+            case .learnClamp(let observedMinimum):
+                pendingFrameChecks.removeValue(forKey: id)
+                if recordObservedMinimum(observedMinimum, forPID: check.pid, screenFrame: check.state.screenFrame) {
                     learnedClamp = true
                 }
-                pendingFrameChecks.removeValue(forKey: id)
-            case .rejected:
-                guard check.attempts < maxFrameReassertAttempts,
-                      reassertBudget.allowsReassert(of: id, now: verificationStartedAt) else {
+            case .reassert(let state):
+                guard reassertBudget.allowsReassert(of: id, now: now) else {
                     pendingFrameChecks.removeValue(forKey: id)
                     continue
                 }
-                check.attempts += 1
-                pendingFrameChecks[id] = check
+                check.state = state
                 reassertions.append((id, check))
+            case .abandon:
+                pendingFrameChecks.removeValue(forKey: id)
             }
         }
         if !reassertions.isEmpty {
@@ -3684,28 +3744,36 @@ final class WindowTiler {
         if learnedClamp {
             scheduleReconcile(delay: 0.01)
         }
-        if !pendingFrameChecks.isEmpty {
+        if keptAny {
             scheduleFrameVerification(delay: frameVerificationRetryDelay)
         }
     }
     private func performReassertions(_ reassertions: [(id: WindowIdentity, check: FrameCheck)]) {
+        guard !reassertions.isEmpty else { return }
         suppressExternalChanges(for: 0.45)
+        let token = nextFrameWriteToken()
         var writesByPID: [pid_t: [FrameWrite]] = [:]
         for (id, check) in reassertions {
-            lastAppliedFrameByWindowID[id] = check.target
-            writesByPID[check.pid, default: []].append(FrameWrite(element: check.element, frame: check.target, mode: .full))
+            var check = check
+            check.state.writeState = .pending
+            check.state.writeToken = token
+            check.state.writeCompletedAt = nil
+            pendingFrameChecks[id] = check
+            lastAppliedFrameByWindowID[id] = check.state.target
+            writesByPID[check.pid, default: []].append(
+                FrameWrite(id: id, element: check.element, frame: check.state.target, mode: .full)
+            )
         }
-        dispatchFrameWrites(writesByPID, label: "reassert")
+        dispatchFrameWrites(writesByPID, label: "reassert", token: token)
+        scheduleFrameVerification(delay: frameVerificationRetryDelay)
     }
-    private func recordObservedMinimum(_ observedMinimum: CGSize, forPID pid: pid_t) {
-        guard let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier else { return }
-        let screens = currentScreenInfos()
-        let width = screens.map(\.frame.width).max() ?? 1440
-        let height = screens.map(\.frame.height).max() ?? 900
-        appSizeConstraints.recordObservedMinimum(
+    @discardableResult
+    private func recordObservedMinimum(_ observedMinimum: CGSize, forPID pid: pid_t, screenFrame: CGRect) -> Bool {
+        guard let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier else { return false }
+        return appSizeConstraints.recordObservedMinimum(
             observedMinimum,
             forBundleIdentifier: bundleID,
-            cappedTo: CGSize(width: width * 0.9, height: height * 0.9)
+            screenSize: screenFrame.size
         )
     }
     private func axFrame(of element: AXUIElement) -> CGRect? {
@@ -3788,21 +3856,20 @@ final class WindowTiler {
             // Only a frame check after a MacPane write can learn a minimum size.
             guard reassertBudget.allowsReassert(of: window.id, now: now) else { continue }
             reassertions.append((window.id, FrameCheck(
-                target: expected,
-                attempts: 1,
+                state: FrameCheckState(
+                    target: expected,
+                    kind: .visibleTile,
+                    screenFrame: screen.frame,
+                    attempts: 1,
+                    writeState: .pending,
+                    createdAt: now
+                ),
                 pid: window.id.pid,
                 windowNumber: window.windowNumber,
-                element: window.element,
-                kind: .visibleTile
+                element: window.element
             )))
         }
-        if !reassertions.isEmpty {
-            performReassertions(reassertions)
-            for (id, check) in reassertions {
-                pendingFrameChecks[id] = check
-            }
-            scheduleFrameVerification(delay: frameVerificationRetryDelay)
-        }
+        performReassertions(reassertions)
     }
     private func currentScreenInfosByKey() -> [String: ScreenInfo] {
         Dictionary(currentScreenInfos().map { ($0.stateKey, $0) }, uniquingKeysWith: { first, _ in first })
@@ -3833,15 +3900,14 @@ final class WindowTiler {
 }
 
 private struct FrameCheck {
-    let target: CGRect
-    var attempts: Int
+    var state: FrameCheckState
     let pid: pid_t
     let windowNumber: Int?
     let element: AXUIElement
-    let kind: WindowFrameAssignment.Kind
 }
 
 private struct FrameWrite {
+    let id: WindowIdentity
     let element: AXUIElement
     let frame: CGRect
     let mode: FrameWriteMode

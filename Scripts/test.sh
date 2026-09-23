@@ -16,6 +16,7 @@ xcrun swiftc \
   "$ROOT_DIR/Sources/MacPane/WindowFrameApplier.swift" \
   "$ROOT_DIR/Sources/MacPane/WindowManageabilityPlanner.swift" \
   "$ROOT_DIR/Sources/MacPane/FrameVerificationClassifier.swift" \
+  "$ROOT_DIR/Sources/MacPane/FrameVerificationPlanner.swift" \
   "$ROOT_DIR/Sources/MacPane/AppSizeConstraintsStore.swift" \
   "$ROOT_DIR/Sources/MacPane/ReassertBudget.swift" \
   "$ROOT_DIR/Sources/MacPane/WindowIdentity.swift" \
@@ -35,5 +36,6 @@ xcrun swiftc \
   "$ROOT_DIR/Sources/MacPane/WindowLayoutPlanner.swift" \
   "$ROOT_DIR/Sources/MacPane/WindowFocusNavigator.swift" \
   "$ROOT_DIR/Tests/SnapGeometryTests.swift" \
+  "$ROOT_DIR/Tests/FrameVerificationTests.swift" \
   -o "$TEST_BIN"
 "$TEST_BIN"

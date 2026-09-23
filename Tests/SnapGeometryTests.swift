@@ -86,6 +86,7 @@ struct SnapGeometryTests {
         testCrossScreenFocusTargetIgnoresInactiveAndFloatingWindows()
         testCrossScreenFocusTargetRequiresAdjacentDisplay()
         testCrossScreenFocusTargetHandlesVerticalArrangement()
+        runFrameVerificationTests()
         print("SnapGeometryTests passed")
     }
     private static func testSnapGeometry() {
@@ -1415,18 +1416,18 @@ struct SnapGeometryTests {
             fail("could not create test defaults suite")
         }
         defaults.removePersistentDomain(forName: suiteName)
-        let cap = CGSize(width: 2000, height: 2000)
+        let screen = CGSize(width: 2000, height: 2000)
         let bundleID = "com.microsoft.teams2"
 
         let store = AppSizeConstraintsStore(defaults: defaults)
-        store.recordObservedMinimum(CGSize(width: 800, height: 0), forBundleIdentifier: bundleID, cappedTo: cap)
+        store.recordObservedMinimum(CGSize(width: 800, height: 0), forBundleIdentifier: bundleID, screenSize: screen)
         guard store.minimumSize(forBundleIdentifier: bundleID) == nil else {
             fail("one observation must have no effect because it could be a misread")
         }
         guard AppSizeConstraintsStore(defaults: defaults).minimumSize(forBundleIdentifier: bundleID) == nil else {
             fail("one observation must not persist")
         }
-        store.recordObservedMinimum(CGSize(width: 802, height: 0), forBundleIdentifier: bundleID, cappedTo: cap)
+        store.recordObservedMinimum(CGSize(width: 802, height: 0), forBundleIdentifier: bundleID, screenSize: screen)
         guard store.minimumSize(forBundleIdentifier: bundleID)?.width ?? 0 >= 800 else {
             fail("two consistent observations must take effect")
         }
@@ -1434,10 +1435,10 @@ struct SnapGeometryTests {
               persisted.width >= 800 else {
             fail("two consistent observations must persist")
         }
-        store.recordObservedMinimum(CGSize(width: 3000, height: 50), forBundleIdentifier: bundleID, cappedTo: cap)
-        store.recordObservedMinimum(CGSize(width: 3000, height: 50), forBundleIdentifier: bundleID, cappedTo: cap)
-        guard let capped = store.minimumSize(forBundleIdentifier: bundleID), capped.width <= cap.width else {
-            fail("observations must be capped")
+        store.recordObservedMinimum(CGSize(width: 3000, height: 50), forBundleIdentifier: bundleID, screenSize: screen)
+        store.recordObservedMinimum(CGSize(width: 3000, height: 50), forBundleIdentifier: bundleID, screenSize: screen)
+        guard let kept = store.minimumSize(forBundleIdentifier: bundleID), kept.width == 802, kept.height == 0 else {
+            fail("observations larger than the screen allows must be rejected, not merged")
         }
         store.reset()
         guard store.minimumSize(forBundleIdentifier: bundleID) == nil,
@@ -1700,10 +1701,10 @@ struct SnapGeometryTests {
             title: title
         )
     }
-    private static func windowID(_ serial: Int, pid: pid_t = 42) -> WindowIdentity {
+    static func windowID(_ serial: Int, pid: pid_t = 42) -> WindowIdentity {
         WindowIdentity(pid: pid, serial: serial)
     }
-    private static func testManagedWindow(
+    static func testManagedWindow(
         id: WindowIdentity,
         screen: ScreenInfo,
         frame: CGRect? = nil,
@@ -1725,7 +1726,7 @@ struct SnapGeometryTests {
     private static func testManagedWindow(serial: Int, frame: CGRect, screen: ScreenInfo) -> ManagedWindow {
         testManagedWindow(id: windowID(serial), screen: screen, frame: frame, scanIndex: serial)
     }
-    private static func screenState(
+    static func screenState(
         _ ids: [WindowIdentity],
         focused: WindowIdentity? = nil,
         zoomed: WindowIdentity? = nil
@@ -1801,7 +1802,7 @@ struct SnapGeometryTests {
             fail("\(message)\nexpected: \(expected)\nactual:   \(actual)")
         }
     }
-    private static func fail(_ message: String) -> Never {
+    static func fail(_ message: String) -> Never {
         fputs("\(message)\n", stderr)
         exit(1)
     }
