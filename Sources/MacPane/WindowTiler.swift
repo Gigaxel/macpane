@@ -47,8 +47,10 @@ final class WindowTiler {
     }
     private var resolving: [WindowID: Resolution] = [:]
     private var awaitingAdoption: [WindowID: ResolvedWindow] = [:]
-    /// On-screen windows that are not managed: panels, dialogs, other apps' utility windows.
-    private var ignored: Set<WindowID> = []
+    /// On-screen windows their app described as something not to tile (a dialog, a panel), with
+    /// the app they belong to. The answer is asked for again when that app next reports a change,
+    /// because a window can start out as one thing and become another.
+    private var ignored: [WindowID: pid_t] = [:]
     private var hasAdoptedInitialWindows = false
     private let maximumResolutionAttempts = 12
     /// How long a batch of new windows waits for the rest of the batch, so launching MacPane or
@@ -131,7 +133,6 @@ final class WindowTiler {
         /// Windows showing on a display whose current Space is an ordinary desktop.
         var onScreen: Set<WindowID>
         let shared: Set<WindowID>
-        let tileableSpaces: Set<UInt64>
 
         func screen(for scope: ScopeKey) -> ScreenInfo? {
             screens.first { $0.scope == scope }
@@ -471,6 +472,7 @@ final class WindowTiler {
         closing.removeValue(forKey: id)
         relocating.removeValue(forKey: id)
         traceStarts.removeValue(forKey: id)
+        accessibilityFocus = accessibilityFocus.filter { $0.value != id }
         if focusedWindow == id { focusedWindow = nil }
         if observedFocus == id { observedFocus = nil }
         if focusIntent?.window == id { focusIntent = nil }
@@ -534,8 +536,7 @@ final class WindowTiler {
             windows: listing.windows,
             byID: byID,
             onScreen: onScreen,
-            shared: listing.shared,
-            tileableSpaces: tileableSpaces
+            shared: listing.shared
         )
     }
 
@@ -604,8 +605,8 @@ final class WindowTiler {
     /// tab switch is replacing them.
     @discardableResult
     private func removeDepartedWindows(_ world: World) -> Set<WindowID> {
-        for id in ignored where world.byID[id] == nil {
-            ignored.remove(id)
+        for id in ignored.keys where world.byID[id] == nil {
+            ignored.removeValue(forKey: id)
         }
         for id in resolving.keys where world.byID[id] == nil {
             resolving.removeValue(forKey: id)
@@ -614,8 +615,12 @@ final class WindowTiler {
             awaitingAdoption.removeValue(forKey: id)
         }
         for (id, deadline) in closing where world.byID[id] == nil || deadline <= world.now {
-            // Gone, or the app announced a close that never happened.
             closing.removeValue(forKey: id)
+            if world.byID[id] != nil {
+                // The app destroyed the element but the window is still here: it rebuilt its
+                // windows. The handle is dead, so let go and pick the window up again.
+                forget(id)
+            }
         }
         let missing = model.windows.keys.filter { world.byID[$0] == nil }
         guard !missing.isEmpty else { return [] }
@@ -654,7 +659,7 @@ final class WindowTiler {
             + awaitingAdoption.filter { $0.value.pid == pid }.map(\.key)
         let unresolved = world.windows.contains { window in
             window.pid == pid && window.isStandard && world.onScreen.contains(window.id) &&
-                !model.isManaged(window.id) && !ignored.contains(window.id) &&
+                !model.isManaged(window.id) && ignored[window.id] == nil &&
                 FramePlanner.approximatelyEqual(window.bounds, bounds)
         }
         return unresolved || candidates.contains { candidate in
@@ -685,7 +690,7 @@ final class WindowTiler {
         var earliestRetry: UInt64?
         for window in world.windows where window.isStandard && world.onScreen.contains(window.id) {
             let id = window.id
-            guard !model.isManaged(id), !ignored.contains(id), awaitingAdoption[id] == nil else { continue }
+            guard !model.isManaged(id), ignored[id] == nil, awaitingAdoption[id] == nil else { continue }
             if var resolution = resolving[id] {
                 guard !resolution.isInFlight else { continue }
                 guard resolution.nextAttemptAt <= world.now else {
@@ -730,7 +735,7 @@ final class WindowTiler {
                 )
             case .excluded:
                 resolving.removeValue(forKey: id)
-                ignored.insert(id)
+                ignored[id] = pending.pid
                 PerformanceTrace.event("window-excluded", "window \(id) pid \(pending.pid)")
             case .unavailable:
                 // Apps publish a window to Accessibility a little after the WindowServer shows it.
@@ -751,6 +756,9 @@ final class WindowTiler {
 
     /// An app that just notified or came forward gets another chance right away.
     private func retryResolutions(forPID pid: pid_t) {
+        for (id, owner) in ignored where owner == pid {
+            ignored.removeValue(forKey: id)
+        }
         for (id, resolution) in resolving where resolution.pid == pid && !resolution.isInFlight {
             resolving[id]?.nextAttemptAt = 0
             if resolution.attempts >= maximumResolutionAttempts {
@@ -934,7 +942,10 @@ final class WindowTiler {
         }
         // Focus arriving on a parked window (Cmd-Tab, a Dock click, a notification) brings its
         // workspace along instead of leaving the keyboard in a window nobody can see.
+        // Only when focus left a window that is still there. When that window closed or was
+        // minimized, macOS hands focus to the app's next window, and nobody asked to go to it.
         if focusIntent == nil, slide == nil, let front, front != observedFocus,
+           let previous = observedFocus, world.onScreen.contains(previous),
            let key = model.workspace(of: front), !model.isShowing(key),
            let screen = world.screen(for: key.scope) {
             // This runs inside a reconcile, which goes on to lay out the workspace it just showed.
@@ -1065,6 +1076,11 @@ final class WindowTiler {
         guard isRunning, !isStopping else { return }
         let now = PerformanceTrace.now()
         for outcome in outcomes where frameRecords[outcome.window] != nil {
+            if outcome.error == .invalidUIElement {
+                // The handle no longer names a window. Forgotten, it is found again with a new one.
+                forget(outcome.window)
+                continue
+            }
             FramePlanner.absorb(token: outcome.token, error: outcome.error, record: &frameRecords[outcome.window], now: now)
         }
         if let started = commandStartedAt {
