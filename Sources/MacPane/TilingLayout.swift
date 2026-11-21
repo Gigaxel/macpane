@@ -41,24 +41,23 @@ struct TileSlot: Equatable {
             height: max(1, frame.height.rounded(.toNearestOrAwayFromZero))
         )
     }
-    static func normalized(from frame: CGRect, in screen: CGRect) -> TileSlot {
-        guard screen.width > 0, screen.height > 0 else {
-            return TileSlot(x: 0, y: 0, width: 1, height: 1)
-        }
-        return TileSlot(
-            x: clamped((frame.minX - screen.minX) / screen.width, minimum: 0, maximum: 1),
-            y: clamped((frame.minY - screen.minY) / screen.height, minimum: 0, maximum: 1),
-            width: clamped(frame.width / screen.width, minimum: TileLayout.minimumSlotSize, maximum: 1),
-            height: clamped(frame.height / screen.height, minimum: TileLayout.minimumSlotSize, maximum: 1)
-        ).clampedToUnit()
-    }
-    private func clampedToUnit() -> TileSlot {
-        var slot = self
-        slot.width = clamped(slot.width, minimum: TileLayout.minimumSlotSize, maximum: 1)
-        slot.height = clamped(slot.height, minimum: TileLayout.minimumSlotSize, maximum: 1)
-        slot.x = clamped(slot.x, minimum: 0, maximum: max(0, 1 - slot.width))
-        slot.y = clamped(slot.y, minimum: 0, maximum: max(0, 1 - slot.height))
-        return slot
+    /// Inverse of `frame(in:gap:smartOuterGap:)`: the slot a frame occupies, given the slot it was
+    /// last rendered from. That slot says which edges carry half an inner gap, so an untouched edge
+    /// maps back to exactly where it was instead of reading as a small resize.
+    static func observed(from frame: CGRect, in screen: CGRect, gap: CGFloat, rendered: TileSlot) -> TileSlot {
+        let gap = max(0, gap)
+        let usable = screen.insetBy(dx: gap, dy: gap)
+        guard usable.width > 0, usable.height > 0 else { return rendered }
+        let half = gap / 2
+        let left = frame.minX - (rendered.x > TileLayout.epsilon ? half : 0)
+        let right = frame.maxX + (rendered.maxX < 1 - TileLayout.epsilon ? half : 0)
+        let top = frame.minY - (rendered.y > TileLayout.epsilon ? half : 0)
+        let bottom = frame.maxY + (rendered.maxY < 1 - TileLayout.epsilon ? half : 0)
+        let x = clamped((left - usable.minX) / usable.width, minimum: 0, maximum: 1)
+        let y = clamped((top - usable.minY) / usable.height, minimum: 0, maximum: 1)
+        let maxX = clamped((right - usable.minX) / usable.width, minimum: 0, maximum: 1)
+        let maxY = clamped((bottom - usable.minY) / usable.height, minimum: 0, maximum: 1)
+        return TileSlot(x: x, y: y, width: max(0, maxX - x), height: max(0, maxY - y))
     }
 }
 enum TileAxis {
@@ -85,24 +84,9 @@ enum TileLayout {
     static let epsilon: CGFloat = 0.001
     static let resizeStep: CGFloat = 0.055
     static let minimumSplitRatio: CGFloat = 0.12
-    static let minimumSlotSize: CGFloat = 0.04
     static let resizeReflectionThreshold: CGFloat = 0.018
     static let minimumWindowFrameSize = CGSize(width: 180, height: 120)
     static let minimumAccommodationRatio: CGFloat = 0.02
-    static func maximumSpatialTileCount(
-        in screen: CGRect,
-        gap: CGFloat,
-        minimumFrameSize: CGSize = TileLayout.minimumWindowFrameSize
-    ) -> Int {
-        guard screen.width > 0, screen.height > 0,
-              minimumFrameSize.width > 0, minimumFrameSize.height > 0 else {
-            return 1
-        }
-        let gap = max(0, gap)
-        let maxColumns = floor((screen.width - gap) / (minimumFrameSize.width + gap))
-        let maxRows = floor((screen.height - gap) / (minimumFrameSize.height + gap))
-        return max(1, Int(maxColumns) * Int(maxRows))
-    }
 }
 extension SnapDirection {
     var splitAxis: TileAxis {
@@ -131,7 +115,6 @@ struct BSPTree<ID: Hashable> {
     var isEmpty: Bool { root == nil }
     var ids: [ID] { root?.ids ?? [] }
     var firstID: ID? { ids.first }
-    var tileCount: Int { ids.count }
     init() {}
     private init(root: BSPNode<ID>?) {
         self.root = root
@@ -142,51 +125,37 @@ struct BSPTree<ID: Hashable> {
     func contains(_ id: ID) -> Bool {
         root?.contains(id) ?? false
     }
-    mutating func replaceIDs(_ replacements: [ID: ID]) -> Bool {
-        guard !replacements.isEmpty, let currentRoot = root else { return false }
-        var changed = false
-        let nextRoot = currentRoot.mapIDs { id in
-            let replacement = replacements[id] ?? id
-            if replacement != id {
-                changed = true
-            }
-            return replacement
-        }
-        guard changed else { return false }
-        let nextIDs = nextRoot.ids
-        guard Set(nextIDs).count == nextIDs.count else { return false }
-        root = nextRoot
-        return true
-    }
-    func compactMapIDs<NewID: Hashable>(_ transform: (ID) -> NewID?) -> BSPTree<NewID>? {
-        guard let root else { return BSPTree<NewID>() }
-        guard let nextRoot = root.compactMapIDs(transform) else { return nil }
-        let nextIDs = nextRoot.ids
-        guard Set(nextIDs).count == nextIDs.count else { return nil }
-        return BSPTree<NewID>(root: nextRoot)
-    }
-    func slot(for id: ID) -> TileSlot? {
-        slots()[id]
-    }
-    func slots() -> [ID: TileSlot] {
+    /// Every read and edit takes a `hidden` set: leaves that keep their place in the tree but take no
+    /// space right now (minimized, hidden app, native fullscreen). A split with nothing visible on
+    /// one side hands its whole slot to the other side and cannot be resized or rotated.
+    func slots(hidden: Set<ID> = []) -> [ID: TileSlot] {
         guard let root else { return [:] }
         var output: [ID: TileSlot] = [:]
-        root.collectSlots(in: TileSlot(x: 0, y: 0, width: 1, height: 1), into: &output)
+        root.collectSlots(in: TileSlot(x: 0, y: 0, width: 1, height: 1), hidden: hidden) { id, slot in
+            output[id] = slot
+        }
         return output
     }
-    func slotList() -> [(id: ID, slot: TileSlot)] {
+    func slotList(hidden: Set<ID> = []) -> [(id: ID, slot: TileSlot)] {
         guard let root else { return [] }
         var output: [(id: ID, slot: TileSlot)] = []
-        root.collectSlotList(in: TileSlot(x: 0, y: 0, width: 1, height: 1), into: &output)
+        root.collectSlots(in: TileSlot(x: 0, y: 0, width: 1, height: 1), hidden: hidden) { id, slot in
+            output.append((id, slot))
+        }
         return output
     }
 
-    func slotsAccommodating(minimums: [ID: CGSize], in screenFrame: CGRect, gap: CGFloat) -> [ID: TileSlot] {
+    func slotsAccommodating(
+        minimums: [ID: CGSize],
+        in screenFrame: CGRect,
+        gap: CGFloat,
+        hidden: Set<ID> = []
+    ) -> [ID: TileSlot] {
         guard let root else { return [:] }
-        guard !minimums.isEmpty else { return slots() }
+        guard !minimums.isEmpty else { return slots(hidden: hidden) }
         let gap = max(0, gap)
         let usable = screenFrame.insetBy(dx: gap, dy: gap)
-        guard usable.width > 0, usable.height > 0 else { return slots() }
+        guard usable.width > 0, usable.height > 0 else { return slots(hidden: hidden) }
         var output: [ID: TileSlot] = [:]
         root.collectAccommodatedSlots(
             in: TileSlot(x: 0, y: 0, width: 1, height: 1),
@@ -194,28 +163,27 @@ struct BSPTree<ID: Hashable> {
             minimums: minimums,
             defaultMinimum: TileLayout.minimumWindowFrameSize,
             gap: gap,
+            hidden: hidden,
             into: &output
         )
         return output
     }
-    mutating func removeMissing(keeping liveIDs: Set<ID>) {
-        for id in ids where !liveIDs.contains(id) {
-            remove(id)
-        }
-    }
     mutating func remove(_ id: ID) {
         root = root?.removing(id)
     }
-    mutating func insert(_ id: ID, near requestedTarget: ID?, placement: TilePlacement = .automatic) {
+    mutating func insert(
+        _ id: ID,
+        near requestedTarget: ID?,
+        placement: TilePlacement = .automatic,
+        hidden: Set<ID> = []
+    ) {
         guard root != nil else {
             root = .leaf(id)
             return
         }
         guard !contains(id) else { return }
-        let currentSlots = slots()
-        let targetID = resolvedTargetID(requestedTarget, slots: currentSlots)
-        guard let targetID else {
-            root = .leaf(id)
+        let currentSlots = slots(hidden: hidden)
+        guard let targetID = resolvedTargetID(requestedTarget, hidden: hidden) else {
             return
         }
         let targetSlot = currentSlots[targetID] ?? TileSlot(x: 0, y: 0, width: 1, height: 1)
@@ -231,22 +199,18 @@ struct BSPTree<ID: Hashable> {
         }
         root = root?.inserting(id, near: targetID, axis: axis, newFirst: newFirst)
     }
-    mutating func move(_ id: ID, onto target: ID, placement: TilePlacement) -> Bool {
+    mutating func move(_ id: ID, onto target: ID, placement: TilePlacement, hidden: Set<ID> = []) -> Bool {
         guard id != target, contains(id), contains(target) else { return false }
         if placement == .swap {
             return swap(id, target)
         }
         remove(id)
-        guard contains(target) else {
-            insert(id, near: nil, placement: .automatic)
-            return true
-        }
-        insert(id, near: target, placement: placement)
+        insert(id, near: target, placement: placement, hidden: hidden)
         return true
     }
-    func largestLeafID() -> ID? {
+    func largestLeafID(hidden: Set<ID> = []) -> ID? {
         var best: (id: ID, slot: TileSlot)?
-        for item in slotList() {
+        for item in slotList(hidden: hidden) {
             guard let current = best else {
                 best = item
                 continue
@@ -257,8 +221,8 @@ struct BSPTree<ID: Hashable> {
         }
         return best?.id
     }
-    func neighborID(from focusedID: ID, direction: SnapDirection) -> ID? {
-        let allSlots = slotList()
+    func neighborID(from focusedID: ID, direction: SnapDirection, hidden: Set<ID> = []) -> ID? {
+        let allSlots = slotList(hidden: hidden)
         guard let focused = allSlots.first(where: { $0.id == focusedID })?.slot else { return nil }
         let source = sideCenter(of: focused, leaving: direction)
         var best: (id: ID, score: CGFloat, overlap: CGFloat)?
@@ -277,6 +241,15 @@ struct BSPTree<ID: Hashable> {
         }
         return best?.id
     }
+    /// Puts `replacement` in the leaf `id` occupies.
+    mutating func replace(_ id: ID, with replacement: ID) -> Bool {
+        guard id != replacement, let currentRoot = root,
+              currentRoot.contains(id), !currentRoot.contains(replacement) else {
+            return false
+        }
+        root = currentRoot.mapIDs { $0 == id ? replacement : $0 }
+        return true
+    }
     mutating func swap(_ firstID: ID, _ secondID: ID) -> Bool {
         guard firstID != secondID, let currentRoot = root,
               currentRoot.contains(firstID), currentRoot.contains(secondID) else {
@@ -289,35 +262,37 @@ struct BSPTree<ID: Hashable> {
         }
         return true
     }
-    mutating func resize(focusedID: ID, direction: SnapDirection) -> Bool {
+    mutating func resize(focusedID: ID, direction: SnapDirection, hidden: Set<ID> = []) -> Bool {
         guard var currentRoot = root, currentRoot.contains(focusedID) else { return false }
         let changed = currentRoot.resize(
             focusedID: focusedID,
             direction: direction,
             step: TileLayout.resizeStep,
-            minimumRatio: TileLayout.minimumSplitRatio
+            minimumRatio: TileLayout.minimumSplitRatio,
+            hidden: hidden
         )
         if changed {
             root = currentRoot
         }
         return changed
     }
-    mutating func reflectResize(focusedID: ID, observedSlot: TileSlot) -> Bool {
+    mutating func reflectResize(focusedID: ID, observedSlot: TileSlot, hidden: Set<ID> = []) -> Bool {
         guard var currentRoot = root, currentRoot.contains(focusedID) else { return false }
         let changed = currentRoot.reflectResize(
             focusedID: focusedID,
             observedSlot: observedSlot,
             in: TileSlot(x: 0, y: 0, width: 1, height: 1),
-            minimumRatio: TileLayout.minimumSplitRatio
+            minimumRatio: TileLayout.minimumSplitRatio,
+            hidden: hidden
         )
         if changed {
             root = currentRoot
         }
         return changed
     }
-    mutating func toggleOrientation(focusedID: ID) -> Bool {
+    mutating func toggleOrientation(focusedID: ID, hidden: Set<ID> = []) -> Bool {
         guard var currentRoot = root, currentRoot.contains(focusedID) else { return false }
-        let changed = currentRoot.toggleOrientation(containing: focusedID)
+        let changed = currentRoot.toggleOrientation(containing: focusedID, hidden: hidden)
         if changed {
             root = currentRoot
         }
@@ -327,24 +302,11 @@ struct BSPTree<ID: Hashable> {
         guard !ids.isEmpty else { return }
         root = BSPNode.balanced(from: ids[...], axis: .horizontal)
     }
-    mutating func limitTileCount(to maxCount: Int) -> [ID] {
-        guard maxCount > 0 else {
-            let removed = ids
-            root = nil
-            return removed
-        }
-        let currentIDs = ids
-        guard currentIDs.count > maxCount else { return [] }
-        let kept = Array(currentIDs.prefix(maxCount))
-        let removed = Array(currentIDs.dropFirst(maxCount))
-        root = BSPNode.balanced(from: kept[...], axis: .horizontal)
-        return removed
-    }
-    private func resolvedTargetID(_ requested: ID?, slots _: [ID: TileSlot]) -> ID? {
-        if let requested, contains(requested) {
+    private func resolvedTargetID(_ requested: ID?, hidden: Set<ID>) -> ID? {
+        if let requested, contains(requested), !hidden.contains(requested) {
             return requested
         }
-        return largestLeafID() ?? firstID
+        return largestLeafID(hidden: hidden) ?? firstID
     }
     private func sideCenter(of slot: TileSlot, leaving direction: SnapDirection) -> CGPoint {
         switch direction {
@@ -415,35 +377,69 @@ private indirect enum BSPNode<ID: Hashable> {
         )
         return .split(axis: axis, ratio: ratio, first: first, second: second)
     }
-    func collectSlots(in slot: TileSlot, into output: inout [ID: TileSlot]) {
+    func hasVisibleLeaf(_ hidden: Set<ID>) -> Bool {
+        guard !hidden.isEmpty else { return true }
         switch self {
         case .leaf(let id):
-            output[id] = slot
-        case .split(let axis, let ratio, let first, let second):
-            let (firstSlot, secondSlot) = splitSlots(slot, axis: axis, ratio: ratio)
-            first.collectSlots(in: firstSlot, into: &output)
-            second.collectSlots(in: secondSlot, into: &output)
+            return !hidden.contains(id)
+        case .split(_, _, let first, let second):
+            return first.hasVisibleLeaf(hidden) || second.hasVisibleLeaf(hidden)
         }
     }
-    func collectSlotList(in slot: TileSlot, into output: inout [(id: ID, slot: TileSlot)]) {
+    /// The slots the two children occupy, or nil for a child with nothing visible in it.
+    func childSlots(
+        of slot: TileSlot,
+        axis: TileAxis,
+        ratio: CGFloat,
+        first: BSPNode<ID>,
+        second: BSPNode<ID>,
+        hidden: Set<ID>
+    ) -> (first: TileSlot?, second: TileSlot?) {
+        switch (first.hasVisibleLeaf(hidden), second.hasVisibleLeaf(hidden)) {
+        case (true, true):
+            let (firstSlot, secondSlot) = splitSlots(slot, axis: axis, ratio: ratio)
+            return (firstSlot, secondSlot)
+        case (true, false):
+            return (slot, nil)
+        case (false, true):
+            return (nil, slot)
+        case (false, false):
+            return (nil, nil)
+        }
+    }
+    func collectSlots(in slot: TileSlot, hidden: Set<ID>, _ emit: (ID, TileSlot) -> Void) {
         switch self {
         case .leaf(let id):
-            output.append((id, slot))
+            if !hidden.contains(id) {
+                emit(id, slot)
+            }
         case .split(let axis, let ratio, let first, let second):
-            let (firstSlot, secondSlot) = splitSlots(slot, axis: axis, ratio: ratio)
-            first.collectSlotList(in: firstSlot, into: &output)
-            second.collectSlotList(in: secondSlot, into: &output)
+            let slots = childSlots(of: slot, axis: axis, ratio: ratio, first: first, second: second, hidden: hidden)
+            if let firstSlot = slots.first {
+                first.collectSlots(in: firstSlot, hidden: hidden, emit)
+            }
+            if let secondSlot = slots.second {
+                second.collectSlots(in: secondSlot, hidden: hidden, emit)
+            }
         }
     }
 
-    func requiredMinimumSize(minimums: [ID: CGSize], defaultMinimum: CGSize, gap: CGFloat) -> CGSize {
+    /// The space a subtree needs, measured in tile-slot pixels. A frame gives up half a gap on each
+    /// side it shares, so one full gap per leaf is the bound that holds wherever the leaf sits.
+    func requiredMinimumSize(
+        minimums: [ID: CGSize],
+        defaultMinimum: CGSize,
+        gap: CGFloat,
+        hidden: Set<ID>
+    ) -> CGSize {
         switch self {
         case .leaf(let id):
+            guard !hidden.contains(id) else { return .zero }
             let minimum = minimums[id] ?? defaultMinimum
             return CGSize(width: minimum.width + gap, height: minimum.height + gap)
         case .split(let axis, _, let first, let second):
-            let firstMinimum = first.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap)
-            let secondMinimum = second.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap)
+            let firstMinimum = first.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap, hidden: hidden)
+            let secondMinimum = second.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap, hidden: hidden)
             switch axis {
             case .horizontal:
                 return CGSize(
@@ -465,14 +461,34 @@ private indirect enum BSPNode<ID: Hashable> {
         minimums: [ID: CGSize],
         defaultMinimum: CGSize,
         gap: CGFloat,
+        hidden: Set<ID>,
         into output: inout [ID: TileSlot]
     ) {
         switch self {
         case .leaf(let id):
-            output[id] = slot
+            if !hidden.contains(id) {
+                output[id] = slot
+            }
         case .split(let axis, let ratio, let first, let second):
-            let firstMinimum = first.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap)
-            let secondMinimum = second.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap)
+            let firstVisible = first.hasVisibleLeaf(hidden)
+            let secondVisible = second.hasVisibleLeaf(hidden)
+            guard firstVisible, secondVisible else {
+                let only = firstVisible ? first : second
+                if firstVisible || secondVisible {
+                    only.collectAccommodatedSlots(
+                        in: slot,
+                        unitSize: unitSize,
+                        minimums: minimums,
+                        defaultMinimum: defaultMinimum,
+                        gap: gap,
+                        hidden: hidden,
+                        into: &output
+                    )
+                }
+                return
+            }
+            let firstMinimum = first.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap, hidden: hidden)
+            let secondMinimum = second.requiredMinimumSize(minimums: minimums, defaultMinimum: defaultMinimum, gap: gap, hidden: hidden)
             let availablePixels: CGFloat
             let firstMinimumPixels: CGFloat
             let secondMinimumPixels: CGFloat
@@ -512,6 +528,7 @@ private indirect enum BSPNode<ID: Hashable> {
                 minimums: minimums,
                 defaultMinimum: defaultMinimum,
                 gap: gap,
+                hidden: hidden,
                 into: &output
             )
             second.collectAccommodatedSlots(
@@ -520,6 +537,7 @@ private indirect enum BSPNode<ID: Hashable> {
                 minimums: minimums,
                 defaultMinimum: defaultMinimum,
                 gap: gap,
+                hidden: hidden,
                 into: &output
             )
         }
@@ -579,100 +597,90 @@ private indirect enum BSPNode<ID: Hashable> {
             return .split(axis: axis, ratio: ratio, first: first.mapIDs(transform), second: second.mapIDs(transform))
         }
     }
-    func compactMapIDs<NewID: Hashable>(_ transform: (ID) -> NewID?) -> BSPNode<NewID>? {
-        switch self {
-        case .leaf(let id):
-            guard let nextID = transform(id) else { return nil }
-            return .leaf(nextID)
-        case .split(let axis, let ratio, let first, let second):
-            guard let nextFirst = first.compactMapIDs(transform),
-                  let nextSecond = second.compactMapIDs(transform) else {
-                return nil
-            }
-            return .split(axis: axis, ratio: ratio, first: nextFirst, second: nextSecond)
-        }
-    }
-    mutating func resize(focusedID: ID, direction: SnapDirection, step: CGFloat, minimumRatio: CGFloat) -> Bool {
+    mutating func resize(
+        focusedID: ID,
+        direction: SnapDirection,
+        step: CGFloat,
+        minimumRatio: CGFloat,
+        hidden: Set<ID>
+    ) -> Bool {
         switch self {
         case .leaf:
             return false
         case .split(let axis, var ratio, var first, var second):
-            if first.contains(focusedID) {
-                if first.resize(focusedID: focusedID, direction: direction, step: step, minimumRatio: minimumRatio) {
-                    self = .split(axis: axis, ratio: ratio, first: first, second: second)
-                    return true
-                }
-                return updateRatio(&ratio, direction: direction, step: step, axis: axis, first: first, second: second, minimumRatio: minimumRatio)
+            let isInFirst = first.contains(focusedID)
+            guard isInFirst || second.contains(focusedID) else { return false }
+            let resizedChild = isInFirst
+                ? first.resize(focusedID: focusedID, direction: direction, step: step, minimumRatio: minimumRatio, hidden: hidden)
+                : second.resize(focusedID: focusedID, direction: direction, step: step, minimumRatio: minimumRatio, hidden: hidden)
+            if resizedChild {
+                self = .split(axis: axis, ratio: ratio, first: first, second: second)
+                return true
             }
-            if second.contains(focusedID) {
-                if second.resize(focusedID: focusedID, direction: direction, step: step, minimumRatio: minimumRatio) {
-                    self = .split(axis: axis, ratio: ratio, first: first, second: second)
-                    return true
-                }
-                return updateRatio(&ratio, direction: direction, step: step, axis: axis, first: first, second: second, minimumRatio: minimumRatio)
-            }
-            return false
+            guard first.hasVisibleLeaf(hidden), second.hasVisibleLeaf(hidden) else { return false }
+            return updateRatio(&ratio, direction: direction, step: step, axis: axis, first: first, second: second, minimumRatio: minimumRatio)
         }
     }
-    mutating func reflectResize(focusedID: ID, observedSlot: TileSlot, in slot: TileSlot, minimumRatio: CGFloat) -> Bool {
+    mutating func reflectResize(
+        focusedID: ID,
+        observedSlot: TileSlot,
+        in slot: TileSlot,
+        minimumRatio: CGFloat,
+        hidden: Set<ID>
+    ) -> Bool {
         switch self {
         case .leaf:
             return false
         case .split(let axis, var ratio, var first, var second):
-            let (firstSlot, secondSlot) = splitSlots(slot, axis: axis, ratio: ratio)
-            if first.contains(focusedID) {
-                if first.reflectResize(focusedID: focusedID, observedSlot: observedSlot, in: firstSlot, minimumRatio: minimumRatio) {
-                    self = .split(axis: axis, ratio: ratio, first: first, second: second)
-                    return true
-                }
-                let reflectedRatio: CGFloat
-                switch axis {
-                case .horizontal:
-                    reflectedRatio = (observedSlot.maxX - slot.x) / max(TileLayout.epsilon, slot.width)
-                case .vertical:
-                    reflectedRatio = (observedSlot.maxY - slot.y) / max(TileLayout.epsilon, slot.height)
-                }
-                return setReflectedRatio(reflectedRatio, axis: axis, ratio: &ratio, first: first, second: second, minimumRatio: minimumRatio)
+            let isInFirst = first.contains(focusedID)
+            guard isInFirst || second.contains(focusedID) else { return false }
+            let slots = childSlots(of: slot, axis: axis, ratio: ratio, first: first, second: second, hidden: hidden)
+            guard let childSlot = isInFirst ? slots.first : slots.second else { return false }
+            let reflectedChild = isInFirst
+                ? first.reflectResize(focusedID: focusedID, observedSlot: observedSlot, in: childSlot, minimumRatio: minimumRatio, hidden: hidden)
+                : second.reflectResize(focusedID: focusedID, observedSlot: observedSlot, in: childSlot, minimumRatio: minimumRatio, hidden: hidden)
+            if reflectedChild {
+                self = .split(axis: axis, ratio: ratio, first: first, second: second)
+                return true
             }
-            if second.contains(focusedID) {
-                if second.reflectResize(focusedID: focusedID, observedSlot: observedSlot, in: secondSlot, minimumRatio: minimumRatio) {
-                    self = .split(axis: axis, ratio: ratio, first: first, second: second)
-                    return true
-                }
-                let reflectedRatio: CGFloat
-                switch axis {
-                case .horizontal:
-                    reflectedRatio = (observedSlot.x - slot.x) / max(TileLayout.epsilon, slot.width)
-                case .vertical:
-                    reflectedRatio = (observedSlot.y - slot.y) / max(TileLayout.epsilon, slot.height)
-                }
-                return setReflectedRatio(reflectedRatio, axis: axis, ratio: &ratio, first: first, second: second, minimumRatio: minimumRatio)
+            guard slots.first != nil, slots.second != nil else { return false }
+            // The shared edge is the focused window's far edge when it is the first child and
+            // its near edge when it is the second.
+            let sharedEdge: CGFloat
+            switch (axis, isInFirst) {
+            case (.horizontal, true): sharedEdge = observedSlot.maxX - slot.x
+            case (.horizontal, false): sharedEdge = observedSlot.x - slot.x
+            case (.vertical, true): sharedEdge = observedSlot.maxY - slot.y
+            case (.vertical, false): sharedEdge = observedSlot.y - slot.y
             }
-            return false
+            let extent = axis == .horizontal ? slot.width : slot.height
+            return setReflectedRatio(
+                sharedEdge / max(TileLayout.epsilon, extent),
+                axis: axis,
+                ratio: &ratio,
+                first: first,
+                second: second,
+                minimumRatio: minimumRatio
+            )
         }
     }
-    mutating func toggleOrientation(containing focusedID: ID) -> Bool {
+    mutating func toggleOrientation(containing focusedID: ID, hidden: Set<ID>) -> Bool {
         switch self {
         case .leaf:
             return false
         case .split(let axis, let ratio, var first, var second):
-            if first.contains(focusedID) {
-                if first.toggleOrientation(containing: focusedID) {
-                    self = .split(axis: axis, ratio: ratio, first: first, second: second)
-                    return true
-                }
-                self = .split(axis: axis.toggled, ratio: ratio, first: first, second: second)
+            let isInFirst = first.contains(focusedID)
+            guard isInFirst || second.contains(focusedID) else { return false }
+            let toggledChild = isInFirst
+                ? first.toggleOrientation(containing: focusedID, hidden: hidden)
+                : second.toggleOrientation(containing: focusedID, hidden: hidden)
+            if toggledChild {
+                self = .split(axis: axis, ratio: ratio, first: first, second: second)
                 return true
             }
-            if second.contains(focusedID) {
-                if second.toggleOrientation(containing: focusedID) {
-                    self = .split(axis: axis, ratio: ratio, first: first, second: second)
-                    return true
-                }
-                self = .split(axis: axis.toggled, ratio: ratio, first: first, second: second)
-                return true
-            }
-            return false
+            guard first.hasVisibleLeaf(hidden), second.hasVisibleLeaf(hidden) else { return false }
+            self = .split(axis: axis.toggled, ratio: ratio, first: first, second: second)
+            return true
         }
     }
     private mutating func updateRatio(

@@ -5,7 +5,6 @@ import SwiftUI
 
 final class SettingsStore: ObservableObject {
     let gapRange: ClosedRange<Int> = 0...48
-    let workspaceCountRange: ClosedRange<Int> = 1...9
     private let tiler: WindowTiler
 
     init(tiler: WindowTiler) {
@@ -16,6 +15,9 @@ final class SettingsStore: ObservableObject {
             name: UserDefaults.didChangeNotification,
             object: nil
         )
+        tiler.onStateChange = { [weak self] in
+            self?.objectWillChange.send()
+        }
     }
 
     deinit {
@@ -77,11 +79,6 @@ final class SettingsStore: ObservableObject {
     func setAutoFloatHeightThreshold(_ value: Int) {
         objectWillChange.send()
         tiler.setAutoFloatHeightThreshold(value)
-    }
-
-    func resetLearnedAppSizeLimits() {
-        objectWillChange.send()
-        tiler.resetLearnedAppSizeConstraints()
     }
 
     func createWorkspace() {

@@ -53,7 +53,11 @@ private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
 final class WorkspaceOverviewOverlay {
     private var panel: OverlayPanel?
     private var onDismiss: (() -> Void)?
-    private var overview: WorkspaceOverview?
+    private(set) var overview: WorkspaceOverview?
+    private(set) var isRenaming = false
+    private var clickOutsideMonitor: Any?
+    private var clickInsideMonitor: Any?
+    private var dismissalObservers: [NSObjectProtocol] = []
     var workspaceCount: Int? {
         overview?.workspaceCount
     }
@@ -70,6 +74,7 @@ final class WorkspaceOverviewOverlay {
         panel.contentView = view
         panel.ignoresMouseEvents = false
         panel.presentWithSpringFade(frame: frame)
+        installDismissalMonitors()
     }
     @discardableResult
     func beginRename(onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) -> Bool {
@@ -78,6 +83,7 @@ final class WorkspaceOverviewOverlay {
         panel.ignoresMouseEvents = false
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
+        isRenaming = true
         view.beginRenaming(
             text: overview.activeWorkspaceName ?? "",
             onCommit: { [weak self] name in
@@ -95,12 +101,15 @@ final class WorkspaceOverviewOverlay {
         panel?.contentView as? WorkspaceOverviewView
     }
     private func finishRenameMode() {
+        isRenaming = false
         overviewView?.endRenaming()
     }
     func hide() {
         hide(notify: true)
     }
     private func hide(notify: Bool) {
+        removeDismissalMonitors()
+        isRenaming = false
         overviewView?.endRenaming()
         panel?.ignoresMouseEvents = true
         panel?.orderOut(nil)
@@ -114,6 +123,54 @@ final class WorkspaceOverviewOverlay {
         hide(notify: true)
         panel?.close()
         panel = nil
+    }
+    /// While the overview is up its bare number, R and Escape keys are global shortcuts. It has to
+    /// close as soon as attention goes anywhere else, or those keys stay taken from every app.
+    private func installDismissalMonitors() {
+        clickOutsideMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] _ in
+            self?.hide()
+        }
+        clickInsideMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] event in
+            if let self, event.window !== self.panel {
+                self.hide()
+            }
+            return event
+        }
+        dismissalObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            guard app?.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+            self?.hide()
+        })
+        dismissalObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.hide()
+        })
+    }
+    private func removeDismissalMonitors() {
+        if let clickOutsideMonitor {
+            NSEvent.removeMonitor(clickOutsideMonitor)
+            self.clickOutsideMonitor = nil
+        }
+        if let clickInsideMonitor {
+            NSEvent.removeMonitor(clickInsideMonitor)
+            self.clickInsideMonitor = nil
+        }
+        for observer in dismissalObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            NotificationCenter.default.removeObserver(observer)
+        }
+        dismissalObservers.removeAll()
     }
     private func ensurePanel() -> OverlayPanel {
         if let panel { return panel }
@@ -477,21 +534,11 @@ private final class WorkspaceMiniMapView: NSView {
     ]
 }
 
-private final class AppIconProvider {
-    private static let iconCache = NSCache<NSString, NSImage>()
-
+private enum AppIconProvider {
     static func appIcon(for pid: pid_t) -> NSImage {
-        let runningApp = NSRunningApplication(processIdentifier: pid)
-        let key = NSString(string: runningApp?.bundleIdentifier.map { "bundle-\($0)" } ?? "pid-\(pid)")
-        if let cached = iconCache.object(forKey: key) { return cached }
-        var image = NSWorkspace.shared.icon(forFile: runningApp?.bundleURL?.path ?? "")
-        if let bundleID = runningApp?.bundleIdentifier {
-            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-                image = NSWorkspace.shared.icon(forFile: url.path)
-            }
-        }
-        iconCache.setObject(image, forKey: key)
-        return image
+        NSRunningApplication(processIdentifier: pid)?.icon
+            ?? NSImage(named: NSImage.applicationIconName)
+            ?? NSImage()
     }
 }
 }

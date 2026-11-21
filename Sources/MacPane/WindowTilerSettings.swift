@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 final class WindowTilerSettings {
@@ -26,9 +27,6 @@ final class WindowTilerSettings {
     let maximumGap = 48
     let maximumWorkspaceCount = 9
 
-    private var activeWorkspaceIndexByNativeStateKey: [String: Int] = [:]
-    private(set) var workspaceConfigurationVersion = 0
-
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
     }
@@ -49,7 +47,6 @@ final class WindowTilerSettings {
 
     func setWorkspaceCount(_ value: Int) {
         defaults.set(min(max(value, 1), maximumWorkspaceCount), forKey: DefaultsKey.workspaceCount)
-        workspaceConfigurationVersion += 1
     }
 
     var tilingEnabled: Bool {
@@ -86,7 +83,10 @@ final class WindowTilerSettings {
     }
 
     var fastFocusEnabled: Bool {
-        defaults.bool(forKey: DefaultsKey.fastFocusEnabled)
+        if defaults.object(forKey: DefaultsKey.fastFocusEnabled) == nil {
+            return true
+        }
+        return defaults.bool(forKey: DefaultsKey.fastFocusEnabled)
     }
 
     func setFastFocusEnabled(_ value: Bool) {
@@ -135,11 +135,6 @@ final class WindowTilerSettings {
         defaults.set(true, forKey: DefaultsKey.onboardingCompleted)
     }
 
-    func resetRuntimeState() {
-        activeWorkspaceIndexByNativeStateKey.removeAll()
-        workspaceConfigurationVersion += 1
-    }
-
     func availableWorkspaceIndex(_ index: Int) -> Int? {
         guard index >= 0, index < workspaceCount else { return nil }
         return index
@@ -150,66 +145,20 @@ final class WindowTilerSettings {
         return ((index % count) + count) % count
     }
 
-    func shiftedActiveWorkspaceIndex(
-        _ activeIndex: Int,
-        deletingWorkspaceIndex index: Int,
-        newWorkspaceCount: Int
-    ) -> Int {
-        let shifted = activeIndex > index ? activeIndex - 1 : min(activeIndex, newWorkspaceCount - 1)
-        return min(max(shifted, 0), max(newWorkspaceCount - 1, 0))
+    func workspaceName(on screen: ScreenInfo, index: Int) -> String? {
+        let names = workspaceNames()
+        return names[nameKey(display: screen.key, index: index)]
+            ?? names[legacyNameKey(displayID: screen.displayID, index: index)]
     }
 
-    func shiftActiveWorkspaceIndices(deletingWorkspaceIndex index: Int, newWorkspaceCount: Int) {
-        activeWorkspaceIndexByNativeStateKey = activeWorkspaceIndexByNativeStateKey.mapValues {
-            shiftedActiveWorkspaceIndex($0, deletingWorkspaceIndex: index, newWorkspaceCount: newWorkspaceCount)
-        }
-        workspaceConfigurationVersion += 1
-    }
-
-    func activeWorkspaceIndex(forNativeStateKey nativeStateKey: String) -> Int {
-        let displayKey = displayKeyComponent(of: nativeStateKey)
-        let fallbackIndex = activeWorkspaceIndexByNativeStateKey
-            .first { displayKeyComponent(of: $0.key) == displayKey }?.value
-            ?? 0
-        let index = clampedWorkspaceIndex(activeWorkspaceIndexByNativeStateKey[nativeStateKey] ?? fallbackIndex)
-        activeWorkspaceIndexByNativeStateKey[nativeStateKey] = index
-        return index
-    }
-
-    func storedActiveWorkspaceIndex(forNativeStateKey nativeStateKey: String) -> Int? {
-        activeWorkspaceIndexByNativeStateKey[nativeStateKey].map(clampedWorkspaceIndex)
-    }
-
-    func setActiveWorkspaceIndex(_ index: Int, forNativeStateKey nativeStateKey: String) {
-        let index = clampedWorkspaceIndex(index)
-        if activeWorkspaceIndexByNativeStateKey[nativeStateKey] != index {
-            workspaceConfigurationVersion += 1
-        }
-        activeWorkspaceIndexByNativeStateKey[nativeStateKey] = index
-    }
-
-    func hasWorkspaceMetadata(forNativeStateKey nativeStateKey: String) -> Bool {
-        if activeWorkspaceIndexByNativeStateKey[nativeStateKey] != nil {
-            return true
-        }
-        let displayKey = displayKeyComponent(of: nativeStateKey)
-        return workspaceNames().keys.contains { nameKey in
-            workspaceNameDisplayKey(from: nameKey) == displayKey
-        }
-    }
-
-    func workspaceName(forNativeStateKey nativeStateKey: String, workspaceIndex: Int) -> String? {
-        workspaceNames()[workspaceNameKey(forNativeStateKey: nativeStateKey, workspaceIndex: workspaceIndex)]
-    }
-
-    func setWorkspaceName(_ name: String, forNativeStateKey nativeStateKey: String, workspaceIndex: Int) {
+    func setWorkspaceName(_ name: String, on screen: ScreenInfo, index: Int) {
         var names = workspaceNames()
-        let key = workspaceNameKey(forNativeStateKey: nativeStateKey, workspaceIndex: workspaceIndex)
         let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        names.removeValue(forKey: legacyNameKey(displayID: screen.displayID, index: index))
         if normalizedName.isEmpty {
-            names.removeValue(forKey: key)
+            names.removeValue(forKey: nameKey(display: screen.key, index: index))
         } else {
-            names[key] = String(normalizedName.prefix(48))
+            names[nameKey(display: screen.key, index: index)] = String(normalizedName.prefix(48))
         }
         defaults.set(names, forKey: DefaultsKey.workspaceNamesByDisplay)
     }
@@ -232,74 +181,16 @@ final class WindowTilerSettings {
         defaults.set(shiftedNames, forKey: DefaultsKey.workspaceNamesByDisplay)
     }
 
-    func migrateWorkspaceNames(
-        fromNativeStateKey sourceNativeStateKey: String,
-        toNativeStateKey targetNativeStateKey: String
-    ) -> Bool {
-        var names = workspaceNames()
-        var migrated = false
-        for index in 0..<workspaceCount {
-            let sourceKey = workspaceNameKey(forNativeStateKey: sourceNativeStateKey, workspaceIndex: index)
-            let targetKey = workspaceNameKey(forNativeStateKey: targetNativeStateKey, workspaceIndex: index)
-            guard sourceKey != targetKey, let name = names[sourceKey], names[targetKey] == nil else { continue }
-            names[targetKey] = name
-            names.removeValue(forKey: sourceKey)
-            migrated = true
-        }
-        if migrated {
-            defaults.set(names, forKey: DefaultsKey.workspaceNamesByDisplay)
-        }
-        return migrated
-    }
-
-    func migrateActiveWorkspaceIndex(
-        fromNativeStateKey sourceNativeStateKey: String,
-        toNativeStateKey targetNativeStateKey: String,
-        sourceActiveIndex: Int?,
-        focusedWorkspaceIndex: Int?,
-        targetHadState: Bool
-    ) -> Bool {
-        var migrated = false
-        if activeWorkspaceIndexByNativeStateKey.removeValue(forKey: sourceNativeStateKey) != nil {
-            migrated = true
-        }
-        if migrated {
-            workspaceConfigurationVersion += 1
-        }
-        if let focusedWorkspaceIndex {
-            setActiveWorkspaceIndex(focusedWorkspaceIndex, forNativeStateKey: targetNativeStateKey)
-            return true
-        }
-        if !targetHadState, let sourceActiveIndex {
-            setActiveWorkspaceIndex(sourceActiveIndex, forNativeStateKey: targetNativeStateKey)
-            return true
-        }
-        return migrated
-    }
-
-    private func clampedWorkspaceIndex(_ index: Int) -> Int {
-        min(max(index, 0), workspaceCount - 1)
-    }
-
     private func workspaceNames() -> [String: String] {
         defaults.dictionary(forKey: DefaultsKey.workspaceNamesByDisplay) as? [String: String] ?? [:]
     }
 
-    private func workspaceNameKey(forNativeStateKey nativeStateKey: String, workspaceIndex: Int) -> String {
-        "\(displayKeyComponent(of: nativeStateKey)):\(workspaceIndex)"
+    private func nameKey(display: String, index: Int) -> String {
+        "\(display):\(index)"
     }
 
-    private func workspaceNameDisplayKey(from nameKey: String) -> String? {
-        guard let separator = nameKey.lastIndex(of: ":") else { return nil }
-        return String(nameKey[..<separator])
-    }
-
-    private func displayKeyComponent(of stateKey: String) -> String {
-        nativeStateKeyComponent(of: stateKey)
-    }
-
-    private func nativeStateKeyComponent(of stateKey: String) -> String {
-        guard let range = stateKey.range(of: ScreenInfo.workspaceStateSeparator) else { return stateKey }
-        return String(stateKey[..<range.lowerBound])
+    /// Names saved before displays were identified by UUID.
+    private func legacyNameKey(displayID: CGDirectDisplayID, index: Int) -> String {
+        "display:\(displayID):\(index)"
     }
 }

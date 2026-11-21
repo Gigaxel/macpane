@@ -168,9 +168,9 @@ private struct GeneralSettingsView: View {
                 }
             }
 
-            Section("Experimental") {
+            Section("Focus") {
                 Toggle(
-                    "Instant window focus (private API)",
+                    "Instant window focus",
                     isOn: Binding(
                         get: { store.fastFocusEnabled },
                         set: { store.setFastFocusEnabled($0) }
@@ -178,7 +178,7 @@ private struct GeneralSettingsView: View {
                 )
                 .disabled(!store.isFastFocusAvailable)
                 Text(store.isFastFocusAvailable
-                    ? "Focuses windows through a private macOS window server call. It is faster than the standard path but may stop working after a macOS update. MacPane falls back to the standard path when the call fails."
+                    ? "Focuses a window directly through the macOS window server instead of activating its whole app first. MacPane falls back to the standard path if the call fails."
                     : "Not available on this macOS version. MacPane uses the standard focus path.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -186,12 +186,6 @@ private struct GeneralSettingsView: View {
 
             Section("Maintenance") {
                 Button("Retile Windows Now") { store.retileNow() }
-                LabeledContent("Learned app size limits") {
-                    Button("Reset") { store.resetLearnedAppSizeLimits() }
-                }
-                Text("MacPane learns an app's minimum size when the app rejects a smaller frame. Reset the saved sizes if a tile is too large.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -429,10 +423,7 @@ private struct AboutSettingsView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Spacer()
-            VStack(spacing: 2) {
-                Text("Ad-hoc signed for local development.")
-                Text("Requires Accessibility permission to manage windows.")
-            }
+            Text("Requires Accessibility permission to manage windows.")
             .font(.caption)
             .foregroundStyle(.tertiary)
             .padding(.bottom, 12)

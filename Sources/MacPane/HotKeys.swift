@@ -3,7 +3,7 @@ import Carbon
 import Foundation
 
 protocol HotKeyHandling: AnyObject {
-    func handle(action: HotKeyAction, eventAge: TimeInterval, triggerKeyIsDown: Bool)
+    func handle(action: HotKeyAction, eventAge: TimeInterval)
 }
 enum HotKeyAction {
     case focus(SnapDirection)
@@ -13,7 +13,7 @@ enum HotKeyAction {
     case deleteWorkspace
     case switchWorkspace(Int)
     case moveWindowToWorkspace(Int)
-    case moveWindowToWorkspaceOnDisplay(index: Int, displayID: CGDirectDisplayID?, windowID: WindowIdentity?)
+    case moveWindowToWorkspaceOnDisplay(index: Int, displayID: CGDirectDisplayID?, windowID: WindowID?)
     case cycleWorkspace(Int)
     case showWorkspaceOverview
     case hideWorkspaceOverview
@@ -41,15 +41,6 @@ enum HotKeyAction {
             return false
         }
     }
-    var isWorkspaceMutation: Bool {
-        switch self {
-        case .createWorkspace, .deleteWorkspace, .switchWorkspace, .cycleWorkspace,
-             .moveWindowToWorkspace, .moveWindowToWorkspaceOnDisplay:
-            return true
-        default:
-            return false
-        }
-    }
     var shouldDropWhenStale: Bool {
         switch self {
         case .focus, .overviewSwitchWorkspace, .pickerSelectMonitor:
@@ -58,18 +49,6 @@ enum HotKeyAction {
             return false
         }
     }
-    var shouldDropWhenTriggerReleased: Bool {
-        switch self {
-        case .focus:
-            return true
-        default:
-            return false
-        }
-    }
-}
-private struct RegisteredHotKey {
-    let action: HotKeyAction
-    let keyCode: UInt32
 }
 final class HotKeyManager {
     static let shared = HotKeyManager()
@@ -81,7 +60,7 @@ final class HotKeyManager {
     private var overviewActionIDs: Set<UInt32> = []
     private var pickerHotKeyRefs: [EventHotKeyRef?] = []
     private var pickerActionIDs: Set<UInt32> = []
-    private var hotKeysByID: [UInt32: RegisteredHotKey] = [:]
+    private var actionsByID: [UInt32: HotKeyAction] = [:]
     private var recordingSuppressionCount = 0
     private var nextID: UInt32 = 1
     private let signature = fourCharCode("MCPN")
@@ -201,14 +180,13 @@ final class HotKeyManager {
         }
         refs.removeAll()
         for id in actionIDs {
-            hotKeysByID.removeValue(forKey: id)
+            actionsByID.removeValue(forKey: id)
         }
         actionIDs.removeAll()
     }
     func handleHotKey(id: UInt32, eventAge: TimeInterval) {
-        guard let hotKey = hotKeysByID[id] else { return }
-        let triggerKeyIsDown = CGEventSource.keyState(.hidSystemState, key: CGKeyCode(hotKey.keyCode))
-        delegate?.handle(action: hotKey.action, eventAge: eventAge, triggerKeyIsDown: triggerKeyIsDown)
+        guard let action = actionsByID[id] else { return }
+        delegate?.handle(action: action, eventAge: eventAge)
     }
     private func registerMainHotKeys() {
         for binding in bindingStore.effectiveBindings() {
@@ -222,11 +200,11 @@ final class HotKeyManager {
             }
         }
         hotKeyRefs.removeAll()
-        let mainIDs = Set(hotKeysByID.keys)
+        let mainIDs = Set(actionsByID.keys)
             .subtracting(overviewActionIDs)
             .subtracting(pickerActionIDs)
         for id in mainIDs {
-            hotKeysByID.removeValue(forKey: id)
+            actionsByID.removeValue(forKey: id)
         }
     }
     private func register(keyCode: UInt32, modifiers: UInt32, action: HotKeyAction) {
@@ -243,7 +221,7 @@ final class HotKeyManager {
             &hotKeyRef
         )
         if status == noErr {
-            hotKeysByID[id] = RegisteredHotKey(action: action, keyCode: keyCode)
+            actionsByID[id] = action
             hotKeyRefs.append(hotKeyRef)
         } else {
             NSLog("MacPane failed to register hotkey id=\(id) key=\(keyCode) modifiers=\(modifiers): \(status)")
@@ -269,7 +247,7 @@ final class HotKeyManager {
             &hotKeyRef
         )
         if status == noErr {
-            hotKeysByID[id] = RegisteredHotKey(action: action, keyCode: keyCode)
+            actionsByID[id] = action
             refs.append(hotKeyRef)
             actionIDs.insert(id)
         } else {

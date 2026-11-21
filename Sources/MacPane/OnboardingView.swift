@@ -163,7 +163,7 @@ private struct CheatsheetStep: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Keyboard cheatsheet")
                 .font(.system(size: 22, weight: .semibold))
-            Text("All shortcuts are global and rebindable in Settings → Shortcuts.")
+            Text("Shortcuts are global. Most can be changed in Settings → Shortcuts.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
             ScrollView {

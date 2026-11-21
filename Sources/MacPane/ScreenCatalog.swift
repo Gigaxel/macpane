@@ -1,81 +1,80 @@
 import AppKit
 import CoreGraphics
 
-struct ScreenCatalog {
-    private let activeWorkspaceIndexForNativeStateKey: (String) -> Int
-
-    init(activeWorkspaceIndexForNativeStateKey: @escaping (String) -> Int) {
-        self.activeWorkspaceIndexForNativeStateKey = activeWorkspaceIndexForNativeStateKey
-    }
-
-    func infosByKey() -> [String: ScreenInfo] {
-        Dictionary(uniqueKeysWithValues: currentInfos().map { ($0.stateKey, $0) })
-    }
-
-    func currentInfos() -> [ScreenInfo] {
-        NSScreen.screens.map(info(forScreen:))
-    }
-
-    func info(forScreen screen: NSScreen) -> ScreenInfo {
-        let displayID = screen.displayID
-        let displayKey = ScreenInfo.displayKey(for: displayID, frame: screen.frame)
-        let nativeStateKey = ScreenInfo.nativeStateKey(displayKey: displayKey)
-        return ScreenInfo(
-            key: displayKey,
-            frame: accessibilityVisibleFrame(for: screen),
-            displayID: displayID,
-            workspaceIndex: activeWorkspaceIndexForNativeStateKey(nativeStateKey)
-        )
-    }
-
-    func screenContainingCursor() -> NSScreen? {
-        let cursor = NSEvent.mouseLocation
-        return NSScreen.screens.first { $0.frame.contains(cursor) }
-    }
-
-    func displayName(for screen: ScreenInfo) -> String {
-        guard let displayID = screen.displayID,
-              let screen = NSScreen.screens.first(where: { $0.displayID == displayID }) else {
-            return "Current Display"
+/// Reads the connected displays and the native Space each one is showing. Nothing is kept between
+/// calls: reading every display takes a few microseconds.
+enum ScreenCatalog {
+    static func current(server: WindowServer = .shared) -> [ScreenInfo] {
+        NSScreen.screens.compactMap { screen in
+            guard let displayID = screen.displayID else { return nil }
+            let key = displayKey(for: displayID)
+            let space = server.currentSpace(ofDisplay: key)
+            return ScreenInfo(
+                key: key,
+                displayID: displayID,
+                frame: usableFrame(of: screen, displayID: displayID),
+                bounds: CGDisplayBounds(displayID),
+                space: space?.id ?? 0,
+                isTileable: space?.isUser ?? true
+            )
         }
-        return screen.localizedName
     }
 
-    func info(for windowRect: CGRect, screens: [ScreenInfo]) -> ScreenInfo {
-        let center = CGPoint(x: windowRect.midX, y: windowRect.midY)
-        if let bestIndex = ScreenGeometry.bestScreenIndex(for: windowRect, screens: screens.map(\.frame)) {
-            return screens[bestIndex]
+    static func displayKey(for displayID: CGDirectDisplayID) -> String {
+        guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue(),
+              let string = CFUUIDCreateString(nil, uuid) as String? else {
+            return "display:\(displayID)"
         }
-        if let containingScreen = screens.first(where: { $0.frame.contains(center) }) {
-            return containingScreen
+        return string
+    }
+
+    static func displayName(for screen: ScreenInfo) -> String {
+        NSScreen.screens.first { $0.displayID == screen.displayID }?.localizedName ?? "Current Display"
+    }
+
+    static func nsScreen(for screen: ScreenInfo) -> NSScreen? {
+        NSScreen.screens.first { $0.displayID == screen.displayID }
+    }
+
+    /// The pointer in the global top-left coordinates the WindowServer and Accessibility use.
+    static func cursorLocation() -> CGPoint {
+        if let location = CGEvent(source: nil)?.location {
+            return location
         }
-        return screens.min { lhs, rhs in
-            lhs.frame.distanceSquared(to: center) < rhs.frame.distanceSquared(to: center)
-        } ?? ScreenInfo(
-            key: "fallback",
-            frame: CGRect(x: 0, y: 0, width: 1440, height: 900),
-            displayID: nil,
-            workspaceIndex: 0
-        )
+        let location = NSEvent.mouseLocation
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        return CGPoint(x: location.x, y: primaryHeight - location.y)
     }
 
-    func frameIntersectsAnyVisibleScreen(_ frame: CGRect, screens: [ScreenInfo]) -> Bool {
-        screens.contains { $0.frame.intersects(frame) }
+    static func screen(containing point: CGPoint, in screens: [ScreenInfo]) -> ScreenInfo? {
+        screens.first { $0.bounds.contains(point) }
+            ?? screens.min { $0.bounds.distanceSquared(to: point) < $1.bounds.distanceSquared(to: point) }
     }
 
-    private func accessibilityVisibleFrame(for screen: NSScreen) -> CGRect {
+    /// The display a frame belongs on: the one it overlaps most, else the nearest.
+    static func screen(for frame: CGRect, in screens: [ScreenInfo]) -> ScreenInfo? {
+        if let index = ScreenGeometry.bestScreenIndex(for: frame, screens: screens.map(\.bounds)) {
+            return screens[index]
+        }
+        let center = CGPoint(x: frame.midX, y: frame.midY)
+        return screens.min { $0.bounds.distanceSquared(to: center) < $1.bounds.distanceSquared(to: center) }
+    }
+
+    /// AppKit measures from the bottom-left of the primary display; windows are placed in top-left
+    /// coordinates. The insets are the same either way, so they are applied to the display bounds.
+    private static func usableFrame(of screen: NSScreen, displayID: CGDirectDisplayID) -> CGRect {
         let screenFrame = screen.frame
         let visibleFrame = screen.visibleFrame
-        let displayBounds = screen.displayID.map { CGDisplayBounds($0) } ?? screenFrame
+        let bounds = CGDisplayBounds(displayID)
         let leftInset = visibleFrame.minX - screenFrame.minX
         let rightInset = screenFrame.maxX - visibleFrame.maxX
         let topInset = screenFrame.maxY - visibleFrame.maxY
         let bottomInset = visibleFrame.minY - screenFrame.minY
         return CGRect(
-            x: displayBounds.minX + leftInset,
-            y: displayBounds.minY + topInset,
-            width: displayBounds.width - leftInset - rightInset,
-            height: displayBounds.height - topInset - bottomInset
+            x: bounds.minX + leftInset,
+            y: bounds.minY + topInset,
+            width: bounds.width - leftInset - rightInset,
+            height: bounds.height - topInset - bottomInset
         )
     }
 }

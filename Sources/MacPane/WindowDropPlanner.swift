@@ -1,6 +1,9 @@
 import CoreGraphics
 
+/// Decides what dropping a dragged window means from where the pointer let go.
 enum WindowDropPlanner {
+    /// The middle third of a tile swaps the two windows; anywhere else splits the tile on the
+    /// nearest edge.
     static func dropAction(cursor: CGPoint, targetFrame: CGRect) -> DropAction {
         guard targetFrame.width > 0, targetFrame.height > 0 else { return .split(.right) }
         if targetFrame.contains(cursor) {
@@ -19,24 +22,27 @@ enum WindowDropPlanner {
         return .split(distances.min { $0.distance < $1.distance }?.direction ?? .right)
     }
 
-    static func targetWindowForDrop(cursor: CGPoint, moving: ManagedWindow, candidates: [ManagedWindow]) -> ManagedWindow? {
-        let containing = candidates
-            .filter { $0.frame.contains(cursor) }
-            .min { lhs, rhs in lhs.frame.area < rhs.frame.area }
-        if let containing {
+    /// The tile a window was dropped on: the one under the pointer, else the one it overlaps most,
+    /// else the nearest. `candidates` are the other tiles on the display the drop landed on.
+    static func target(
+        cursor: CGPoint,
+        movingFrame: CGRect,
+        candidates: [(id: WindowID, frame: CGRect)]
+    ) -> (id: WindowID, frame: CGRect)? {
+        if let containing = candidates
+            .filter({ $0.frame.contains(cursor) })
+            .min(by: { $0.frame.area < $1.frame.area }) {
             return containing
         }
-        let overlapping = candidates.compactMap { candidate -> (window: ManagedWindow, area: CGFloat)? in
-            let intersection = candidate.frame.intersection(moving.frame)
+        let overlapping = candidates.compactMap { candidate -> (candidate: (id: WindowID, frame: CGRect), area: CGFloat)? in
+            let intersection = candidate.frame.intersection(movingFrame)
             let area = intersection.isNull ? 0 : max(0, intersection.width) * max(0, intersection.height)
-            guard area > min(candidate.frame.area, moving.frame.area) * 0.08 else { return nil }
+            guard area > min(candidate.frame.area, movingFrame.area) * 0.08 else { return nil }
             return (candidate, area)
-        }.max { lhs, rhs in lhs.area < rhs.area }
+        }.max { $0.area < $1.area }
         if let overlapping {
-            return overlapping.window
+            return overlapping.candidate
         }
-        return candidates.min { lhs, rhs in
-            lhs.frame.distanceSquared(to: cursor) < rhs.frame.distanceSquared(to: cursor)
-        }
+        return candidates.min { $0.frame.distanceSquared(to: cursor) < $1.frame.distanceSquared(to: cursor) }
     }
 }

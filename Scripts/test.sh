@@ -1,41 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD_DIR="$ROOT_DIR/build"
-TEST_BIN="$BUILD_DIR/SnapGeometryTests"
+BUILD_DIR="${BUILD_ROOT:-$ROOT_DIR/build}"
+TEST_BIN="$BUILD_DIR/TilingTests"
 MODULE_CACHE_DIR="$BUILD_DIR/ModuleCache"
 mkdir -p "$BUILD_DIR" "$MODULE_CACHE_DIR"
+
+# Every source file except the app entry point, so the tests can never drift from the app.
+SOURCES=()
+for source in "$ROOT_DIR"/Sources/MacPane/*.swift; do
+  [[ "$(basename "$source")" == "main.swift" ]] || SOURCES+=("$source")
+done
+
 xcrun swiftc \
+  -parse-as-library \
   -module-cache-path "$MODULE_CACHE_DIR" \
   -framework AppKit \
   -framework ApplicationServices \
   -framework Carbon \
-  "$ROOT_DIR/Sources/MacPane/SnapGeometry.swift" \
-  "$ROOT_DIR/Sources/MacPane/TilingLayout.swift" \
-  "$ROOT_DIR/Sources/MacPane/AXReader.swift" \
-  "$ROOT_DIR/Sources/MacPane/WindowFrameApplier.swift" \
-  "$ROOT_DIR/Sources/MacPane/WindowManageabilityPlanner.swift" \
-  "$ROOT_DIR/Sources/MacPane/FrameVerificationClassifier.swift" \
-  "$ROOT_DIR/Sources/MacPane/FrameVerificationPlanner.swift" \
-  "$ROOT_DIR/Sources/MacPane/AppSizeConstraintsStore.swift" \
-  "$ROOT_DIR/Sources/MacPane/ReassertBudget.swift" \
-  "$ROOT_DIR/Sources/MacPane/WindowIdentity.swift" \
-  "$ROOT_DIR/Sources/MacPane/WindowLayoutIdentity.swift" \
-  "$ROOT_DIR/Sources/MacPane/ScreenGeometryExtensions.swift" \
-  "$ROOT_DIR/Sources/MacPane/WindowModels.swift" \
-  "$ROOT_DIR/Sources/MacPane/WorkspaceModels.swift" \
-  "$ROOT_DIR/Sources/MacPane/WorkspaceSlidePlanner.swift" \
-  "$ROOT_DIR/Sources/MacPane/WorkspaceStatePlanner.swift" \
-  "$ROOT_DIR/Sources/MacPane/WorkspaceSwitchPlanner.swift" \
-  "$ROOT_DIR/Sources/MacPane/WorkspaceStateKeys.swift" \
-  "$ROOT_DIR/Sources/MacPane/WindowStateSyncPlanner.swift" \
-  "$ROOT_DIR/Sources/MacPane/AXIOScheduler.swift" \
-  "$ROOT_DIR/Sources/MacPane/LiveWindowPlanner.swift" \
-  "$ROOT_DIR/Sources/MacPane/LayoutRestorePlanner.swift" \
-  "$ROOT_DIR/Sources/MacPane/WorkspaceStateMigrator.swift" \
-  "$ROOT_DIR/Sources/MacPane/WindowLayoutPlanner.swift" \
-  "$ROOT_DIR/Sources/MacPane/WindowFocusNavigator.swift" \
-  "$ROOT_DIR/Tests/SnapGeometryTests.swift" \
-  "$ROOT_DIR/Tests/FrameVerificationTests.swift" \
+  -framework SwiftUI \
+  "${SOURCES[@]}" \
+  "$ROOT_DIR"/Tests/*.swift \
   -o "$TEST_BIN"
 "$TEST_BIN"

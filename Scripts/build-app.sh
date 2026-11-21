@@ -41,8 +41,21 @@ cp "$ROOT_DIR/Assets/MacPane.icns" "$RESOURCES_DIR/MacPane.icns"
 printf "APPL????" > "$CONTENTS_DIR/PkgInfo"
 plutil -lint "$CONTENTS_DIR/Info.plist" >/dev/null
 
+# macOS ties the Accessibility grant to the app's signature. An ad-hoc signature changes with every
+# build, so the grant is lost each time; a signing identity keeps it. Set CODESIGN_IDENTITY to pick
+# one, or leave it unset to use the first development identity in the keychain.
 if [[ "${CODESIGN:-1}" == "1" ]] && command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null
+  IDENTITY="${CODESIGN_IDENTITY:-}"
+  if [[ -z "$IDENTITY" ]]; then
+    IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+      | awk -F'"' '/Apple Development|Developer ID Application/ { print $2; exit }')"
+  fi
+  if [[ -n "$IDENTITY" ]] && codesign --force --sign "$IDENTITY" "$APP_BUNDLE" >/dev/null 2>&1; then
+    echo "Signed with $IDENTITY"
+  else
+    codesign --force --sign - "$APP_BUNDLE" >/dev/null
+    echo "Signed ad hoc"
+  fi
 fi
 
 echo "Built $APP_BUNDLE"

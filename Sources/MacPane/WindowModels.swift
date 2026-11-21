@@ -1,331 +1,160 @@
-import AppKit
 import ApplicationServices
+import CoreGraphics
 
-struct CGWindowRecord {
-    let pid: pid_t
-    let number: Int
-    let frame: CGRect
-    let title: String?
-    let rank: Int
-}
-struct OnScreenWindowSnapshot {
-    var recordsByPID: [pid_t: [CGWindowRecord]] = [:]
-    var visibleNumbersByPID: [pid_t: Set<Int>] = [:]
-    var rankByWindow: [WindowOrderKey: Int] = [:]
-    var framesByWindow: [WindowOrderKey: CGRect] = [:]
-    func frame(pid: pid_t, number: Int) -> CGRect? {
-        framesByWindow[WindowOrderKey(pid: pid, number: number)]
-    }
-    func matchWindowNumber(pid: pid_t, frame: CGRect, title: String?, excluding excludedNumbers: Set<Int>) -> Int? {
-        guard let records = recordsByPID[pid], !records.isEmpty else { return nil }
-        let normalizedTitle = normalizedWindowTitle(title)
-        var best: (number: Int, score: CGFloat)?
-        for record in records where !excludedNumbers.contains(record.number) {
-            let frameScore = record.frame.frameSimilarityScore(to: frame)
-            guard frameScore <= 24 else { continue }
-            let recordTitle = normalizedWindowTitle(record.title)
-            var score = frameScore
-            if !normalizedTitle.isEmpty, !recordTitle.isEmpty, normalizedTitle != recordTitle {
-                score += 20
-            } else if normalizedTitle.isEmpty || recordTitle.isEmpty {
-                score += 4
-            }
-            score += CGFloat(record.rank) * 0.001
-            if best == nil || score < best!.score {
-                best = (record.number, score)
-            }
-        }
-        return best?.number
-    }
-    private func normalizedWindowTitle(_ title: String?) -> String {
-        (title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-}
-struct VisibleWindowSignature: Equatable {
-    let visibleNumbersByPID: [pid_t: Set<Int>]
-    init() {
-        visibleNumbersByPID = [:]
-    }
-    init(snapshot: OnScreenWindowSnapshot) {
-        visibleNumbersByPID = snapshot.visibleNumbersByPID.filter { !$0.value.isEmpty }
-    }
-}
-struct ScreenInfo {
-    static let workspaceStateSeparator = ":workspace:"
+/// A display together with the native Space it is currently showing.
+struct ScreenInfo: Equatable {
+    /// Display UUID. Unlike `CGDirectDisplayID` it survives reconnects and sleep.
     let key: String
+    let displayID: CGDirectDisplayID
+    /// Usable area in global top-left coordinates: the display minus the menu bar and Dock.
     let frame: CGRect
-    let displayID: CGDirectDisplayID?
-    let workspaceIndex: Int
-    private let stateKeyOverride: String?
-    init(
-        key: String,
-        frame: CGRect,
-        displayID: CGDirectDisplayID?,
-        workspaceIndex: Int,
-        stateKeyOverride: String? = nil
-    ) {
-        self.key = key
-        self.frame = frame
-        self.displayID = displayID
-        self.workspaceIndex = workspaceIndex
-        self.stateKeyOverride = stateKeyOverride
-    }
-    var nativeStateKey: String {
-        Self.nativeStateKey(displayKey: key)
-    }
-    var stateKey: String {
-        stateKeyOverride ?? Self.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: workspaceIndex)
-    }
-    func withStateKeyOverride(_ stateKey: String) -> ScreenInfo {
-        ScreenInfo(
-            key: key,
-            frame: frame,
-            displayID: displayID,
-            workspaceIndex: Self.workspaceIndex(from: stateKey) ?? workspaceIndex,
-            stateKeyOverride: stateKey
-        )
-    }
-    func withoutStateKeyOverride() -> ScreenInfo {
-        ScreenInfo(
-            key: key,
-            frame: frame,
-            displayID: displayID,
-            workspaceIndex: workspaceIndex
-        )
-    }
-    static func nativeStateKey(displayKey: String) -> String {
-        displayKey
-    }
-    static func workspaceStateKey(nativeStateKey: String, workspaceIndex: Int) -> String {
-        "\(nativeStateKey)\(workspaceStateSeparator)\(workspaceIndex)"
-    }
-    static func workspaceIndex(from stateKey: String) -> Int? {
-        guard let range = stateKey.range(of: workspaceStateSeparator) else { return nil }
-        return Int(stateKey[range.upperBound...])
-    }
-    static func displayKey(for displayID: CGDirectDisplayID?, frame: CGRect?) -> String {
-        if let displayID { return "display:\(displayID)" }
-        if let frame { return "frame:\(frame.debugDescription)" }
-        return "display:unknown"
+    /// Full display bounds in the same coordinates.
+    let bounds: CGRect
+    let space: UInt64
+    /// False while the display shows a fullscreen or system Space, which is never tiled.
+    let isTileable: Bool
+
+    var scope: ScopeKey { ScopeKey(display: key, space: space) }
+    func workspaceKey(index: Int) -> WorkspaceKey {
+        WorkspaceKey(display: key, space: space, index: index)
     }
 }
+
+/// One native Space on one display: the unit that owns a set of virtual workspaces.
+struct ScopeKey: Hashable {
+    var display: String
+    var space: UInt64
+}
+
+/// One virtual workspace. Each has its own tile tree.
+struct WorkspaceKey: Hashable {
+    var display: String
+    var space: UInt64
+    var index: Int
+
+    var scope: ScopeKey { ScopeKey(display: display, space: space) }
+    init(display: String, space: UInt64, index: Int) {
+        self.display = display
+        self.space = space
+        self.index = index
+    }
+    init(scope: ScopeKey, index: Int) {
+        self.init(display: scope.display, space: scope.space, index: index)
+    }
+}
+
+/// A window MacPane manages. It exists from the moment Accessibility confirms the window is
+/// manageable until the WindowServer reports the window gone.
 struct ManagedWindow {
-    let id: WindowIdentity
-    let windowNumber: Int?
-    let element: AXUIElement
-    let screen: ScreenInfo
-    let layoutIdentity: WindowLayoutIdentity?
-    let frame: CGRect
-    let bundleIdentifier: String?
-    let title: String?
-    let orderRank: Int?
-    let scanIndex: Int
-    func withFrame(_ frame: CGRect) -> ManagedWindow {
-        with(frame: frame, orderRank: orderRank)
-    }
-    func with(frame: CGRect, orderRank: Int?) -> ManagedWindow {
-        ManagedWindow(
-            id: id,
-            windowNumber: windowNumber,
-            element: element,
-            screen: screen,
-            layoutIdentity: layoutIdentity,
-            frame: frame,
-            bundleIdentifier: bundleIdentifier,
-            title: title,
-            orderRank: orderRank,
-            scanIndex: scanIndex
-        )
-    }
-    func withScreen(_ screen: ScreenInfo) -> ManagedWindow {
-        ManagedWindow(
-            id: id,
-            windowNumber: windowNumber,
-            element: element,
-            screen: screen,
-            layoutIdentity: layoutIdentity,
-            frame: frame,
-            bundleIdentifier: bundleIdentifier,
-            title: title,
-            orderRank: orderRank,
-            scanIndex: scanIndex
-        )
-    }
-    static func shouldOrderBefore(_ lhs: ManagedWindow, _ rhs: ManagedWindow) -> Bool {
-        switch (lhs.orderRank, rhs.orderRank) {
-        case (.some(let lhsRank), .some(let rhsRank)) where lhsRank != rhsRank:
-            return lhsRank > rhsRank
-        case (.some, .none):
-            return true
-        case (.none, .some):
-            return false
-        default:
-            break
-        }
-        let lhsApp = lhs.bundleIdentifier ?? ""
-        let rhsApp = rhs.bundleIdentifier ?? ""
-        if lhsApp != rhsApp { return lhsApp < rhsApp }
-        if lhs.id.pid != rhs.id.pid { return lhs.id.pid < rhs.id.pid }
-        switch (lhs.windowNumber, rhs.windowNumber) {
-        case (.some(let lhsNumber), .some(let rhsNumber)) where lhsNumber != rhsNumber:
-            return lhsNumber < rhsNumber
-        case (.some, .none):
-            return true
-        case (.none, .some):
-            return false
-        default:
-            return lhs.scanIndex < rhs.scanIndex
-        }
-    }
-}
-struct PersistedScreenLayout {
-    let stateKey: String
-    let displayKey: String
-    let tree: BSPTree<Int>
-    let entriesByID: [Int: PersistedWindowLayoutEntry]
-    let lastFocusedEntryID: Int?
-    let zoomedEntryID: Int?
-    let lastUpdated: Date
-}
-struct PersistedWindowLayoutEntry {
-    let id: Int
+    let id: WindowID
     let pid: pid_t
+    var handle: WindowHandle
     let bundleIdentifier: String?
-    let layoutIdentity: WindowLayoutIdentity?
-    let orderRank: Int?
-    let scanIndex: Int
+    var title: String?
+    /// The smallest size the app accepted when asked for less. Measured from the app's own answer
+    /// to a frame write; zero in a dimension means no floor is known there.
+    var minimumSize = CGSize.zero
+    /// Set while the window floats only because it opened below the pop-up size limits.
+    var autoFloatedAt: UInt64?
 }
-struct PersistedWindowGroupKey: Hashable {
-    let pid: pid_t
-    let bundleIdentifier: String?
-}
-struct SystemUIWindowSnapshot: Equatable {
-    let idsByStateKey: [String: Set<WindowIdentity>]
-    let framesByID: [WindowIdentity: RoundedWindowFrame]
-    init(windows: [ManagedWindow]) {
-        idsByStateKey = Dictionary(grouping: windows, by: { $0.screen.stateKey })
-            .mapValues { Set($0.map(\.id)) }
-        framesByID = Dictionary(uniqueKeysWithValues: windows.map { ($0.id, RoundedWindowFrame($0.frame)) })
-    }
-}
-struct RoundedWindowFrame: Hashable {
-    let x: Int
-    let y: Int
-    let width: Int
-    let height: Int
-    init(_ frame: CGRect) {
-        x = Int(frame.minX.rounded(.toNearestOrAwayFromZero))
-        y = Int(frame.minY.rounded(.toNearestOrAwayFromZero))
-        width = Int(frame.width.rounded(.toNearestOrAwayFromZero))
-        height = Int(frame.height.rounded(.toNearestOrAwayFromZero))
-    }
-}
-final class AppObserverRegistration {
-    let observer: AXObserver
-    let source: CFRunLoopSource
-    var observedWindowTokens: Set<String> = []
-    init(observer: AXObserver, source: CFRunLoopSource) {
-        self.observer = observer
-        self.source = source
-    }
-}
+
+/// The tile tree of one virtual workspace, plus which of its windows was focused last and which
+/// one, if any, is zoomed to fill the workspace.
 struct ScreenTileState {
-    private var tree = BSPTree<WindowIdentity>()
-    private var lastFocusedID: WindowIdentity?
-    private(set) var zoomedWindowID: WindowIdentity?
+    private var tree = BSPTree<WindowID>()
+    private var lastFocusedID: WindowID?
+    private(set) var zoomedWindowID: WindowID?
+
     init() {}
-    init(
-        tree: BSPTree<WindowIdentity>,
-        lastFocusedID: WindowIdentity? = nil,
-        zoomedWindowID: WindowIdentity? = nil
-    ) {
+    init(tree: BSPTree<WindowID>, lastFocusedID: WindowID? = nil, zoomedWindowID: WindowID? = nil) {
         self.tree = tree
         self.lastFocusedID = lastFocusedID.flatMap { tree.contains($0) ? $0 : nil }
         self.zoomedWindowID = zoomedWindowID.flatMap { tree.contains($0) ? $0 : nil }
     }
+
     var isEmpty: Bool { tree.isEmpty }
-    var slots: [WindowIdentity: TileSlot] { tree.slots() }
-    var slotList: [(id: WindowIdentity, slot: TileSlot)] { tree.slotList() }
+    var orderedIDs: [WindowID] { tree.ids }
+    var windowIDs: Set<WindowID> { Set(tree.ids) }
+    var focusedWindowID: WindowID? {
+        lastFocusedID.flatMap { tree.contains($0) ? $0 : nil }
+    }
+    func contains(_ id: WindowID) -> Bool {
+        tree.contains(id)
+    }
+
+    // MARK: Layout
+
+    /// The unit-square slot of every visible window, grown where needed to respect app minimums.
     func resolvedSlots(
         in screenFrame: CGRect,
         gap: CGFloat,
-        accommodating minimums: [WindowIdentity: CGSize]
-    ) -> [WindowIdentity: TileSlot] {
-        guard !minimums.isEmpty else { return slots }
-        let ids = windowIDs
-        let relevantMinimums = minimums.filter { ids.contains($0.key) }
-        guard !relevantMinimums.isEmpty else { return slots }
-        return tree.slotsAccommodating(minimums: relevantMinimums, in: screenFrame, gap: gap)
+        accommodating minimums: [WindowID: CGSize] = [:],
+        hidden: Set<WindowID> = []
+    ) -> [WindowID: TileSlot] {
+        tree.slotsAccommodating(minimums: minimums, in: screenFrame, gap: gap, hidden: hidden)
     }
-    var tileCount: Int { tree.tileCount }
-    var windowIDs: Set<WindowIdentity> { Set(tree.ids) }
-    var focusedWindowID: WindowIdentity? {
-        lastFocusedID.flatMap { tree.contains($0) ? $0 : nil }
+    /// Frames for every visible window. A zoomed window covers the workspace; the rest keep their
+    /// tiles underneath it.
+    func frames(
+        in screenFrame: CGRect,
+        gap: CGFloat,
+        accommodating minimums: [WindowID: CGSize] = [:],
+        hidden: Set<WindowID> = []
+    ) -> [WindowID: CGRect] {
+        resolvedSlots(in: screenFrame, gap: gap, accommodating: minimums, hidden: hidden)
+            .reduce(into: [WindowID: CGRect]()) { frames, entry in
+                let slot = entry.key == zoomedWindowID ? TileSlot(x: 0, y: 0, width: 1, height: 1) : entry.value
+                frames[entry.key] = slot.frame(in: screenFrame, gap: gap, smartOuterGap: true)
+            }
     }
-    var lastFocusedOrLargestID: WindowIdentity? {
-        lastFocusedID.flatMap { tree.contains($0) ? $0 : nil } ?? tree.largestLeafID() ?? tree.firstID
-    }
-    func contains(_ id: WindowIdentity) -> Bool {
-        tree.contains(id)
-    }
-    mutating func replaceWindowIDs(_ replacements: [WindowIdentity: WindowIdentity]) -> Bool {
-        guard tree.replaceIDs(replacements) else { return false }
-        if let lastFocusedID, let replacement = replacements[lastFocusedID] {
-            self.lastFocusedID = replacement
+    func focusTarget(hidden: Set<WindowID> = []) -> WindowID? {
+        if let lastFocusedID, tree.contains(lastFocusedID), !hidden.contains(lastFocusedID) {
+            return lastFocusedID
         }
-        if let zoomedWindowID, let replacement = replacements[zoomedWindowID] {
-            self.zoomedWindowID = replacement
+        return tree.largestLeafID(hidden: hidden)
+    }
+    func neighborID(from focusedID: WindowID, direction: SnapDirection, hidden: Set<WindowID> = []) -> WindowID? {
+        tree.neighborID(from: focusedID, direction: direction, hidden: hidden)
+    }
+
+    // MARK: Membership
+
+    /// Adds a window by splitting `targetID`'s tile, or the last focused or largest visible tile.
+    mutating func insert(
+        _ id: WindowID,
+        near targetID: WindowID? = nil,
+        placement: TilePlacement = .automatic,
+        hidden: Set<WindowID> = []
+    ) {
+        guard !tree.contains(id) else { return }
+        let target = targetID.flatMap { tree.contains($0) && !hidden.contains($0) ? $0 : nil }
+            ?? focusTarget(hidden: hidden)
+        tree.insert(id, near: target, placement: placement, hidden: hidden)
+        zoomedWindowID = nil
+        lastFocusedID = id
+    }
+    /// Hands a window's tile, focus and zoom to another window.
+    mutating func replace(_ id: WindowID, with replacement: WindowID) -> Bool {
+        guard tree.replace(id, with: replacement) else { return false }
+        if lastFocusedID == id {
+            lastFocusedID = replacement
         }
-        clearZoomIfInvalid()
+        if zoomedWindowID == id {
+            zoomedWindowID = replacement
+        }
         return true
     }
-    func compactMapWindowIDs<NewID: Hashable>(_ transform: (WindowIdentity) -> NewID?) -> BSPTree<NewID>? {
-        tree.compactMapIDs(transform)
-    }
-    mutating func sync(windowIDs: [WindowIdentity], focusedID: WindowIdentity?) {
-        let liveIDs = Set(windowIDs)
-        tree.removeMissing(keeping: liveIDs)
-        let existingIDs = Set(tree.ids)
-        if windowIDs.contains(where: { !existingIDs.contains($0) }) {
-            zoomedWindowID = nil
-        }
-        var target = focusedID.flatMap { existingIDs.contains($0) ? $0 : nil }
-            ?? lastFocusedID.flatMap { existingIDs.contains($0) ? $0 : nil }
-            ?? tree.largestLeafID()
-            ?? tree.firstID
-        for id in windowIDs where !existingIDs.contains(id) {
-            tree.insert(id, near: target, placement: .automatic)
-            target = id
-        }
-        if let focusedID, liveIDs.contains(focusedID) {
-            markFocused(focusedID)
-        } else if let lastFocusedID, liveIDs.contains(lastFocusedID) {
-            markFocused(lastFocusedID)
-        } else if let target, liveIDs.contains(target) {
-            markFocused(target)
-        } else if let first = tree.firstID {
-            markFocused(first)
-        } else {
+    mutating func remove(_ id: WindowID) {
+        guard tree.contains(id) else { return }
+        tree.remove(id)
+        if lastFocusedID == id {
             lastFocusedID = nil
         }
-        clearZoomIfInvalid()
-    }
-    mutating func removeMissing(keeping liveIDs: Set<WindowIdentity>) {
-        tree.removeMissing(keeping: liveIDs)
-        if let lastFocusedID, !tree.contains(lastFocusedID) {
-            self.lastFocusedID = tree.firstID
-        }
-        clearZoomIfInvalid()
-    }
-    mutating func insertExisting(_ id: WindowIdentity, near targetID: WindowIdentity?, placement: TilePlacement) {
-        let addsMember = !tree.contains(id)
-        let target = targetID.flatMap { tree.contains($0) ? $0 : nil } ?? lastFocusedOrLargestID
-        tree.insert(id, near: target, placement: placement)
-        if addsMember {
+        if zoomedWindowID == id {
             zoomedWindowID = nil
         }
-        markFocused(id)
     }
+    /// Appends another workspace's windows, keeping this one's shape.
     mutating func merge(_ source: ScreenTileState, preferSourceFocus: Bool) {
         guard !source.isEmpty else { return }
         guard !isEmpty else {
@@ -333,34 +162,24 @@ struct ScreenTileState {
             return
         }
         let preservedFocus = focusedWindowID
-        var insertionTarget = lastFocusedOrLargestID
-        var addedMember = false
-        for item in source.slotList {
-            guard !tree.contains(item.id) else { continue }
-            tree.insert(item.id, near: insertionTarget, placement: .automatic)
-            insertionTarget = item.id
-            addedMember = true
+        for id in source.orderedIDs where !tree.contains(id) {
+            insert(id)
         }
-        if addedMember {
-            zoomedWindowID = nil
-        }
-        if preferSourceFocus, let sourceFocus = source.focusedWindowID ?? source.lastFocusedOrLargestID {
-            markFocusedIfKnown(sourceFocus)
+        if preferSourceFocus, let sourceFocus = source.focusedWindowID {
+            markFocused(sourceFocus)
         } else if let preservedFocus {
-            markFocusedIfKnown(preservedFocus)
-        } else if let insertionTarget {
-            markFocusedIfKnown(insertionTarget)
+            markFocused(preservedFocus)
         }
     }
-    mutating func remove(_ id: WindowIdentity) {
-        tree.remove(id)
-        if lastFocusedID == id {
-            lastFocusedID = tree.firstID
-        }
-        clearZoomIfInvalid()
+    mutating func markFocused(_ id: WindowID) {
+        guard tree.contains(id) else { return }
+        lastFocusedID = id
     }
+
+    // MARK: Edits
+
     @discardableResult
-    mutating func toggleZoom(_ id: WindowIdentity) -> Bool {
+    mutating func toggleZoom(_ id: WindowID) -> Bool {
         guard tree.contains(id) else { return false }
         zoomedWindowID = zoomedWindowID == id ? nil : id
         return true
@@ -371,62 +190,40 @@ struct ScreenTileState {
         zoomedWindowID = nil
         return true
     }
-    func neighborID(from focusedID: WindowIdentity, direction: SnapDirection) -> WindowIdentity? {
-        tree.neighborID(from: focusedID, direction: direction)
-    }
-    mutating func markFocused(_ focusedID: WindowIdentity) {
-        guard tree.contains(focusedID) else { return }
-        lastFocusedID = focusedID
-    }
-    mutating func markFocusedIfKnown(_ focusedID: WindowIdentity) {
-        guard tree.contains(focusedID) else { return }
-        markFocused(focusedID)
-    }
-    mutating func swapFocused(_ focusedID: WindowIdentity, direction: SnapDirection) -> Bool {
-        guard let neighborID = tree.neighborID(from: focusedID, direction: direction),
-              tree.swap(focusedID, neighborID) else {
+    mutating func swap(_ id: WindowID, direction: SnapDirection, hidden: Set<WindowID> = []) -> Bool {
+        guard let neighborID = tree.neighborID(from: id, direction: direction, hidden: hidden),
+              tree.swap(id, neighborID) else {
             return false
         }
-        markFocused(focusedID)
+        markFocused(id)
         return true
     }
-    mutating func resizeFocused(_ focusedID: WindowIdentity, direction: SnapDirection) -> Bool {
-        guard tree.resize(focusedID: focusedID, direction: direction) else { return false }
-        markFocused(focusedID)
+    mutating func resize(_ id: WindowID, direction: SnapDirection, hidden: Set<WindowID> = []) -> Bool {
+        guard tree.resize(focusedID: id, direction: direction, hidden: hidden) else { return false }
+        markFocused(id)
         return true
     }
-    mutating func reflectResize(focusedID: WindowIdentity, observedSlot: TileSlot) -> Bool {
-        guard tree.reflectResize(focusedID: focusedID, observedSlot: observedSlot) else { return false }
-        markFocused(focusedID)
+    mutating func reflectResize(_ id: WindowID, observedSlot: TileSlot, hidden: Set<WindowID> = []) -> Bool {
+        guard tree.reflectResize(focusedID: id, observedSlot: observedSlot, hidden: hidden) else { return false }
+        markFocused(id)
         return true
     }
-    mutating func toggleOrientation(focusedID: WindowIdentity) -> Bool {
-        guard tree.toggleOrientation(focusedID: focusedID) else { return false }
-        markFocused(focusedID)
+    mutating func toggleOrientation(_ id: WindowID, hidden: Set<WindowID> = []) -> Bool {
+        guard tree.toggleOrientation(focusedID: id, hidden: hidden) else { return false }
+        markFocused(id)
         return true
     }
-    mutating func move(_ id: WindowIdentity, onto target: WindowIdentity, placement: TilePlacement) -> Bool {
-        guard tree.move(id, onto: target, placement: placement) else { return false }
+    mutating func move(
+        _ id: WindowID,
+        onto target: WindowID,
+        placement: TilePlacement,
+        hidden: Set<WindowID> = []
+    ) -> Bool {
+        guard tree.move(id, onto: target, placement: placement, hidden: hidden) else { return false }
         markFocused(id)
         return true
     }
     mutating func balance() {
         tree.balance()
-        if let lastFocusedID, tree.contains(lastFocusedID) {
-            markFocused(lastFocusedID)
-        }
-    }
-    mutating func limitTileCount(to maxCount: Int) -> [WindowIdentity] {
-        let removed = tree.limitTileCount(to: maxCount)
-        if let lastFocusedID, !tree.contains(lastFocusedID) {
-            self.lastFocusedID = tree.firstID
-        }
-        clearZoomIfInvalid()
-        return removed
-    }
-    private mutating func clearZoomIfInvalid() {
-        if let zoomedWindowID, !tree.contains(zoomedWindowID) {
-            self.zoomedWindowID = nil
-        }
     }
 }
