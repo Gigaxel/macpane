@@ -137,6 +137,42 @@ final class Scenario {
             (a, tile(0, 0, 0.5, 1)), (b, tile(0.5, 0, 0.5, 1))
         ], timeout: 4)
 
+        // A window that goes native fullscreen and back finds every tile where it left it. On the
+        // way it is ordered out of the desktop and, for a moment, on no Space at all.
+        let c2 = openWindow("C2")
+        try await waitUntil("a third window joins the tiles", timeout: 3) { [self] in
+            guard let screen = try? screenInfo() else { return false }
+            return [a, b, c2].allSatisfy { window in
+                bounds(window).map { screen.frame.contains($0) } ?? false
+            } && bounds(a).map { FramePlanner.approximatelyEqual($0.size, tile(0, 0, 0.5, 1).frame(in: screen.frame, gap: gap, smartOuterGap: true).size) } ?? false
+        }
+        try await pause(0.3)
+        let beforeFullscreen = [a, b, c2].map { bounds($0) }
+        a.collectionBehavior.insert(.fullScreenPrimary)
+        a.toggleFullScreen(nil)
+        try await waitUntil("the window enters fullscreen", timeout: 5) { a.styleMask.contains(.fullScreen) }
+        try await pause(1.0)
+        a.toggleFullScreen(nil)
+        try await waitUntil("the window leaves fullscreen", timeout: 5) { !a.styleMask.contains(.fullScreen) }
+        try await waitUntil("every tile is where it was before fullscreen", timeout: 4) { [self] in
+            zip([a, b, c2], beforeFullscreen).allSatisfy { window, before in
+                guard let before, let now = bounds(window) else { return false }
+                return FramePlanner.approximatelyEqual(now, before)
+            }
+        }
+        try await pause(0.5)
+        let afterFullscreen = [a, b, c2].map { bounds($0) }
+        guard zip(afterFullscreen, beforeFullscreen).allSatisfy({ after, before in
+            after.flatMap { after in before.map { FramePlanner.approximatelyEqual(after, $0) } } ?? false
+        }) else {
+            throw Failure(description: "tiles moved after fullscreen: \(beforeFullscreen) -> \(afterFullscreen)")
+        }
+        print("ok  a fullscreen round trip keeps every tile")
+        c2.close()
+        try await expect("closing the third window restores the two tiles", [
+            (a, tile(0, 0, 0.5, 1)), (b, tile(0.5, 0, 0.5, 1))
+        ], timeout: 3)
+
         // Keyboard commands. Focus picks the window the rest act on.
         tiler.handle(action: .focus(.left))
         command(.swap(.right))

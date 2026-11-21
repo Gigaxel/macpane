@@ -14,6 +14,9 @@ struct ServerWindow: Equatable {
     let attributes: UInt64
     let bounds: CGRect
     let space: UInt64
+    /// The Space of a window that is listed but on none of the Spaces asked about. No display
+    /// ever shows it, unlike 0, which stands for a display whose Space is unknown.
+    static let noSpace = UInt64.max
 
     /// Tag bits observed on macOS 13 through 27. A window that is ordered out keeps its Space and
     /// its bounds, and these say why it is not showing.
@@ -200,14 +203,15 @@ final class WindowServer {
         return DisplaySpace(id: id, isUser: functions.spaceType(connection, id) == 0)
     }
 
-    /// The Space a window is assigned to, whether or not it is showing.
-    func space(of window: WindowID) -> UInt64? {
+    /// Every Space a window is assigned to, whether or not it is showing. Empty when it is on none
+    /// or SkyLight is unavailable.
+    func spaces(of window: WindowID) -> [UInt64] {
         guard let functions,
               let spaces = functions.copySpacesForWindows(connection, 0x7, [NSNumber(value: window)] as CFArray)?
                   .takeRetainedValue() as? [NSNumber] else {
-            return nil
+            return []
         }
-        return spaces.first?.uint64Value
+        return spaces.map(\.uint64Value)
     }
 
     // MARK: - Windows
@@ -247,7 +251,8 @@ final class WindowServer {
                 tags: window.tags,
                 attributes: window.attributes,
                 bounds: window.bounds,
-                space: spaceByWindow[window.id] ?? spaces[0]
+                // A window that left every Space between the two queries is on none of them.
+                space: spaces.count == 1 ? spaces[0] : spaceByWindow[window.id] ?? ServerWindow.noSpace
             ))
         }
         return (windows, shared)

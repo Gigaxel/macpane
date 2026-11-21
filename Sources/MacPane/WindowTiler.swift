@@ -55,6 +55,9 @@ final class WindowTiler {
     /// Windows whose handle is being replaced, each with the identity of the repair under way.
     private var rehandling: [WindowID: Int] = [:]
     private var lastRepair = 0
+    /// Repairs of windows that were out of view when their app answered, which says nothing about
+    /// them: a fullscreen window cannot be moved or resized. Each starts over when it is back.
+    private var repairsAwaitingReturn: Set<WindowID> = []
     /// On-screen windows their app described as something not to tile (a dialog, a panel), with
     /// the app they belong to. The answer is asked for again when that app next reports a change,
     /// because a window can start out as one thing and become another.
@@ -288,6 +291,7 @@ final class WindowTiler {
         resolving.removeAll()
         awaitingAdoption.removeAll()
         rehandling.removeAll()
+        repairsAwaitingReturn.removeAll()
         ignored.removeAll()
         hasAdoptedInitialWindows = false
         frameRecords.removeAll()
@@ -518,6 +522,7 @@ final class WindowTiler {
         dragged.remove(id)
         closing.removeValue(forKey: id)
         rehandling.removeValue(forKey: id)
+        repairsAwaitingReturn.remove(id)
         relocating.removeValue(forKey: id)
         traceStarts.removeValue(forKey: id)
         accessibilityFocus = accessibilityFocus.filter { $0.value != id }
@@ -649,8 +654,9 @@ final class WindowTiler {
         }
     }
 
-    /// Forgets managed windows that are gone. Returns the ones that are off screen only because a
-    /// tab switch is replacing them.
+    /// Forgets managed windows that are gone; one that is merely out of view keeps its tile (see
+    /// `WindowDeparturePlanner`). Returns the ones that are off screen only because a tab switch is
+    /// replacing them.
     @discardableResult
     private func removeDepartedWindows(_ world: World) -> Set<WindowID> {
         for id in ignored.keys where world.byID[id] == nil {
@@ -662,42 +668,71 @@ final class WindowTiler {
         for id in awaitingAdoption.keys where world.byID[id] == nil {
             awaitingAdoption.removeValue(forKey: id)
         }
-        for (id, deadline) in closing where world.byID[id] == nil || deadline <= world.now {
-            closing.removeValue(forKey: id)
-            if world.byID[id] != nil {
-                // The app destroyed the element but the window is still here: it rebuilt its
-                // windows, and the handle is dead.
-                replaceHandle(of: id)
+        var beingReplaced: Set<WindowID> = []
+        let missing = model.windows.keys.filter { world.byID[$0] == nil }
+        if !missing.isEmpty {
+            let described = server.describe(missing)
+            let showingSpaces = Set(world.screens.map(\.space))
+            for id in missing {
+                let window = described[id]
+                let isMinimized = window.map { $0.isMinimized || $0.isHiddenWithApplication } ?? false
+                // The public window list has no tags or Spaces to weigh an announcement against.
+                let announcedClosing = server.usesSkyLight && closing[id] != nil
+                let isExpectedHere = (model.workspace(of: id)?.space ?? model.floating[id]?.space)
+                    .map(showingSpaces.contains) ?? false
+                // Asked only when it can matter, since every window on another Space is missing.
+                var knownSpaces: [UInt64]?
+                func spaces() -> [UInt64] {
+                    if knownSpaces == nil {
+                        knownSpaces = server.usesSkyLight && window != nil ? server.spaces(of: id) : []
+                    }
+                    return knownSpaces ?? []
+                }
+                // A tab switched away from, or closed, is ordered out where its workspace is
+                // showing while its successor opens at the same spot. It holds its tile until then.
+                if let window, server.usesSkyLight, !isMinimized, isExpectedHere,
+                   isBeingReplaced(id, bounds: window.bounds, world),
+                   spaces().isEmpty || spaces().contains(where: showingSpaces.contains) {
+                    beingReplaced.insert(id)
+                    continue
+                }
+                if let window, server.usesSkyLight, !isMinimized, isExpectedHere,
+                   spaces().isEmpty || spaces().contains(where: showingSpaces.contains) {
+                    handOverTabTile(from: id, bounds: window.bounds, world)
+                }
+                switch WindowDeparturePlanner.verdict(
+                    exists: window != nil,
+                    announcedClosing: announcedClosing,
+                    isMinimized: isMinimized,
+                    isHomeShowing: isExpectedHere,
+                    spaces: announcedClosing && !isMinimized && isExpectedHere ? spaces() : [],
+                    showingSpaces: showingSpaces
+                ) {
+                case .gone:
+                    forget(id)
+                case .rebuilt:
+                    closing.removeValue(forKey: id)
+                    replaceHandle(of: id, returning: true)
+                case .hidden:
+                    break
+                }
             }
         }
-        if let nextDeadline = closing.values.min() {
+        for id in repairsAwaitingReturn where world.onScreen.contains(id) {
+            repairsAwaitingReturn.remove(id)
+            startHandleRepair(of: id, returning: true)
+        }
+        // An announcement stands while the window is out of view, so a window closed while
+        // minimized or on another Space is let go once it would show. One still listed past its
+        // deadline was not closed: its app rebuilt it, and the handle is dead.
+        for (id, deadline) in closing where world.byID[id] != nil && deadline <= world.now {
+            closing.removeValue(forKey: id)
+            // An app rebuilds an element around fullscreen too, so this one may still be on its way.
+            replaceHandle(of: id, returning: true)
+        }
+        if let nextDeadline = closing.filter({ world.byID[$0.key] != nil }).values.min() {
             // Only the earliest wake is kept, so the deadline is asked for again every time.
             scheduleWake(at: nextDeadline, now: world.now)
-        }
-        let missing = model.windows.keys.filter { world.byID[$0] == nil }
-        guard !missing.isEmpty else { return [] }
-        let described = server.describe(missing)
-        let showingSpaces = Set(world.screens.map(\.space))
-        var beingReplaced: Set<WindowID> = []
-        for id in missing {
-            guard let window = described[id] else {
-                forget(id)
-                continue
-            }
-            // A window that still exists but is not showing keeps its place when it is minimized,
-            // hidden with its app, or on a Space that is not showing. Otherwise it was closed and
-            // the app merely kept it around; the public window list cannot tell these apart.
-            guard server.usesSkyLight, !window.isMinimized, !window.isHiddenWithApplication,
-                  let expected = model.workspace(of: id)?.space ?? model.floating[id]?.space,
-                  showingSpaces.contains(expected),
-                  server.space(of: id).map(showingSpaces.contains) ?? true else {
-                continue
-            }
-            if isBeingReplaced(id, bounds: window.bounds, world) {
-                beingReplaced.insert(id)
-            } else {
-                forget(id)
-            }
         }
         return beingReplaced
     }
@@ -715,6 +750,51 @@ final class WindowTiler {
                 resolving[window.id]?.nextAttemptAt != .max &&
                 FramePlanner.approximatelyEqual(window.bounds, bounds)
         }
+    }
+
+    /// Selecting another tab of a merged window group orders the tab before it out and shows the
+    /// new one at the same spot, and both are managed. The new one takes over that tile, so the
+    /// group stays in one place.
+    private func handOverTabTile(from id: WindowID, bounds: CGRect, _ world: World) {
+        guard let pid = model.windows[id]?.pid, let key = model.workspace(of: id), model.isShowing(key),
+              let state = model.trees[key], let screen = world.screen(for: key.scope),
+              let successor = world.windows.first(where: { window in
+                  window.pid == pid && window.id != id && world.onScreen.contains(window.id) &&
+                      model.workspace(of: window.id) == key &&
+                      FramePlanner.approximatelyEqual(window.bounds, bounds)
+              }) else {
+            return
+        }
+        // Only when the exchange is what puts the new tab's tile where it already is, so a
+        // handover that already happened is never undone.
+        let gap = CGFloat(settings.gapPixels)
+        let hidden = model.hidden(in: key, onScreen: world.onScreen)
+        // A terminal snaps to whole cells and stops short of its tile, so the new tab counts as in
+        // a tile it fills from the tile's corner. Of two such tiles the tighter one is the one it
+        // was given: a larger tile can share that corner.
+        // Tabs of one group share a frame, so the larger minimum either has learned holds for both.
+        var minimums = model.minimumSizes(in: key)
+        if let inherited = minimums[id] {
+            let own = minimums[successor.id] ?? .zero
+            minimums[successor.id] = CGSize(
+                width: max(own.width, inherited.width), height: max(own.height, inherited.height)
+            )
+        }
+        func tileArea(_ state: ScreenTileState) -> CGFloat? {
+            guard let tile = state.frames(
+                in: screen.frame, gap: gap, accommodating: minimums, hidden: hidden
+            )[successor.id].map(FramePlanner.sanitized),
+                FramePlanner.fits(successor.bounds, in: tile) else {
+                return nil
+            }
+            return tile.width * tile.height
+        }
+        var exchanged = state
+        guard exchanged.exchange(id, successor.id), let exchangedArea = tileArea(exchanged),
+              tileArea(state).map({ exchangedArea < $0 - 1 }) ?? true else {
+            return
+        }
+        model.edit(key) { $0.exchange(id, successor.id) }
     }
 
     /// The display that takes over some windows whose own display is gone: the one most of them
@@ -807,21 +887,30 @@ final class WindowTiler {
     /// Asks the app for a fresh handle to a window whose handle has died. The window keeps its tile
     /// meanwhile. It is forgotten, to be found again as new, only when the app says it is not a
     /// window to tile or keeps failing to produce it.
-    private func replaceHandle(of id: WindowID) {
+    /// `returning` as for `startHandleRepair`.
+    private func replaceHandle(of id: WindowID, returning: Bool = false) {
         guard model.windows[id] != nil, rehandling[id] == nil else { return }
-        startHandleRepair(of: id)
+        startHandleRepair(of: id, returning: returning)
     }
 
     /// Starts a repair from its first attempt. Anything still in flight for an earlier repair of
     /// the same window no longer matches and ends there.
-    private func startHandleRepair(of id: WindowID) {
+    /// `returning` is for a window just back in view, which may still be finishing its way out of
+    /// fullscreen and cannot be resized until it has.
+    private func startHandleRepair(of id: WindowID, returning: Bool = false) {
         lastRepair += 1
         rehandling[id] = lastRepair
-        requestHandle(for: id, repair: lastRepair, attempt: 1)
+        requestHandle(for: id, repair: lastRepair, attempt: 1, returning: returning)
     }
 
-    private func requestHandle(for id: WindowID, repair: Int, attempt: Int) {
+    private func requestHandle(for id: WindowID, repair: Int, attempt: Int, returning: Bool) {
         guard let window = model.windows[id] else { return }
+        // A fullscreen or minimized window cannot be moved or resized, so the app would call it
+        // untileable. Its repair waits until it is back, with every attempt left.
+        guard readWorld().onScreen.contains(id) else {
+            repairsAwaitingReturn.insert(id)
+            return
+        }
         application(for: window.pid).resolve([id]) { [weak self] resolutions in
             guard let self, self.rehandling[id] == repair, self.model.isManaged(id) else { return }
             // Apps hide their windows from Accessibility while the screen is locked, so an answer
@@ -830,20 +919,28 @@ final class WindowTiler {
             switch resolutions[id] {
             case .manageable(let handle, _)?:
                 self.rehandling.removeValue(forKey: id)
+                self.repairsAwaitingReturn.remove(id)
                 self.model.setHandle(handle, of: id)
                 self.frameRecords.removeValue(forKey: id)
                 self.application(for: window.pid).watch(handle, id: id)
                 self.setNeedsReconcile()
-            case .unavailable? where attempt < self.maximumResolutionAttempts:
+            case .unavailable? where attempt < self.maximumResolutionAttempts,
+                 .excluded? where returning && attempt < self.maximumResolutionAttempts:
                 // The app is busy or still rebuilding the window. Ask again shortly.
                 let delay = min(0.016 * pow(2, Double(attempt - 1)), 1.0)
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                     // While suspended the entry stays, and the repair starts over on resume.
                     guard let self, !self.isStopping, self.suspensions.isEmpty,
                           self.rehandling[id] == repair else { return }
-                    self.requestHandle(for: id, repair: repair, attempt: attempt + 1)
+                    self.requestHandle(for: id, repair: repair, attempt: attempt + 1, returning: returning)
                 }
             default:
+                // An answer counts only if the window is still in view: it was when asked.
+                guard self.readWorld().onScreen.contains(id) else {
+                    // The window keeps its tile, and frames stay unwritten until it has a handle.
+                    self.repairsAwaitingReturn.insert(id)
+                    return
+                }
                 self.forget(id)
                 self.setNeedsReconcile()
             }
@@ -932,9 +1029,29 @@ final class WindowTiler {
                 (model.workspace(of: candidate.id)?.scope ?? model.floating[candidate.id]) == screen.scope
         }.map(\.id)
         guard !candidates.isEmpty else { return nil }
+        let showingSpaces = Set(world.screens.map(\.space))
         return server.describe(candidates).values.first { candidate in
-            !candidate.isMinimized && !candidate.isHiddenWithApplication &&
-                FramePlanner.approximatelyEqual(candidate.bounds, window.bounds)
+            guard !candidate.isMinimized, !candidate.isHiddenWithApplication,
+                  FramePlanner.approximatelyEqual(candidate.bounds, window.bounds) else {
+                return false
+            }
+            // A tab opened in a window parked on a hidden workspace shows at the park spot. Any
+            // other window of a hidden workspace was put out of view by its app, not by a tab.
+            if let key = model.workspace(of: candidate.id), !model.isShowing(key) {
+                let parked = FramePlanner.parkOrigin(
+                    windowSize: candidate.bounds.size,
+                    screenFrame: screen.frame,
+                    otherScreenFrames: world.screens.filter { $0.key != screen.key }.map(\.frame)
+                )
+                // AppKit can stop a parked window short of the corner, off every display all the same.
+                guard FramePlanner.approximatelyEqual(candidate.bounds.origin, parked) ||
+                    world.screens.allSatisfy({ FramePlanner.isOffDisplay(candidate.bounds, $0.frame) }) else {
+                    return false
+                }
+            }
+            // One in fullscreen or moved to another Space is not a tab of this window.
+            let spaces = server.spaces(of: candidate.id)
+            return spaces.isEmpty || spaces.contains(where: showingSpaces.contains)
         }?.id
     }
 
