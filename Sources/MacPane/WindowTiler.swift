@@ -21,6 +21,10 @@ final class WindowTiler {
         /// How an app's windows are reached: through Accessibility, or in the integration tests
         /// directly, since a process cannot see its own windows through Accessibility.
         var makePort: (pid_t) -> ApplicationPort = { AXApplicationPort(pid: $0) }
+        /// The tests drive their own windows directly, so they run with the screen locked too.
+        var isScreenLocked: () -> Bool = {
+            (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool == true
+        }
     }
 
     private let environment: Environment
@@ -101,6 +105,8 @@ final class WindowTiler {
     private enum Suspension: Hashable {
         case sleep
         case inactiveSession
+        /// While the screen is locked, apps show Accessibility nothing but themselves: no windows.
+        case lockedScreen
     }
     private var isRunning = false
     private var isStopping = false
@@ -108,6 +114,7 @@ final class WindowTiler {
     private var isReconcileScheduled = false
     private var wake: (item: DispatchWorkItem, deadline: UInt64)?
     private var workspaceObservers: [NSObjectProtocol] = []
+    private var lockObservers: [NSObjectProtocol] = []
     private var screenObserver: NSObjectProtocol?
     private var permissionTimer: Timer?
     private var fallbackTimer: Timer?
@@ -256,6 +263,10 @@ final class WindowTiler {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
         workspaceObservers.removeAll()
+        for observer in lockObservers {
+            DistributedNotificationCenter.default().removeObserver(observer)
+        }
+        lockObservers.removeAll()
         if let screenObserver {
             NotificationCenter.default.removeObserver(screenObserver)
             self.screenObserver = nil
@@ -339,6 +350,24 @@ final class WindowTiler {
         }
         observe(NSWorkspace.sessionDidResignActiveNotification) { tiler, _ in tiler.suspend(.inactiveSession) }
         observe(NSWorkspace.sessionDidBecomeActiveNotification) { tiler, _ in tiler.resume(.inactiveSession) }
+        // The lock state is read rather than taken from the notification, which only says that it
+        // may have changed.
+        let distributedCenter = DistributedNotificationCenter.default()
+        for name in ["com.apple.screenIsLocked", "com.apple.screenIsUnlocked"] {
+            lockObservers.append(distributedCenter.addObserver(
+                forName: Notification.Name(name), object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                if self.environment.isScreenLocked() {
+                    self.suspend(.lockedScreen)
+                } else {
+                    self.resume(.lockedScreen)
+                }
+            })
+        }
+        if environment.isScreenLocked() {
+            suspensions.insert(.lockedScreen)
+        }
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
@@ -386,14 +415,18 @@ final class WindowTiler {
     }
 
     private func suspend(_ reason: Suspension) {
+        guard !isStopping else { return }
         suspensions.insert(reason)
         cancelSlide()
         cancelPendingWrites()
     }
     private func resume(_ reason: Suspension) {
-        guard suspensions.remove(reason) != nil, suspensions.isEmpty else { return }
+        guard !isStopping, suspensions.remove(reason) != nil, suspensions.isEmpty else { return }
         AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), AXApplication.messagingTimeout)
         displayLayout = currentDisplayLayout()
+        // Whatever apps answered while the session was away is asked again.
+        resolving = resolving.filter { $0.value.isInFlight }
+        ignored.removeAll()
         // Displays come back one at a time after a wake or unlock.
         pauseLayout(for: 1.8)
     }

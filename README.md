@@ -82,7 +82,7 @@ For a stable local install, use:
 
 That builds and writes the app to `~/Applications/MacPane.app` by default. You can override the destination with `INSTALL_DIR=/Applications ./Scripts/install.sh`.
 
-`./Scripts/integration-test.sh` runs the tiler against real windows that the test opens itself. It needs a logged-in desktop session and moves only its own windows.
+`./Scripts/integration-test.sh` runs the tiler against real windows that the test opens itself, once on the private WindowServer calls and once on the public fallback. It needs a logged-in desktop session and moves only its own windows.
 
 ### Signing
 

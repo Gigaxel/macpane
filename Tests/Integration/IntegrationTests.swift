@@ -50,7 +50,8 @@ final class Scenario {
             environment: WindowTiler.Environment(
                 isAccessibilityTrusted: { true },
                 managesProcess: { $0 == getpid() },
-                makePort: { _ in LocalApplicationPort() }
+                makePort: { _ in LocalApplicationPort() },
+                isScreenLocked: { false }
             ),
             settings: WindowTilerSettings(defaults: defaults)
         )
