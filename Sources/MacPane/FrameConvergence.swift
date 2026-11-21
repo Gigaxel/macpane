@@ -81,10 +81,14 @@ enum FramePlanner {
         defer { record = current }
 
         if matches(goal, observed) {
+            // On the goal, so there is nothing left to judge or wait for. A change from here on is
+            // someone else's, and a late answer to the write that got it here says nothing new.
             current.hasConverged = true
             current.attempts = 0
             current.accepted = nil
             current.settling = nil
+            current.hasUnjudgedWrite = false
+            current.pendingToken = nil
             return .none
         }
         if current.pendingToken != nil {

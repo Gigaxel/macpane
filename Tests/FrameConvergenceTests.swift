@@ -28,6 +28,7 @@ extension TilingTests {
         testUnansweredWritesAreRetriedLater()
         testRefusedWritesAreAccepted()
         testLaterChangeToAnAcceptedFrameIsWrittenNotJudged()
+        testLaterChangeToAConvergedFrameIsWrittenNotJudged()
         testSanitizedFrameRoundsToWholePoints()
     }
 
@@ -357,8 +358,8 @@ extension TilingTests {
               record?.accepted == nil else {
             fail("an app that never answered has not refused the frame; it is tried again later")
         }
-        _ = decide(observed: elsewhere, record: &record, now: FramePlanner.attemptWindow + second)
-        guard decide(observed: elsewhere, record: &record, now: FramePlanner.attemptWindow + second + settle) == .write else {
+        guard decide(observed: elsewhere, record: &record, now: FramePlanner.attemptWindow + second) == .write,
+              record?.attempts == 1 else {
             fail("once the app has had time to recover the frame is written again")
         }
     }
@@ -413,6 +414,29 @@ extension TilingTests {
         let grown = CGRect(x: 100, y: 50, width: 800, height: 400)
         guard decide(observed: grown, record: &record, now: 3 * second) == .write else {
             fail("a window that grows on its own long after it settled has not stated a minimum")
+        }
+    }
+
+    private static func testLaterChangeToAConvergedFrameIsWrittenNotJudged() {
+        var record: FrameRecord?
+        write(observed: elsewhere, record: &record, token: 1)
+        guard decide(observed: target, record: &record, now: millisecond) == .none else {
+            fail("a write that lands on the goal converges")
+        }
+        // The write was never judged, because the frame matched. What the app does later is still
+        // not an answer to it.
+        let shrunk = CGRect(x: target.minX, y: target.minY, width: target.width - 200, height: target.height)
+        guard decide(observed: shrunk, record: &record, now: second) == .write else {
+            fail("a converged window that shrinks on its own is put back, not accepted as a shortfall")
+        }
+        record?.pendingToken = 2
+        record?.pendingSince = second
+        _ = decide(observed: target, record: &record, now: second + millisecond)
+        // The answer to the second write arrives after the frame already matched.
+        FramePlanner.absorb(token: 2, error: .success, record: &record, now: second + 2 * millisecond)
+        let grown = CGRect(x: target.minX, y: target.minY, width: target.width + 300, height: target.height)
+        guard decide(observed: grown, record: &record, now: 3 * second) == .write else {
+            fail("a converged window that grows on its own has not stated a minimum")
         }
     }
 
