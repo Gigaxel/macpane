@@ -28,6 +28,9 @@ struct FrameRecord: Equatable {
     var lastWriteSucceeded = true
     /// True when the last write got no answer at all, as opposed to an error.
     var lastWriteWentUnanswered = false
+    /// True from the moment a write is answered (or given up on) until its effect has been judged.
+    /// Without it, a window that someone moves later would be judged as if a write had just landed.
+    var hasUnjudgedWrite = false
     /// Set after a timeout: the app is given until then before it is written to again.
     var retryNotBefore: UInt64 = 0
     /// True once the window has matched this goal. A later mismatch is then a change someone else
@@ -92,6 +95,7 @@ enum FramePlanner {
             current.pendingToken = nil
             current.lastWriteSucceeded = false
             current.lastWriteWentUnanswered = true
+            current.hasUnjudgedWrite = true
         }
         if let accepted = current.accepted {
             if approximatelyEqual(accepted, observed) {
@@ -106,7 +110,7 @@ enum FramePlanner {
         if current.hasConverged, pointerDown {
             return .userMoved
         }
-        if current.attempts > 0 {
+        if current.hasUnjudgedWrite {
             if now < current.retryNotBefore {
                 return .settling(until: current.retryNotBefore)
             }
@@ -118,6 +122,7 @@ enum FramePlanner {
                 return .settling(until: settling.since + settleDelay)
             }
             current.settling = nil
+            current.hasUnjudgedWrite = false
             if current.lastWriteSucceeded, case .tile(let target) = goal {
                 if case .clamped(let minimum) = FrameVerificationClassifier.classify(
                     target: target, observed: observed, tolerance: tolerance
@@ -155,6 +160,7 @@ enum FramePlanner {
         }
         current.attempts += 1
         current.hasConverged = false
+        current.hasUnjudgedWrite = false
         current.settling = nil
         return .write
     }
@@ -166,6 +172,7 @@ enum FramePlanner {
         current.pendingToken = nil
         current.lastWriteSucceeded = error == .success
         current.lastWriteWentUnanswered = error == .cannotComplete
+        current.hasUnjudgedWrite = true
         current.settling = nil
         if error == .cannotComplete {
             // The app is not answering. Give it longer each time before writing again.

@@ -353,21 +353,17 @@ final class WindowTiler {
         }
         observe(NSWorkspace.sessionDidResignActiveNotification) { tiler, _ in tiler.suspend(.inactiveSession) }
         observe(NSWorkspace.sessionDidBecomeActiveNotification) { tiler, _ in tiler.resume(.inactiveSession) }
-        // The lock state is read rather than taken from the notification, which only says that it
-        // may have changed.
         let distributedCenter = DistributedNotificationCenter.default()
-        for name in ["com.apple.screenIsLocked", "com.apple.screenIsUnlocked"] {
-            lockObservers.append(distributedCenter.addObserver(
-                forName: Notification.Name(name), object: nil, queue: .main
-            ) { [weak self] _ in
-                guard let self else { return }
-                if self.environment.isScreenLocked() {
-                    self.suspend(.lockedScreen)
-                } else {
-                    self.resume(.lockedScreen)
-                }
-            })
-        }
+        lockObservers.append(distributedCenter.addObserver(
+            forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.suspend(.lockedScreen)
+        })
+        lockObservers.append(distributedCenter.addObserver(
+            forName: Notification.Name("com.apple.screenIsUnlocked"), object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.resume(.lockedScreen)
+        })
         if environment.isScreenLocked() {
             suspensions.insert(.lockedScreen)
         }
@@ -508,6 +504,10 @@ final class WindowTiler {
     private func forget(_ id: WindowID) {
         PerformanceTrace.event("window-forgotten", "window \(id)")
         model.forget(id)
+        forgetTracking(of: id)
+    }
+    /// Drops everything the tiler itself keeps about a window that the model no longer has.
+    private func forgetTracking(of id: WindowID) {
         frameRecords.removeValue(forKey: id)
         dragged.remove(id)
         closing.removeValue(forKey: id)
@@ -664,6 +664,10 @@ final class WindowTiler {
                 replaceHandle(of: id)
             }
         }
+        if let nextDeadline = closing.values.min() {
+            // Only the earliest wake is kept, so the deadline is asked for again every time.
+            scheduleWake(at: nextDeadline, now: world.now)
+        }
         let missing = model.windows.keys.filter { world.byID[$0] == nil }
         guard !missing.isEmpty else { return [] }
         let described = server.describe(missing)
@@ -795,20 +799,31 @@ final class WindowTiler {
     }
 
     /// Asks the app for a fresh handle to a window whose handle has died. The window keeps its tile
-    /// meanwhile; only if the app no longer lists it is it forgotten, to be found again as new.
-    private func replaceHandle(of id: WindowID) {
-        guard let window = model.windows[id], !rehandling.contains(id) else { return }
+    /// meanwhile. It is forgotten, to be found again as new, only when the app says it is not a
+    /// window to tile or keeps failing to produce it.
+    private func replaceHandle(of id: WindowID, attempt: Int = 1) {
+        guard let window = model.windows[id], attempt > 1 || !rehandling.contains(id) else { return }
         rehandling.insert(id)
         application(for: window.pid).resolve([id]) { [weak self] resolutions in
-            guard let self, self.rehandling.remove(id) != nil, self.model.isManaged(id) else { return }
-            if case .manageable(let handle, _)? = resolutions[id] {
+            guard let self, self.rehandling.contains(id), self.model.isManaged(id) else { return }
+            switch resolutions[id] {
+            case .manageable(let handle, _)?:
+                self.rehandling.remove(id)
                 self.model.setHandle(handle, of: id)
                 self.frameRecords.removeValue(forKey: id)
                 self.application(for: window.pid).watch(handle, id: id)
-            } else {
+                self.setNeedsReconcile()
+            case .unavailable? where attempt < self.maximumResolutionAttempts:
+                // The app is busy or still rebuilding the window. Ask again shortly.
+                let delay = min(0.016 * pow(2, Double(attempt - 1)), 1.0)
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self, !self.isStopping, self.rehandling.contains(id) else { return }
+                    self.replaceHandle(of: id, attempt: attempt + 1)
+                }
+            default:
                 self.forget(id)
+                self.setNeedsReconcile()
             }
-            self.setNeedsReconcile()
         }
     }
 
@@ -863,7 +878,11 @@ final class WindowTiler {
         let key = model.activeKey(on: screen)
         if let replaced = replacedWindow(by: window, on: screen, world) {
             model.adopt(managed, replacing: replaced)
-            frameRecords.removeValue(forKey: replaced)
+            // Focus that was on the old tab is on its successor.
+            if focusedWindow == replaced { focusedWindow = window.id }
+            if observedFocus == replaced { observedFocus = window.id }
+            if focusIntent?.window == replaced { focusIntent?.window = window.id }
+            forgetTracking(of: replaced)
         } else if hasAdoptedInitialWindows, settings.autoFloatSmallWindowsEnabled, isBelowAutoFloatSize(window.bounds) {
             managed.autoFloatedAt = world.now
             model.adoptFloating(managed, in: screen.scope)
@@ -1949,8 +1968,10 @@ final class WindowTiler {
                 // With tiling on, every tile is put right. With it off, windows stay where the user
                 // left them, except any that are still parked out of view.
                 if let observed = world.byID[id]?.bounds ?? server.bounds(of: id) {
-                    let visible = observed.intersection(screen.frame)
-                    let isInView = !visible.isNull && visible.width * visible.height >= observed.width * observed.height / 2
+                    let isInView = world.screens.contains { display in
+                        let visible = observed.intersection(display.frame)
+                        return !visible.isNull && visible.width * visible.height >= observed.width * observed.height / 2
+                    }
                     if FramePlanner.approximatelyEqual(observed, target) || (!settings.tilingEnabled && isInView) {
                         continue
                     }

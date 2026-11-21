@@ -27,6 +27,7 @@ extension TilingTests {
         testFrameTwoPointsOffSettlesWithoutLooping()
         testUnansweredWritesAreRetriedLater()
         testRefusedWritesAreAccepted()
+        testLaterChangeToAnAcceptedFrameIsWrittenNotJudged()
         testSanitizedFrameRoundsToWholePoints()
     }
 
@@ -161,8 +162,7 @@ extension TilingTests {
         _ = decide(observed: elsewhere, record: &record, now: now)
         let later = FramePlanner.attemptWindow + second
         let moved = elsewhere.offsetBy(dx: 40, dy: 0)
-        _ = decide(observed: moved, record: &record, now: later)
-        guard decide(observed: moved, record: &record, now: later + settle) == .write, record?.attempts == 1 else {
+        guard decide(observed: moved, record: &record, now: later) == .write, record?.attempts == 1 else {
             fail("once the budget window has passed, a window that moves again is put back")
         }
     }
@@ -390,6 +390,29 @@ extension TilingTests {
         }
         guard decide(observed: elsewhere, record: &record, now: now) == .none, record?.accepted == elsewhere else {
             fail("an app that answers every write with an error has refused; the window is left alone")
+        }
+    }
+
+    private static func testLaterChangeToAnAcceptedFrameIsWrittenNotJudged() {
+        var record: FrameRecord?
+        let snapped = CGRect(x: 100, y: 50, width: 494, height: 391)
+        write(observed: elsewhere, record: &record, token: 1)
+        _ = decide(observed: snapped, record: &record, now: millisecond)
+        _ = decide(observed: snapped, record: &record, now: millisecond + settle)
+        // Much later the app shrinks the window, and then grows it past its tile. Neither is the
+        // answer to a write: the first must not be accepted as a shortfall, nor the second learned
+        // as a minimum.
+        let shrunk = CGRect(x: 100, y: 50, width: 300, height: 391)
+        guard decide(observed: shrunk, record: &record, now: second) == .write else {
+            fail("a window that changes long after it settled is put back, not accepted where it is")
+        }
+        record?.pendingToken = 2
+        FramePlanner.absorb(token: 2, error: .success, record: &record, now: second)
+        _ = decide(observed: snapped, record: &record, now: second + millisecond)
+        _ = decide(observed: snapped, record: &record, now: second + millisecond + settle)
+        let grown = CGRect(x: 100, y: 50, width: 800, height: 400)
+        guard decide(observed: grown, record: &record, now: 3 * second) == .write else {
+            fail("a window that grows on its own long after it settled has not stated a minimum")
         }
     }
 

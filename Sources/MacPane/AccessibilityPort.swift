@@ -136,8 +136,6 @@ final class AXApplicationPort: ApplicationPort {
     /// Kept alive here because the observer only holds a raw pointer to each.
     private var watches: [WindowID: WindowWatch] = [:]
     private var retiredWatches: [WindowWatch] = []
-    /// Set as soon as the app has accepted the registrations, before the source is installed.
-    private var isRegistered = false
     private var isStopped = false
 
     init(pid: pid_t) {
@@ -213,18 +211,20 @@ final class AXApplicationPort: ApplicationPort {
             registeredAny = registeredAny || error == .success || error == .notificationAlreadyRegistered
         }
         guard registeredAny else { return }
-        lock.lock()
-        isRegistered = true
-        lock.unlock()
-        // The source goes in on the main thread, where `stopObserving` takes it out, so the two
+        // The observer is published here so a close watch can be registered on it straight away.
+        // Its source goes in on the main thread, where `stopObserving` takes it out, so the two
         // cannot cross: a stop that comes first leaves nothing installed.
+        lock.lock()
+        let isPublished = !isStopped && observer == nil
+        if isPublished {
+            observer = created
+            self.handler = handler
+        }
+        lock.unlock()
+        guard isPublished else { return }
         DispatchQueue.main.async { [self] in
             lock.lock()
-            let shouldInstall = !isStopped && observer == nil
-            if shouldInstall {
-                observer = created
-                self.handler = handler
-            }
+            let shouldInstall = !isStopped && observer === created
             lock.unlock()
             if shouldInstall {
                 CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
@@ -235,7 +235,7 @@ final class AXApplicationPort: ApplicationPort {
     var isObserving: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return isRegistered
+        return observer != nil
     }
 
     func observeClosing(of window: WindowHandle, id: WindowID) {
@@ -261,14 +261,12 @@ final class AXApplicationPort: ApplicationPort {
             kAXUIElementDestroyedNotification as CFString,
             Unmanaged.passUnretained(watch).toOpaque()
         )
-        guard error != .success, error != .notificationAlreadyRegistered else { return }
+        // A busy app may have taken the registration even though the call timed out, so a watch
+        // that timed out stays in place and is still listened to.
+        guard error != .success, error != .notificationAlreadyRegistered, error != .cannotComplete else { return }
         lock.lock()
         if watches[id] === watch {
             watches.removeValue(forKey: id)
-        }
-        if error == .cannotComplete {
-            // A busy app may have taken the registration all the same, pointer included.
-            retiredWatches.append(watch)
         }
         lock.unlock()
     }
