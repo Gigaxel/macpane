@@ -932,7 +932,9 @@ final class WindowTiler {
             }
         }
         var moves: [(id: WindowID, from: WorkspaceKey, to: ScreenInfo)] = []
-        for (key, state) in model.trees {
+        // While a button is down a window on another display is most likely being dragged there,
+        // and the drop decides where it goes. Letting go triggers a reconcile.
+        for (key, state) in isPointerButtonDown ? [:] : model.trees {
             for id in state.orderedIDs {
                 guard let window = world.byID[id],
                       world.onScreen.contains(id),
