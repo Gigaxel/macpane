@@ -99,11 +99,6 @@ struct TilingModel {
             }
         }
     }
-    mutating func forgetWindows(ofPID pid: pid_t) {
-        for id in windows.values.filter({ $0.pid == pid }).map(\.id) {
-            forget(id)
-        }
-    }
 
     // MARK: Window facts
 
@@ -208,17 +203,18 @@ struct TilingModel {
     // MARK: Displays
 
     /// Moves the workspaces of unplugged displays onto a remaining one, keeping their indices, and
-    /// puts them back when the display returns. `fallback` picks the display for an orphaned
-    /// workspace. Returns the windows that were sent back to a returning display.
+    /// puts them back when the display returns. `fallback` picks the display for some orphaned
+    /// windows; it runs while the model is being changed, so it must not read the model. Returns
+    /// the windows that were sent back to a returning display.
     @discardableResult
     mutating func reconcileDisplays(
         _ screens: [ScreenInfo],
         onScreen: Set<WindowID>,
-        fallback: (WorkspaceKey) -> ScreenInfo?
+        fallback: ([WindowID]) -> ScreenInfo?
     ) -> Set<WindowID> {
         let screensByKey = Dictionary(screens.map { ($0.key, $0) }, uniquingKeysWith: { first, _ in first })
         for (key, state) in trees where screensByKey[key.display] == nil {
-            guard let target = fallback(key) else { continue }
+            guard let target = fallback(state.orderedIDs) else { continue }
             trees.removeValue(forKey: key)
             for id in state.orderedIDs {
                 evacuated[key.display, default: [:]][id] = key.index
@@ -229,7 +225,7 @@ struct TilingModel {
             trees[targetKey] = merged
         }
         for (id, scope) in floating where screensByKey[scope.display] == nil {
-            if let target = fallback(WorkspaceKey(scope: scope, index: 0)) {
+            if let target = fallback([id]) {
                 floating[id] = target.scope
             }
         }

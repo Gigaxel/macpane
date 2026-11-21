@@ -22,6 +22,9 @@ extension TilingTests {
         testStaleAnswerIsIgnored()
         testParkGoalOnlyCaresAboutOrigin()
         testParkStoppedShortOfTheCornerIsAccepted()
+        testParkLeftInViewIsNotAccepted()
+        testFrameTwoPointsOffSettlesWithoutLooping()
+        testUnansweredWritesAreRetriedLater()
         testSanitizedFrameRoundsToWholePoints()
     }
 
@@ -73,7 +76,8 @@ extension TilingTests {
             fail("a window off its goal is written")
         }
         record?.pendingToken = 1
-        guard decide(observed: elsewhere, record: &record) == .none, record?.attempts == 1 else {
+        guard decide(observed: elsewhere, record: &record) == .settling(until: FramePlanner.pendingWriteTimeout + 1),
+              record?.attempts == 1 else {
             fail("no second write, and no second attempt counted, while the first is unanswered")
         }
     }
@@ -165,13 +169,14 @@ extension TilingTests {
         var record: FrameRecord?
         _ = decide(observed: elsewhere, record: &record)
         record?.pendingToken = 1
-        guard decide(observed: elsewhere, record: &record, now: second) == .none else {
-            fail("an answer is waited for at first")
+        guard decide(observed: elsewhere, record: &record, now: second)
+            == .settling(until: FramePlanner.pendingWriteTimeout + 1) else {
+            fail("an answer is waited for, with a deadline")
         }
         let late = FramePlanner.pendingWriteTimeout + second
         guard decide(observed: elsewhere, record: &record, now: late) == .settling(until: late + settle),
-              record?.pendingToken == nil else {
-            fail("a write whose answer never came stops blocking the window")
+              record?.pendingToken == nil, record?.lastWriteSucceeded == false else {
+            fail("a write whose answer never came stops blocking the window and counts as unconfirmed")
         }
         guard decide(observed: elsewhere, record: &record, now: late + settle) == .write else {
             fail("and the window is written again once it has held still")
@@ -269,7 +274,7 @@ extension TilingTests {
 
     private static func testParkGoalOnlyCaresAboutOrigin() {
         var record: FrameRecord?
-        let goal = FrameGoal.park(CGPoint(x: 999, y: 799))
+        let goal = FrameGoal.park(CGPoint(x: 999, y: 799), clearing: CGRect(x: 0, y: 0, width: 1000, height: 800))
         guard decide(goal, observed: CGRect(x: 999, y: 799, width: 800, height: 600), record: &record) == .none else {
             fail("a parked window of any size is on its goal")
         }
@@ -286,7 +291,7 @@ extension TilingTests {
 
     private static func testParkStoppedShortOfTheCornerIsAccepted() {
         var record: FrameRecord?
-        let goal = FrameGoal.park(CGPoint(x: 999, y: 799))
+        let goal = FrameGoal.park(CGPoint(x: 999, y: 799), clearing: CGRect(x: 0, y: 0, width: 1000, height: 800))
         guard decide(goal, observed: CGRect(x: 0, y: 0, width: 800, height: 600), record: &record) == .write else {
             fail("expected the window to be parked")
         }
@@ -297,6 +302,62 @@ extension TilingTests {
         guard decide(goal, observed: raised, record: &record, now: millisecond + settle) == .none,
               record?.accepted == raised, record?.attempts == 1 else {
             fail("a window the app holds a little above the corner is parked well enough")
+        }
+    }
+
+    private static func testParkLeftInViewIsNotAccepted() {
+        var record: FrameRecord?
+        // Parked straight down between two neighbors: the origin's x is where the window already was.
+        let display = CGRect(x: 1000, y: 0, width: 1000, height: 800)
+        let goal = FrameGoal.park(CGPoint(x: 1400, y: 799), clearing: display)
+        let inView = CGRect(x: 1400, y: 100, width: 600, height: 500)
+        guard decide(goal, observed: inView, record: &record) == .write else {
+            fail("expected the window to be parked")
+        }
+        record?.pendingToken = 1
+        FramePlanner.absorb(token: 1, error: .success, record: &record, now: 0)
+        _ = decide(goal, observed: inView, record: &record, now: millisecond)
+        guard decide(goal, observed: inView, record: &record, now: millisecond + settle) == .write else {
+            fail("a window still in plain view is not parked, whatever its x")
+        }
+    }
+
+    private static func testFrameTwoPointsOffSettlesWithoutLooping() {
+        var record: FrameRecord?
+        // An app that rounds its frames its own way never lands exactly, however often it is asked.
+        let rounded = target.offsetBy(dx: 2, dy: 0)
+        var now: UInt64 = 0
+        var writes = 0
+        for _ in 0..<40 {
+            if decide(observed: rounded, record: &record, now: now) == .write {
+                writes += 1
+                record?.pendingToken = writes
+                record?.pendingSince = now
+                FramePlanner.absorb(token: writes, error: .success, record: &record, now: now)
+            }
+            now += settle
+        }
+        guard writes == FramePlanner.maximumAttempts, record?.accepted == rounded else {
+            fail("a frame that stays two points off is written a few times and then left alone, got \(writes) writes")
+        }
+    }
+
+    private static func testUnansweredWritesAreRetriedLater() {
+        var record: FrameRecord?
+        var now: UInt64 = 0
+        for token in 1...FramePlanner.maximumAttempts {
+            write(observed: elsewhere, record: &record, token: token, now: now, error: .cannotComplete)
+            now = record!.retryNotBefore
+            _ = decide(observed: elsewhere, record: &record, now: now)
+            now += settle
+        }
+        guard decide(observed: elsewhere, record: &record, now: now) == .settling(until: FramePlanner.attemptWindow + 1),
+              record?.accepted == nil else {
+            fail("an app that never answered has not refused the frame; it is tried again later")
+        }
+        _ = decide(observed: elsewhere, record: &record, now: FramePlanner.attemptWindow + second)
+        guard decide(observed: elsewhere, record: &record, now: FramePlanner.attemptWindow + second + settle) == .write else {
+            fail("once the app has had time to recover the frame is written again")
         }
     }
 

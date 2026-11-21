@@ -35,10 +35,6 @@ enum WindowFocusNavigator {
         bestIndex(from: source, direction: direction, frames: candidates.map(\.frame)).map { candidates[$0].id }
     }
 
-    static func nearest(to point: CGPoint, among candidates: [(id: WindowID, frame: CGRect)]) -> WindowID? {
-        candidates.min { $0.frame.distanceSquared(to: point) < $1.frame.distanceSquared(to: point) }?.id
-    }
-
     private static func bestIndex(from source: CGRect, direction: SnapDirection, frames: [CGRect]) -> Int? {
         let sourcePoint = sideCenter(of: source, leaving: direction)
         var best: (index: Int, score: CGFloat, overlap: CGFloat)?

@@ -685,7 +685,14 @@ struct TilingTests {
         model.adoptTiled(window(2), in: external.workspaceKey(index: 0), onScreen: [1, 2])
         model.adoptTiled(window(3), in: external.workspaceKey(index: 2), onScreen: [1, 2, 3])
 
-        let moved = model.reconcileDisplays([main], onScreen: [1, 2, 3]) { _ in main }
+        var orphans: [[WindowID]] = []
+        let moved = model.reconcileDisplays([main], onScreen: [1, 2, 3]) { windows in
+            orphans.append(windows)
+            return main
+        }
+        guard orphans.sorted(by: { $0[0] < $1[0] }) == [[2], [3]] else {
+            fail("the fallback is asked about each orphaned workspace's windows, got \(orphans)")
+        }
         guard moved.isEmpty,
               model.workspace(of: 2) == main.workspaceKey(index: 0),
               model.workspace(of: 3) == main.workspaceKey(index: 2) else {
@@ -729,9 +736,10 @@ struct TilingTests {
         model.adoptTiled(window(1, pid: 1), in: main.workspaceKey(index: 0), onScreen: [1])
         model.adoptFloating(window(2, pid: 1), in: main.scope)
         model.adoptTiled(window(3, pid: 2), in: main.workspaceKey(index: 0), onScreen: [1, 3])
-        model.forgetWindows(ofPID: 1)
+        model.forget(1)
+        model.forget(2)
         guard model.windows.keys.sorted() == [3], model.floating.isEmpty, model.workspace(of: 1) == nil else {
-            fail("a quit app's windows are removed from every structure")
+            fail("a forgotten window is removed from every structure")
         }
     }
 
@@ -921,9 +929,6 @@ struct TilingTests {
         }
         guard WindowFocusNavigator.neighbor(of: source, direction: .left, among: candidates) == nil else {
             fail("nothing lies to the left")
-        }
-        guard WindowFocusNavigator.nearest(to: CGPoint(x: 1600, y: 100), among: candidates) == 3 else {
-            fail("nearest should be the window under the point")
         }
     }
 

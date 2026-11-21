@@ -555,8 +555,8 @@ final class WindowTiler {
             server.subscribe(to: world.windows.map(\.id).sorted())
             return world
         }
-        let restored = model.reconcileDisplays(world.screens, onScreen: world.onScreen) { [self] key in
-            fallbackScreen(for: key, world)
+        let restored = model.reconcileDisplays(world.screens, onScreen: world.onScreen) { windows in
+            Self.fallbackScreen(for: windows, world)
         }
         for id in restored {
             relocating[id] = world.now + relocationGrace
@@ -652,10 +652,12 @@ final class WindowTiler {
         }
     }
 
-    private func fallbackScreen(for key: WorkspaceKey, _ world: World) -> ScreenInfo? {
+    /// The display that takes over some windows whose own display is gone: the one most of them
+    /// are on now, else the one under the pointer.
+    private static func fallbackScreen(for windows: [WindowID], _ world: World) -> ScreenInfo? {
         let tileable = world.screens.filter(\.isTileable)
         var counts: [String: Int] = [:]
-        for id in model.trees[key]?.orderedIDs ?? [] {
+        for id in windows {
             guard let window = world.byID[id], let screen = world.screen(for: window) else { continue }
             counts[screen.key, default: 0] += 1
         }
@@ -785,7 +787,7 @@ final class WindowTiler {
             title: resolved.title
         )
         let key = model.activeKey(on: screen)
-        if let replaced = replacedWindow(by: window, world) {
+        if let replaced = replacedWindow(by: window, on: screen, world) {
             model.adopt(managed, replacing: replaced)
             frameRecords.removeValue(forKey: replaced)
         } else if hasAdoptedInitialWindows, settings.autoFloatSmallWindowsEnabled, isBelowAutoFloatSize(window.bounds) {
@@ -806,8 +808,12 @@ final class WindowTiler {
 
     /// The managed window a new window takes over from: one of the same app that has just been
     /// ordered out at exactly the same frame. Switching tabs does this.
-    private func replacedWindow(by window: ServerWindow, _ world: World) -> WindowID? {
-        let candidates = model.windows.values.filter { $0.pid == window.pid && world.byID[$0.id] == nil }.map(\.id)
+    private func replacedWindow(by window: ServerWindow, on screen: ScreenInfo, _ world: World) -> WindowID? {
+        // Windows on other Spaces are absent too, and a maximized one there has the same frame.
+        let candidates = model.windows.values.filter { candidate in
+            candidate.pid == window.pid && world.byID[candidate.id] == nil &&
+                (model.workspace(of: candidate.id)?.scope ?? model.floating[candidate.id]) == screen.scope
+        }.map(\.id)
         guard !candidates.isEmpty else { return nil }
         return server.describe(candidates).values.first { candidate in
             !candidate.isMinimized && !candidate.isHiddenWithApplication &&
@@ -853,12 +859,12 @@ final class WindowTiler {
             for id in state.orderedIDs {
                 guard let window = world.byID[id],
                       world.onScreen.contains(id),
-                      window.space != key.space,
                       !world.shared.contains(id),
                       !dragged.contains(id),
                       relocating[id] == nil,
                       slide?.contains(id) != true,
-                      let screen = world.screen(for: window) else {
+                      let screen = world.screen(for: window),
+                      screen.scope != key.scope else {
                     continue
                 }
                 // A parked window hangs off the corner of its display and can overlap the next
@@ -980,11 +986,14 @@ final class WindowTiler {
             case .tile(let frame):
                 goal = .tile(FramePlanner.sanitized(frame))
             case .parked(let screen):
-                goal = .park(FramePlanner.parkOrigin(
-                    windowSize: observed.size,
-                    screenFrame: screen.frame,
-                    otherScreenFrames: world.screens.filter { $0.key != screen.key }.map(\.frame)
-                ))
+                goal = .park(
+                    FramePlanner.parkOrigin(
+                        windowSize: observed.size,
+                        screenFrame: screen.frame,
+                        otherScreenFrames: world.screens.filter { $0.key != screen.key }.map(\.frame)
+                    ),
+                    clearing: screen.frame
+                )
             }
             var record = frameRecords[id]
             switch FramePlanner.decide(
@@ -1002,7 +1011,7 @@ final class WindowTiler {
                 case .tile(let target):
                     frame = target
                     setsSize = true
-                case .park(let origin):
+                case .park(let origin, _):
                     frame = CGRect(origin: origin, size: observed.size)
                     setsSize = false
                 }
@@ -1814,13 +1823,18 @@ final class WindowTiler {
     /// are not showing.
     private func restoreWindowsBeforeStopping() {
         guard isRunning, hasAccessibilityPermission(prompt: false) else { return }
+        // A slide cut short leaves its incoming windows wherever they had got to.
+        let slidingScope = slide?.scope
         cancelSlide()
         cancelPendingWrites()
         let world = readWorld()
         removeDepartedWindows(world)
         let parkedKeys = model.trees.keys.filter { !model.isShowing($0) }
         let zoomedKeys = model.trees.filter { $0.value.zoomedWindowID != nil }.map(\.key)
-        let changed = Set((parkedKeys + zoomedKeys).map { WorkspaceKey(scope: $0.scope, index: model.activeIndex(in: $0.scope)) })
+        var changed = Set((parkedKeys + zoomedKeys).map { WorkspaceKey(scope: $0.scope, index: model.activeIndex(in: $0.scope)) })
+        if let slidingScope {
+            changed.insert(WorkspaceKey(scope: slidingScope, index: model.activeIndex(in: slidingScope)))
+        }
         guard !changed.isEmpty else { return }
         model.mergeAllIntoActiveWorkspaces()
         let gap = CGFloat(settings.gapPixels)
@@ -1848,7 +1862,7 @@ final class WindowTiler {
             let application = application(for: pid)
             application.submit(batch)
             group.enter()
-            application.afterPendingWork { group.leave() }
+            application.afterPendingWrites { group.leave() }
         }
         // Quitting waits for the windows to come back, but not for an app that has hung. The run
         // loop keeps turning meanwhile, so nothing that needs the main thread is held up.

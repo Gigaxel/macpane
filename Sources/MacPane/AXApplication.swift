@@ -42,6 +42,8 @@ final class AXApplication {
     private var mailboxOrder: [WindowID] = []
     private var isDraining = false
     private var isInvalidated = false
+    /// Bumped whenever queued writes are dropped, so a batch already taken off the mailbox stops too.
+    private var cancellations = 0
     /// When each window was last written, kept on the queue. Until a write has had time to reach
     /// the WindowServer, the bounds read from it are those of the frame before.
     private var lastWriteAt: [WindowID: UInt64] = [:]
@@ -107,6 +109,7 @@ final class AXApplication {
     func invalidate() {
         lock.lock()
         isInvalidated = true
+        cancellations += 1
         mailbox.removeAll()
         mailboxOrder.removeAll()
         lock.unlock()
@@ -185,22 +188,34 @@ final class AXApplication {
         }
     }
 
-    /// Drops every write that has not started.
+    /// Drops every write that has not started, including the rest of a batch that is running.
     func cancelPendingWrites() {
         lock.lock()
+        cancellations += 1
         mailbox.removeAll()
         mailboxOrder.removeAll()
         lock.unlock()
     }
 
-    /// Runs `body` on this app's queue once everything queued before it has finished.
-    func afterPendingWork(_ body: @escaping () -> Void) {
-        queue.async(execute: body)
+    /// Runs `body` on this app's queue once every write submitted so far has been carried out.
+    func afterPendingWrites(_ body: @escaping () -> Void) {
+        queue.async { [self] in
+            lock.lock()
+            let isIdle = mailbox.isEmpty
+            lock.unlock()
+            if isIdle {
+                body()
+            } else {
+                // The drain that will take these writes is queued behind this block.
+                afterPendingWrites(body)
+            }
+        }
     }
 
     private func drain() {
         lock.lock()
         let batch = mailboxOrder.compactMap { mailbox[$0] }
+        let generation = cancellations
         mailbox.removeAll()
         mailboxOrder.removeAll()
         if batch.isEmpty {
@@ -208,6 +223,11 @@ final class AXApplication {
         }
         lock.unlock()
         guard !batch.isEmpty else { return }
+        func isCancelled() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancellations != generation
+        }
 
         // An app with enhanced Accessibility on animates every resize. Turning it off for the
         // batch makes the frames apply at once.
@@ -215,7 +235,9 @@ final class AXApplication {
         var appTimedOut = false
         var outcomes: [FrameWriteOutcome] = []
         for write in batch {
-            let error = appTimedOut || invalidated ? AXError.cannotComplete : perform(write)
+            // Cancelled writes are dropped without an answer: whoever cancelled forgot them too.
+            guard !isCancelled() else { break }
+            let error = appTimedOut ? AXError.cannotComplete : perform(write)
             // An app that stopped answering is not asked again for the rest of the batch.
             appTimedOut = appTimedOut || error == .cannotComplete
             if let token = write.token {

@@ -84,9 +84,6 @@ struct ScreenTileState {
 
     // MARK: Layout
 
-    func slotList(hidden: Set<WindowID> = []) -> [(id: WindowID, slot: TileSlot)] {
-        tree.slotList(hidden: hidden)
-    }
     /// The unit-square slot of every visible window, grown where needed to respect app minimums.
     func resolvedSlots(
         in screenFrame: CGRect,

@@ -81,6 +81,7 @@ final class WindowServer {
     private let frontProcessFunctions: FrontProcessFunctions?
     private let connection: Int32
     private var eventHandler: (() -> Void)?
+    private var registeredEvents = false
     private var subscribedWindows: [WindowID] = []
 
     /// Window closed, moved, resized, reordered, changed level, shown and hidden; Dock geometry;
@@ -178,7 +179,8 @@ final class WindowServer {
 
     /// False when the SkyLight query calls are missing and the public CoreGraphics list is used.
     var usesSkyLight: Bool { functions != nil }
-    var deliversEvents: Bool { eventFunctions != nil }
+    /// True once `startEvents` has registered for WindowServer events.
+    var deliversEvents: Bool { registeredEvents }
     var canFocusDirectly: Bool { focusFunctions != nil }
 
     // MARK: - Spaces
@@ -367,24 +369,24 @@ final class WindowServer {
                 }
             }
         }
-        var registeredAny = false
-        for event in Self.wakeEvents where eventFunctions.registerNotifyProc(callback, event, nil) == 0 {
-            registeredAny = true
-        }
-        return registeredAny
+        // Every event has to register: missing one of them means changes that nothing announces.
+        registeredEvents = Self.wakeEvents.allSatisfy { eventFunctions.registerNotifyProc(callback, $0, nil) == 0 }
+        return registeredEvents
     }
 
     func stopEvents() {
         eventHandler = nil
+        registeredEvents = false
         subscribedWindows = []
     }
 
     /// Per-window events are only delivered for windows named in the most recent request.
     func subscribe(to windows: [WindowID]) {
-        guard let eventFunctions, windows != subscribedWindows else { return }
-        subscribedWindows = windows
-        guard !windows.isEmpty else { return }
-        _ = eventFunctions.requestNotifications(connection, windows, Int32(windows.count))
+        guard let eventFunctions, registeredEvents, windows != subscribedWindows else { return }
+        // A request that fails is not remembered, so the next reconcile makes it again.
+        if windows.isEmpty || eventFunctions.requestNotifications(connection, windows, Int32(windows.count)) == 0 {
+            subscribedWindows = windows
+        }
     }
 
     // MARK: - Focus

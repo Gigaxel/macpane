@@ -5,15 +5,9 @@ import CoreGraphics
 enum FrameGoal: Equatable {
     /// An exact frame.
     case tile(CGRect)
-    /// An origin only: a parked window keeps whatever size it has.
-    case park(CGPoint)
-
-    var origin: CGPoint {
-        switch self {
-        case .tile(let frame): return frame.origin
-        case .park(let origin): return origin
-        }
-    }
+    /// An origin only: a parked window keeps whatever size it has. `clearing` is the display it
+    /// has to get off.
+    case park(CGPoint, clearing: CGRect)
 }
 
 /// How far one window has got towards its goal.
@@ -81,7 +75,7 @@ enum FramePlanner {
         var current = record.flatMap { $0.goal == goal ? $0 : nil } ?? FrameRecord(goal: goal)
         defer { record = current }
 
-        if matches(goal, observed, written: current.attempts > 0) {
+        if matches(goal, observed) {
             current.hasConverged = true
             current.attempts = 0
             current.accepted = nil
@@ -89,8 +83,12 @@ enum FramePlanner {
             return .none
         }
         if current.pendingToken != nil {
-            guard now &- current.pendingSince > pendingWriteTimeout else { return .none }
+            guard now &- current.pendingSince > pendingWriteTimeout else {
+                return .settling(until: current.pendingSince + pendingWriteTimeout + 1)
+            }
+            // No answer came. Whatever the frame is now, the app never confirmed taking the write.
             current.pendingToken = nil
+            current.lastWriteSucceeded = false
         }
         if let accepted = current.accepted {
             if approximatelyEqual(accepted, observed) {
@@ -130,9 +128,9 @@ enum FramePlanner {
                     return .none
                 }
             }
-            if current.lastWriteSucceeded, case .park(let origin) = goal, abs(observed.minX - origin.x) <= tolerance {
+            if current.lastWriteSucceeded, case .park(_, let display) = goal, isOffDisplay(observed, display) {
                 // AppKit keeps a title bar clear of the Dock, so a parked window can stop short of
-                // the corner vertically. It is off the side of the display, which is what hides it.
+                // the corner. All but a sliver of it is off the display, which is what hides it.
                 current.accepted = observed
                 return .none
             }
@@ -141,6 +139,10 @@ enum FramePlanner {
             current.attempts = 0
         }
         guard current.attempts < maximumAttempts else {
+            guard current.lastWriteSucceeded else {
+                // The app has not been answering. That is not a refusal: try again later.
+                return .settling(until: current.firstAttemptAt + attemptWindow + 1)
+            }
             current.accepted = observed
             return .none
         }
@@ -167,24 +169,28 @@ enum FramePlanner {
         record = current
     }
 
-    static func matches(_ goal: FrameGoal, _ observed: CGRect, written: Bool) -> Bool {
-        let slack: CGFloat = written ? tolerance : 1
+    /// On the goal to within a point. The same test applies before and after a write, so a frame
+    /// that counts as a match never stops counting as one.
+    static func matches(_ goal: FrameGoal, _ observed: CGRect) -> Bool {
         switch goal {
         case .tile(let frame):
-            return abs(observed.minX - frame.minX) <= slack &&
-                abs(observed.minY - frame.minY) <= slack &&
-                abs(observed.width - frame.width) <= slack &&
-                abs(observed.height - frame.height) <= slack
-        case .park(let origin):
-            return abs(observed.minX - origin.x) <= slack && abs(observed.minY - origin.y) <= slack
+            return approximatelyEqual(observed, frame)
+        case .park(let origin, _):
+            return approximatelyEqual(observed.origin, origin)
         }
     }
 
+    /// True when no more than a sliver of the frame is on the display.
+    private static func isOffDisplay(_ frame: CGRect, _ display: CGRect) -> Bool {
+        let visible = frame.intersection(display)
+        return visible.isNull || visible.width <= tolerance || visible.height <= tolerance
+    }
+
+    /// In the right place and no larger than asked: the app stopped short of the size on purpose.
     private static func isShortfall(target: CGRect, observed: CGRect) -> Bool {
-        abs(observed.minX - target.minX) <= tolerance &&
-            abs(observed.minY - target.minY) <= tolerance &&
-            observed.width <= target.width + tolerance &&
-            observed.height <= target.height + tolerance
+        approximatelyEqual(observed.origin, target.origin) &&
+            observed.width <= target.width + 1 &&
+            observed.height <= target.height + 1
     }
 
     static func approximatelyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {

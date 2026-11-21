@@ -115,7 +115,6 @@ struct BSPTree<ID: Hashable> {
     var isEmpty: Bool { root == nil }
     var ids: [ID] { root?.ids ?? [] }
     var firstID: ID? { ids.first }
-    var tileCount: Int { ids.count }
     init() {}
     private init(root: BSPNode<ID>?) {
         self.root = root

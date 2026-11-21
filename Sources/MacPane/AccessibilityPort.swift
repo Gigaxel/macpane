@@ -117,7 +117,8 @@ final class AXApplicationPort: ApplicationPort {
         kAXRoleAttribute,
         kAXSubroleAttribute,
         kAXTitleAttribute,
-        "AXModal"
+        "AXModal",
+        "AXFullScreen"
     ]
 
     private let pid: pid_t
@@ -147,6 +148,12 @@ final class AXApplicationPort: ApplicationPort {
         guard let window = window as? AXWindowHandle,
               let reads = AXReader.multipleChecked(window.element, attributes: Self.classificationAttributes) else {
             return .unavailable
+        }
+        // With SkyLight a fullscreen window is on a Space that is never tiled. Without it the Space
+        // is unknown, and the window has to say so itself.
+        if !WindowServer.shared.usesSkyLight,
+           case .value(true) = AXReader.boolReadFromBatch(reads["AXFullScreen"]) {
+            return .excluded
         }
         let title = AXReader.stringFromBatch(reads[kAXTitleAttribute])
         var inputs = WindowManageabilityPlanner.Inputs(
@@ -196,38 +203,45 @@ final class AXApplicationPort: ApplicationPort {
             registeredAny = registeredAny || error == .success || error == .notificationAlreadyRegistered
         }
         guard registeredAny else { return }
-        lock.lock()
-        let shouldInstall = !isStopped && observer == nil
-        if shouldInstall {
-            observer = created
-            self.handler = handler
-        }
-        lock.unlock()
-        if shouldInstall {
-            CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
+        // The source goes in on the main thread, where `stopObserving` takes it out, so the two
+        // cannot cross: a stop that comes first leaves nothing installed.
+        DispatchQueue.main.async { [self] in
+            lock.lock()
+            let shouldInstall = !isStopped && observer == nil
+            if shouldInstall {
+                observer = created
+                self.handler = handler
+            }
+            lock.unlock()
+            if shouldInstall {
+                CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
+            }
         }
     }
 
     func observeClosing(of window: WindowHandle, id: WindowID) {
         guard let window = window as? AXWindowHandle else { return }
-        lock.lock()
-        let observer = self.observer
-        let isWatched = watches[id] != nil
-        lock.unlock()
-        guard let observer, !isWatched else { return }
+        // The watch is stored before it is registered: the notification can arrive straight away,
+        // and it carries only a raw pointer to it.
         let watch = WindowWatch(port: self, id: id)
+        lock.lock()
+        let observer = isStopped || watches[id] != nil ? nil : self.observer
+        if observer != nil {
+            watches[id] = watch
+        }
+        lock.unlock()
+        guard let observer else { return }
         let error = AXObserverAddNotification(
             observer,
             window.element,
             kAXUIElementDestroyedNotification as CFString,
             Unmanaged.passUnretained(watch).toOpaque()
         )
-        guard error == .success || error == .notificationAlreadyRegistered else { return }
+        guard error != .success, error != .notificationAlreadyRegistered else { return }
         lock.lock()
-        if !isStopped {
-            watches[id] = watch
-        }
+        let retired = watches.removeValue(forKey: id)
         lock.unlock()
+        DispatchQueue.main.async { _ = retired }
     }
 
     fileprivate func deliverClosing(_ watch: WindowWatch) {
