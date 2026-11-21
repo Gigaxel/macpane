@@ -26,6 +26,7 @@ extension TilingTests {
         testParkOnNeighboringDisplayIsNotAccepted()
         testFrameTwoPointsOffSettlesWithoutLooping()
         testUnansweredWritesAreRetriedLater()
+        testRefusedWritesAreAccepted()
         testSanitizedFrameRoundsToWholePoints()
     }
 
@@ -376,6 +377,19 @@ extension TilingTests {
         _ = decide(goal, observed: onNeighbor, record: &record, now: millisecond)
         guard decide(goal, observed: onNeighbor, record: &record, now: millisecond + settle) == .write else {
             fail("a window showing on another display is not parked")
+        }
+    }
+
+    private static func testRefusedWritesAreAccepted() {
+        var record: FrameRecord?
+        var now: UInt64 = 0
+        for token in 1...FramePlanner.maximumAttempts {
+            write(observed: elsewhere, record: &record, token: token, now: now, error: .failure)
+            _ = decide(observed: elsewhere, record: &record, now: now + millisecond)
+            now += millisecond + settle
+        }
+        guard decide(observed: elsewhere, record: &record, now: now) == .none, record?.accepted == elsewhere else {
+            fail("an app that answers every write with an error has refused; the window is left alone")
         }
     }
 

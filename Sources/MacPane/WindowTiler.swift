@@ -51,6 +51,8 @@ final class WindowTiler {
     }
     private var resolving: [WindowID: Resolution] = [:]
     private var awaitingAdoption: [WindowID: ResolvedWindow] = [:]
+    /// Managed windows waiting on a replacement for a dead handle.
+    private var rehandling: Set<WindowID> = []
     /// On-screen windows their app described as something not to tile (a dialog, a panel), with
     /// the app they belong to. The answer is asked for again when that app next reports a change,
     /// because a window can start out as one thing and become another.
@@ -283,6 +285,7 @@ final class WindowTiler {
         model = TilingModel()
         resolving.removeAll()
         awaitingAdoption.removeAll()
+        rehandling.removeAll()
         ignored.removeAll()
         hasAdoptedInitialWindows = false
         frameRecords.removeAll()
@@ -462,9 +465,12 @@ final class WindowTiler {
         let application = AXApplication(
             pid: pid,
             port: environment.makePort(pid),
-            onNotification: { [weak self] pid in
+            onNotification: { [weak self] pid, isGeometry in
                 guard let self, !self.isStopping else { return }
-                self.retryResolutions(forPID: pid)
+                if !isGeometry {
+                    // A move says nothing new about what a window is.
+                    self.retryResolutions(forPID: pid)
+                }
                 self.setNeedsReconcile()
             },
             onFocusedWindow: { [weak self] pid, window in
@@ -505,6 +511,7 @@ final class WindowTiler {
         frameRecords.removeValue(forKey: id)
         dragged.remove(id)
         closing.removeValue(forKey: id)
+        rehandling.remove(id)
         relocating.removeValue(forKey: id)
         traceStarts.removeValue(forKey: id)
         accessibilityFocus = accessibilityFocus.filter { $0.value != id }
@@ -653,8 +660,8 @@ final class WindowTiler {
             closing.removeValue(forKey: id)
             if world.byID[id] != nil {
                 // The app destroyed the element but the window is still here: it rebuilt its
-                // windows. The handle is dead, so let go and pick the window up again.
-                forget(id)
+                // windows, and the handle is dead.
+                replaceHandle(of: id)
             }
         }
         let missing = model.windows.keys.filter { world.byID[$0] == nil }
@@ -690,15 +697,13 @@ final class WindowTiler {
     /// new one can take over its tile.
     private func isBeingReplaced(_ id: WindowID, bounds: CGRect, _ world: World) -> Bool {
         guard let pid = model.windows[id]?.pid else { return false }
-        let candidates = resolving.filter { $0.value.pid == pid }.map(\.key)
-            + awaitingAdoption.filter { $0.value.pid == pid }.map(\.key)
-        let unresolved = world.windows.contains { window in
+        // A successor is a new window of the same app at the same frame that is still on its way
+        // to being adopted. One whose app has stopped answering about it does not hold the tile.
+        return world.windows.contains { window in
             window.pid == pid && window.isStandard && world.onScreen.contains(window.id) &&
                 !model.isManaged(window.id) && ignored[window.id] == nil &&
+                resolving[window.id]?.nextAttemptAt != .max &&
                 FramePlanner.approximatelyEqual(window.bounds, bounds)
-        }
-        return unresolved || candidates.contains { candidate in
-            world.byID[candidate].map { FramePlanner.approximatelyEqual($0.bounds, bounds) } ?? false
         }
     }
 
@@ -787,6 +792,24 @@ final class WindowTiler {
             }
         }
         setNeedsReconcile()
+    }
+
+    /// Asks the app for a fresh handle to a window whose handle has died. The window keeps its tile
+    /// meanwhile; only if the app no longer lists it is it forgotten, to be found again as new.
+    private func replaceHandle(of id: WindowID) {
+        guard let window = model.windows[id], !rehandling.contains(id) else { return }
+        rehandling.insert(id)
+        application(for: window.pid).resolve([id]) { [weak self] resolutions in
+            guard let self, self.rehandling.remove(id) != nil, self.model.isManaged(id) else { return }
+            if case .manageable(let handle, _)? = resolutions[id] {
+                self.model.setHandle(handle, of: id)
+                self.frameRecords.removeValue(forKey: id)
+                self.application(for: window.pid).watch(handle, id: id)
+            } else {
+                self.forget(id)
+            }
+            self.setNeedsReconcile()
+        }
     }
 
     /// An app that just notified or came forward gets another chance right away.
@@ -1038,7 +1061,8 @@ final class WindowTiler {
         for (id, placement) in placements {
             guard let observed = world.byID[id]?.bounds,
                   let window = model.windows[id],
-                  slide?.contains(id) != true else {
+                  slide?.contains(id) != true,
+                  !rehandling.contains(id) else {
                 continue
             }
             forgetOutgrownMinimum(of: window, observed: observed)
@@ -1117,10 +1141,11 @@ final class WindowTiler {
     private func handleFrameWriteOutcomes(_ outcomes: [FrameWriteOutcome]) {
         guard isRunning, !isStopping else { return }
         let now = PerformanceTrace.now()
-        for outcome in outcomes where frameRecords[outcome.window] != nil {
+        for outcome in outcomes where frameRecords[outcome.window]?.pendingToken == outcome.token {
             if outcome.error == .invalidUIElement {
-                // The handle no longer names a window. Forgotten, it is found again with a new one.
-                forget(outcome.window)
+                // The handle no longer names a window.
+                frameRecords.removeValue(forKey: outcome.window)
+                replaceHandle(of: outcome.window)
                 continue
             }
             FramePlanner.absorb(token: outcome.token, error: outcome.error, record: &frameRecords[outcome.window], now: now)

@@ -24,6 +24,8 @@ enum WindowResolution {
 enum ApplicationNotification {
     /// Something about the app's windows changed.
     case windowsChanged
+    /// A window moved or resized. Only sent when geometry was asked for.
+    case geometryChanged
     /// A watched window is closing. This arrives when the close starts, well before the window has
     /// finished fading out.
     case windowClosing(WindowID)
@@ -134,6 +136,8 @@ final class AXApplicationPort: ApplicationPort {
     /// Kept alive here because the observer only holds a raw pointer to each.
     private var watches: [WindowID: WindowWatch] = [:]
     private var retiredWatches: [WindowWatch] = []
+    /// Set as soon as the app has accepted the registrations, before the source is installed.
+    private var isRegistered = false
     private var isStopped = false
 
     init(pid: pid_t) {
@@ -209,6 +213,9 @@ final class AXApplicationPort: ApplicationPort {
             registeredAny = registeredAny || error == .success || error == .notificationAlreadyRegistered
         }
         guard registeredAny else { return }
+        lock.lock()
+        isRegistered = true
+        lock.unlock()
         // The source goes in on the main thread, where `stopObserving` takes it out, so the two
         // cannot cross: a stop that comes first leaves nothing installed.
         DispatchQueue.main.async { [self] in
@@ -228,7 +235,7 @@ final class AXApplicationPort: ApplicationPort {
     var isObserving: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return observer != nil
+        return isRegistered
     }
 
     func observeClosing(of window: WindowHandle, id: WindowID) {
@@ -258,6 +265,10 @@ final class AXApplicationPort: ApplicationPort {
         lock.lock()
         if watches[id] === watch {
             watches.removeValue(forKey: id)
+        }
+        if error == .cannotComplete {
+            // A busy app may have taken the registration all the same, pointer included.
+            retiredWatches.append(watch)
         }
         lock.unlock()
     }
@@ -301,6 +312,8 @@ final class AXApplicationPort: ApplicationPort {
         guard let handler else { return }
         if notification == kAXFocusedWindowChangedNotification || notification == kAXMainWindowChangedNotification {
             handler(.focusChanged(window: { AXReader.windowID(of: element) }))
+        } else if notification == kAXWindowMovedNotification || notification == kAXWindowResizedNotification {
+            handler(.geometryChanged)
         } else {
             handler(.windowsChanged)
         }

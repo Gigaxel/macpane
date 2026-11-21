@@ -48,7 +48,7 @@ struct WorkspaceKey: Hashable {
 struct ManagedWindow {
     let id: WindowID
     let pid: pid_t
-    let handle: WindowHandle
+    var handle: WindowHandle
     let bundleIdentifier: String?
     var title: String?
     /// The smallest size the app accepted when asked for less. Measured from the app's own answer

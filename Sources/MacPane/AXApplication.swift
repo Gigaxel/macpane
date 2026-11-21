@@ -32,7 +32,7 @@ final class AXApplication {
     private let port: ApplicationPort
     private let queue: DispatchQueue
     private let server = WindowServer.shared
-    private let onNotification: (pid_t) -> Void
+    private let onNotification: (_ pid: pid_t, _ isGeometry: Bool) -> Void
     private let onFocusedWindow: (pid_t, WindowID) -> Void
     private let onWindowClosing: (WindowID) -> Void
     private let onOutcomes: ([FrameWriteOutcome]) -> Void
@@ -51,13 +51,13 @@ final class AXApplication {
     private let commitGrace: UInt64 = 100_000_000
 
     /// Every handler is called on the main thread. `onNotification` fires for any window
-    /// notification from the app, `onFocusedWindow` when the app reports its focused window,
+    /// notification from the app (saying whether it was only a move or resize), `onFocusedWindow` when the app reports its focused window,
     /// `onWindowClosing` when a watched window starts to close, and `onOutcomes` with the result of
     /// each batch of frame writes.
     init(
         pid: pid_t,
         port: ApplicationPort,
-        onNotification: @escaping (pid_t) -> Void,
+        onNotification: @escaping (_ pid: pid_t, _ isGeometry: Bool) -> Void,
         onFocusedWindow: @escaping (pid_t, WindowID) -> Void,
         onWindowClosing: @escaping (WindowID) -> Void,
         onOutcomes: @escaping ([FrameWriteOutcome]) -> Void
@@ -103,7 +103,11 @@ final class AXApplication {
         if case .windowClosing(let id) = notification {
             onWindowClosing(id)
         }
-        onNotification(pid)
+        if case .geometryChanged = notification {
+            onNotification(pid, true)
+        } else {
+            onNotification(pid, false)
+        }
         guard case .focusChanged(let window) = notification else { return }
         queue.async { [self] in
             guard !invalidated, let id = window() else { return }

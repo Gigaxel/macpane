@@ -26,6 +26,8 @@ struct FrameRecord: Equatable {
     var pendingSince: UInt64 = 0
     /// False when the app did not confirm the last write, so nothing is concluded from the frame.
     var lastWriteSucceeded = true
+    /// True when the last write got no answer at all, as opposed to an error.
+    var lastWriteWentUnanswered = false
     /// Set after a timeout: the app is given until then before it is written to again.
     var retryNotBefore: UInt64 = 0
     /// True once the window has matched this goal. A later mismatch is then a change someone else
@@ -89,6 +91,7 @@ enum FramePlanner {
             // No answer came. Whatever the frame is now, the app never confirmed taking the write.
             current.pendingToken = nil
             current.lastWriteSucceeded = false
+            current.lastWriteWentUnanswered = true
         }
         if let accepted = current.accepted {
             if approximatelyEqual(accepted, observed) {
@@ -140,7 +143,7 @@ enum FramePlanner {
             current.attempts = 0
         }
         guard current.attempts < maximumAttempts else {
-            guard current.lastWriteSucceeded else {
+            guard !current.lastWriteWentUnanswered else {
                 // The app has not been answering. That is not a refusal: try again later.
                 return .settling(until: current.firstAttemptAt + attemptWindow + 1)
             }
@@ -162,6 +165,7 @@ enum FramePlanner {
         guard var current = record, current.pendingToken == token else { return }
         current.pendingToken = nil
         current.lastWriteSucceeded = error == .success
+        current.lastWriteWentUnanswered = error == .cannotComplete
         current.settling = nil
         if error == .cannotComplete {
             // The app is not answering. Give it longer each time before writing again.

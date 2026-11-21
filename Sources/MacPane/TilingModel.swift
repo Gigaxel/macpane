@@ -102,6 +102,9 @@ struct TilingModel {
 
     // MARK: Window facts
 
+    mutating func setHandle(_ handle: WindowHandle, of id: WindowID) {
+        windows[id]?.handle = handle
+    }
     mutating func setTitle(_ title: String?, of id: WindowID) {
         windows[id]?.title = title
     }
