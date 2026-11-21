@@ -54,6 +54,7 @@ final class WorkspaceOverviewOverlay {
     private var panel: OverlayPanel?
     private var onDismiss: (() -> Void)?
     private(set) var overview: WorkspaceOverview?
+    private(set) var isRenaming = false
     private var clickOutsideMonitor: Any?
     private var clickInsideMonitor: Any?
     private var dismissalObservers: [NSObjectProtocol] = []
@@ -82,6 +83,7 @@ final class WorkspaceOverviewOverlay {
         panel.ignoresMouseEvents = false
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
+        isRenaming = true
         view.beginRenaming(
             text: overview.activeWorkspaceName ?? "",
             onCommit: { [weak self] name in
@@ -99,6 +101,7 @@ final class WorkspaceOverviewOverlay {
         panel?.contentView as? WorkspaceOverviewView
     }
     private func finishRenameMode() {
+        isRenaming = false
         overviewView?.endRenaming()
     }
     func hide() {
@@ -106,6 +109,7 @@ final class WorkspaceOverviewOverlay {
     }
     private func hide(notify: Bool) {
         removeDismissalMonitors()
+        isRenaming = false
         overviewView?.endRenaming()
         panel?.ignoresMouseEvents = true
         panel?.orderOut(nil)

@@ -98,6 +98,10 @@ final class LocalApplicationPort: ApplicationPort {
         }
     }
 
+    var isObserving: Bool {
+        DispatchQueue.main.sync { handler != nil }
+    }
+
     func stopObserving() {
         for observer in observers {
             NotificationCenter.default.removeObserver(observer)

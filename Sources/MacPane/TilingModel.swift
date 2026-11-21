@@ -231,7 +231,7 @@ struct TilingModel {
         }
         var restored: Set<WindowID> = []
         for (display, indices) in evacuated {
-            guard let screen = screensByKey[display] else { continue }
+            guard let screen = screensByKey[display], screen.isTileable else { continue }
             evacuated.removeValue(forKey: display)
             for (id, index) in indices.sorted(by: { $0.key < $1.key }) where workspace(of: id) != nil {
                 move(id, to: screen.workspaceKey(index: index), onScreen: onScreen)

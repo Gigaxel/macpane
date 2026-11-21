@@ -129,7 +129,7 @@ final class WindowTiler {
         let windows: [ServerWindow]
         let byID: [WindowID: ServerWindow]
         /// Windows showing on a display whose current Space is an ordinary desktop.
-        let onScreen: Set<WindowID>
+        var onScreen: Set<WindowID>
         let shared: Set<WindowID>
         let tileableSpaces: Set<UInt64>
 
@@ -549,8 +549,10 @@ final class WindowTiler {
             beginPermissionPolling()
             return nil
         }
-        let world = readWorld()
-        removeDepartedWindows(world)
+        var world = readWorld()
+        // A tab that was just switched away from holds its tile until its successor takes over, so
+        // its neighbors do not grow into the space and shrink back.
+        world.onScreen.formUnion(removeDepartedWindows(world))
         guard isSettled(world) else {
             server.subscribe(to: world.windows.map(\.id).sorted())
             return world
@@ -598,7 +600,10 @@ final class WindowTiler {
         }
     }
 
-    private func removeDepartedWindows(_ world: World) {
+    /// Forgets managed windows that are gone. Returns the ones that are off screen only because a
+    /// tab switch is replacing them.
+    @discardableResult
+    private func removeDepartedWindows(_ world: World) -> Set<WindowID> {
         for id in ignored where world.byID[id] == nil {
             ignored.remove(id)
         }
@@ -613,9 +618,10 @@ final class WindowTiler {
             closing.removeValue(forKey: id)
         }
         let missing = model.windows.keys.filter { world.byID[$0] == nil }
-        guard !missing.isEmpty else { return }
+        guard !missing.isEmpty else { return [] }
         let described = server.describe(missing)
         let showingSpaces = Set(world.screens.map(\.space))
+        var beingReplaced: Set<WindowID> = []
         for id in missing {
             guard let window = described[id] else {
                 forget(id)
@@ -627,12 +633,16 @@ final class WindowTiler {
             guard server.usesSkyLight, !window.isMinimized, !window.isHiddenWithApplication,
                   let expected = model.workspace(of: id)?.space ?? model.floating[id]?.space,
                   showingSpaces.contains(expected),
-                  server.space(of: id).map(showingSpaces.contains) ?? true,
-                  !isBeingReplaced(id, bounds: window.bounds, world) else {
+                  server.space(of: id).map(showingSpaces.contains) ?? true else {
                 continue
             }
-            forget(id)
+            if isBeingReplaced(id, bounds: window.bounds, world) {
+                beingReplaced.insert(id)
+            } else {
+                forget(id)
+            }
         }
+        return beingReplaced
     }
 
     /// True while a new window of the same app is being adopted at exactly this spot. That is a tab
@@ -688,10 +698,8 @@ final class WindowTiler {
                 resolution.attempts += 1
                 resolving[id] = resolution
             } else {
-                guard isManageableApplication(pid: window.pid) else {
-                    ignored.insert(id)
-                    continue
-                }
+                // Not remembered: an app can turn into a regular app after its window is up.
+                guard isManageableApplication(pid: window.pid) else { continue }
                 resolving[id] = Resolution(pid: window.pid, firstSeenAt: world.now)
             }
             requests[window.pid, default: []].insert(id)
@@ -917,7 +925,7 @@ final class WindowTiler {
         if let intent = focusIntent, front == intent.window || world.now >= intent.deadline {
             focusIntent = nil
         }
-        if front != observedFocus {
+        if let front, front != observedFocus {
             selectedEmptyScreen = nil
         }
         focusedWindow = focusIntent?.window ?? front
@@ -932,7 +940,11 @@ final class WindowTiler {
             // This runs inside a reconcile, which goes on to lay out the workspace it just showed.
             showWorkspace(key.index, on: screen, world, directionHint: nil, focusing: false, applying: false)
         }
-        observedFocus = front
+        // A launcher or MacPane's own Settings taking focus for a moment leaves this alone, so
+        // focus falling back to a parked window afterwards does not count as arriving there.
+        if let front {
+            observedFocus = front
+        }
     }
 
     private func focus(_ id: WindowID) {
@@ -1114,7 +1126,10 @@ final class WindowTiler {
         }
         let gap = CGFloat(settings.gapPixels)
         let hidden = model.hidden(in: key, onScreen: world.onScreen)
-        if !FramePlanner.approximatelyEqual(window.bounds.size, target.size) {
+        // A window that settled on its own size (a terminal's cell grid, an app minimum) was not
+        // resized just because it differs from its tile.
+        let settledSize = (frameRecords[id]?.accepted ?? target).size
+        if !FramePlanner.approximatelyEqual(window.bounds.size, settledSize) {
             // Resized: move the split the dragged edge belongs to.
             let slots = state.resolvedSlots(
                 in: screen.frame, gap: gap, accommodating: model.minimumSizes(in: key), hidden: hidden
@@ -1133,6 +1148,11 @@ final class WindowTiler {
         let cursor = ScreenCatalog.cursorLocation()
         let dropScreen = ScreenCatalog.screen(containing: cursor, in: world.screens.filter(\.isTileable)) ?? screen
         let dropKey = model.activeKey(on: dropScreen)
+        // Let go inside its own tile: a nudge, not a move. The window goes back.
+        guard dropKey != key || !target.contains(cursor) else { return }
+        if dropKey != key {
+            relocating[id] = world.now + relocationGrace
+        }
         let candidates = visibleTiles(in: dropKey, world).filter { $0.id != id }
         guard let hit = WindowDropPlanner.target(cursor: cursor, movingFrame: window.bounds, candidates: candidates) else {
             if dropKey != key {

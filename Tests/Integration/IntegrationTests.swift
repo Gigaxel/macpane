@@ -57,12 +57,13 @@ final class Scenario {
     }
 
     func run() async throws {
-        guard server.usesSkyLight else {
-            throw Failure(description: "the WindowServer query calls are unavailable")
-        }
         tiler.start()
         defer {
             UserDefaults.standard.removePersistentDomain(forName: "com.gigaxel.macpane.integration-tests")
+        }
+        guard server.usesSkyLight else {
+            try await runWithoutSkyLight()
+            return
         }
 
         // New windows tile by splitting the most recent one.
@@ -105,15 +106,21 @@ final class Scenario {
         windows.append(tab)
         b.addTabbedWindow(tab, ordered: .above)
         b.tabGroup?.selectedWindow = tab
-        try await waitUntil("the second tab takes over the first tab's tile", timeout: 3) { [self] in
-            guard let screen = try? screenInfo(), let tabBounds = bounds(tab), let aBounds = bounds(a) else { return false }
-            let right = tile(0.5, 0, 0.5, 1).frame(in: screen.frame, gap: gap, smartOuterGap: true)
-            let left = tile(0, 0, 0.5, 1).frame(in: screen.frame, gap: gap, smartOuterGap: true)
-            return FramePlanner.approximatelyEqual(tabBounds, right) && FramePlanner.approximatelyEqual(aBounds, left)
-        }
-        print("ok  the second tab takes over the first tab's tile")
+        try await expect("the second tab sits on the first tab's tile", [
+            (a, tile(0, 0, 0.5, 1)), (tab, tile(0.5, 0, 0.5, 1))
+        ], timeout: 3)
+        // Swapping proves the tab itself is now the tiled window, not just sitting where B was.
+        tiler.handle(action: .focus(.right))
+        command(.swap(.left))
+        try await expect("the tab took over the tile and moves with it", [
+            (tab, tile(0, 0, 0.5, 1)), (a, tile(0.5, 0, 0.5, 1))
+        ], timeout: 3)
         b.tabGroup?.selectedWindow = b
-        try await expect("switching back keeps the same tile", [
+        try await expect("switching back hands the tile to the first tab", [
+            (b, tile(0, 0, 0.5, 1)), (a, tile(0.5, 0, 0.5, 1))
+        ], timeout: 3)
+        command(.swap(.right))
+        try await expect("and it moves with the tile too", [
             (a, tile(0, 0, 0.5, 1)), (b, tile(0.5, 0, 0.5, 1))
         ], timeout: 3)
         tab.close()
@@ -263,6 +270,33 @@ final class Scenario {
         print("")
         for timing in timings {
             print("  \(timing.name.padding(toLength: 34, withPad: " ", startingAt: 0)) \(String(format: "%7.2f ms", timing.milliseconds))")
+        }
+    }
+
+    /// With `MACPANE_DISABLE_SKYLIGHT=1` the tiler runs on the public window list and a once-a-second
+    /// check, as it would on a macOS release that dropped the private calls. Slower, same result.
+    private func runWithoutSkyLight() async throws {
+        let a = openWindow("A")
+        try await expect("fallback: first window fills the display", [(a, tile(0, 0, 1, 1))], timeout: 5)
+        let b = openWindow("B")
+        try await expect("fallback: second window splits the first", [
+            (a, tile(0, 0, 0.5, 1)), (b, tile(0.5, 0, 0.5, 1))
+        ], timeout: 5)
+        b.miniaturize(nil)
+        try await expect("fallback: minimizing gives the space to the sibling", [(a, tile(0, 0, 1, 1))], timeout: 6)
+        b.deminiaturize(nil)
+        try await expect("fallback: restoring returns the window to its tile", [
+            (a, tile(0, 0, 0.5, 1)), (b, tile(0.5, 0, 0.5, 1))
+        ], timeout: 6)
+        command(.swap(.left))
+        try await expect("fallback: swap exchanges the two tiles", [
+            (b, tile(0, 0, 0.5, 1)), (a, tile(0.5, 0, 0.5, 1))
+        ], timeout: 5)
+        b.close()
+        try await expect("fallback: closing gives the tile back", [(a, tile(0, 0, 1, 1))], timeout: 5)
+        await stopTiler()
+        for window in windows {
+            window.close()
         }
     }
 

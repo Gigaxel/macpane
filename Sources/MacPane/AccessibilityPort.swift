@@ -39,8 +39,11 @@ protocol ApplicationPort: AnyObject {
     func windows() -> AXRead<[(id: WindowID, handle: WindowHandle)]>
     func classify(_ window: WindowHandle) -> WindowResolution
     /// Starts delivering notifications to `handler` on the main thread. Move and resize are only
-    /// included on request, for when the WindowServer is not reporting them.
+    /// included on request, for when the WindowServer is not reporting them. An app that has just
+    /// launched may not accept the registration yet; `isObserving` stays false and it can be asked
+    /// again.
     func startObserving(includingGeometry: Bool, handler: @escaping (ApplicationNotification) -> Void)
+    var isObserving: Bool { get }
     /// Asks to be told when this window starts closing. Only takes effect once observing started.
     func observeClosing(of window: WindowHandle, id: WindowID)
     /// Stops notifications. Called on the main thread, so none can be delivered afterwards.
@@ -219,6 +222,12 @@ final class AXApplicationPort: ApplicationPort {
         }
     }
 
+    var isObserving: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return observer != nil
+    }
+
     func observeClosing(of window: WindowHandle, id: WindowID) {
         guard let window = window as? AXWindowHandle else { return }
         // The watch is stored before it is registered: the notification can arrive straight away,
@@ -262,7 +271,8 @@ final class AXApplicationPort: ApplicationPort {
         let retired = watches
         watches.removeAll()
         lock.unlock()
-        DispatchQueue.main.async { _ = retired }
+        // A callback already on its way in on this turn of the run loop still finds this port.
+        DispatchQueue.main.async { _ = (self, retired) }
         if let installed {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(installed), .commonModes)
         }

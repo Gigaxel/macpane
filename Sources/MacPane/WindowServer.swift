@@ -82,6 +82,9 @@ final class WindowServer {
     private let connection: Int32
     private var eventHandler: (() -> Void)?
     private var registeredEvents = false
+    /// SkyLight has no call to take a callback back, so it is registered once per process.
+    private var requestedEvents = false
+    private var allEventsRegistered = false
     private var subscribedWindows: [WindowID] = []
 
     /// Window closed, moved, resized, reordered, changed level, shown and hidden; Dock geometry;
@@ -264,8 +267,7 @@ final class WindowServer {
         guard !candidates.isEmpty else { return [:] }
         var described: [WindowID: ServerWindow] = [:]
         guard let functions else {
-            let list = candidates.map { NSNumber(value: $0) } as CFArray
-            let descriptions = CGWindowListCreateDescriptionFromArray(list) as? [[String: Any]] ?? []
+            let descriptions = CGWindowListCreateDescriptionFromArray(Self.rawWindowIDs(candidates)) as? [[String: Any]] ?? []
             for description in descriptions {
                 guard let id = (description[kCGWindowNumber as String] as? NSNumber)?.uint32Value else { continue }
                 described[id] = ServerWindow(
@@ -290,7 +292,7 @@ final class WindowServer {
             }
             return rect
         }
-        guard let descriptions = CGWindowListCreateDescriptionFromArray([NSNumber(value: window)] as CFArray)
+        guard let descriptions = CGWindowListCreateDescriptionFromArray(Self.rawWindowIDs([window]))
                   as? [[String: Any]],
               let boundsDictionary = descriptions.first?[kCGWindowBounds as String] as? NSDictionary,
               let rect = CGRect(dictionaryRepresentation: boundsDictionary as CFDictionary),
@@ -298,6 +300,13 @@ final class WindowServer {
             return nil
         }
         return rect
+    }
+
+    /// `CGWindowListCreateDescriptionFromArray` takes the IDs themselves as the array's values, not
+    /// boxed numbers.
+    private static func rawWindowIDs(_ ids: [WindowID]) -> CFArray {
+        var values = ids.map { UnsafeRawPointer(bitPattern: UInt($0)) }
+        return CFArrayCreate(kCFAllocatorDefault, &values, values.count, nil)
     }
 
     private func iterate(_ list: CFArray, functions: Functions, _ body: (ServerWindow) -> Void) {
@@ -369,8 +378,12 @@ final class WindowServer {
                 }
             }
         }
-        // Every event has to register: missing one of them means changes that nothing announces.
-        registeredEvents = Self.wakeEvents.allSatisfy { eventFunctions.registerNotifyProc(callback, $0, nil) == 0 }
+        if !requestedEvents {
+            requestedEvents = true
+            // Every event has to register: missing one means changes that nothing announces.
+            allEventsRegistered = Self.wakeEvents.allSatisfy { eventFunctions.registerNotifyProc(callback, $0, nil) == 0 }
+        }
+        registeredEvents = allEventsRegistered
         return registeredEvents
     }
 

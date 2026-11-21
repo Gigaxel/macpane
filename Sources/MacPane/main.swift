@@ -332,7 +332,9 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
             // Titles are read from the apps in the background; the overview opens with the ones
             // already known and redraws if any turn out to have changed.
             tiler.refreshWindowTitles { [weak self] changed in
-                guard let self, changed, self.workspaceOverviewOverlay.overview?.displayID == overview.displayID else {
+                // Redrawing would take the text field away from someone typing a name.
+                guard let self, changed, !self.workspaceOverviewOverlay.isRenaming,
+                      self.workspaceOverviewOverlay.overview?.displayID == overview.displayID else {
                     return
                 }
                 self.showWorkspaceOverview(refreshingTitles: false)

@@ -423,10 +423,7 @@ private struct AboutSettingsView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Spacer()
-            VStack(spacing: 2) {
-                Text("Ad-hoc signed for local development.")
-                Text("Requires Accessibility permission to manage windows.")
-            }
+            Text("Requires Accessibility permission to manage windows.")
             .font(.caption)
             .foregroundStyle(.tertiary)
             .padding(.bottom, 12)

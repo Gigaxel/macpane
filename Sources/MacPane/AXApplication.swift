@@ -46,6 +46,7 @@ final class AXApplication {
     private var cancellations = 0
     /// When each window was last written, kept on the queue. Until a write has had time to reach
     /// the WindowServer, the bounds read from it are those of the frame before.
+    private var observesGeometry = false
     private var lastWriteAt: [WindowID: UInt64] = [:]
     private let commitGrace: UInt64 = 100_000_000
 
@@ -74,10 +75,17 @@ final class AXApplication {
 
     func observe(includingGeometry: Bool) {
         queue.async { [self] in
-            guard !invalidated else { return }
-            port.startObserving(includingGeometry: includingGeometry) { [weak self] notification in
-                self?.deliver(notification)
-            }
+            observesGeometry = includingGeometry
+            startObservingIfNeeded()
+        }
+    }
+
+    /// An app that was still launching when it was first asked gets asked again whenever there is
+    /// other business with it. Runs on the queue.
+    private func startObservingIfNeeded() {
+        guard !invalidated, !port.isObserving else { return }
+        port.startObserving(includingGeometry: observesGeometry) { [weak self] notification in
+            self?.deliver(notification)
         }
     }
 
@@ -122,6 +130,7 @@ final class AXApplication {
     /// one can be tiled. `completion` runs on the main thread.
     func resolve(_ windows: Set<WindowID>, completion: @escaping ([WindowID: WindowResolution]) -> Void) {
         queue.async { [self] in
+            startObservingIfNeeded()
             var resolutions: [WindowID: WindowResolution] = [:]
             if !invalidated, case .value(let listed) = port.windows() {
                 for (id, handle) in listed where windows.contains(id) && resolutions[id] == nil {
