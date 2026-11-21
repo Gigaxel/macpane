@@ -144,6 +144,17 @@ struct ScreenTileState {
         }
         return true
     }
+    /// Puts two windows in each other's tiles. Focus and zoom stay with the tile.
+    @discardableResult
+    mutating func exchange(_ id: WindowID, _ other: WindowID) -> Bool {
+        guard tree.swap(id, other) else { return false }
+        func swapped(_ value: WindowID?) -> WindowID? {
+            value == id ? other : value == other ? id : value
+        }
+        lastFocusedID = swapped(lastFocusedID)
+        zoomedWindowID = swapped(zoomedWindowID)
+        return true
+    }
     mutating func remove(_ id: WindowID) {
         guard tree.contains(id) else { return }
         tree.remove(id)

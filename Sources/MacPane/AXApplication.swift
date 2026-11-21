@@ -49,6 +49,9 @@ final class AXApplication {
     private var observesGeometry = false
     private var lastWriteAt: [WindowID: UInt64] = [:]
     private let commitGrace: UInt64 = 100_000_000
+    /// Close watches asked for before the app accepted observing, kept on the queue. Without its
+    /// watch a window's close would go unannounced, so each is registered once observing starts.
+    private var unregisteredWatches: [WindowID: WindowHandle] = [:]
 
     /// Every handler is called on the main thread. `onNotification` fires for any window
     /// notification from the app (saying whether it was only a move or resize), `onFocusedWindow` when the app reports its focused window,
@@ -87,6 +90,11 @@ final class AXApplication {
         port.startObserving(includingGeometry: observesGeometry) { [weak self] notification in
             self?.deliver(notification)
         }
+        guard port.isObserving else { return }
+        for (id, window) in unregisteredWatches {
+            port.observeClosing(of: window, id: id)
+        }
+        unregisteredWatches.removeAll()
     }
 
     /// Watches a window for the start of its close.
@@ -94,6 +102,10 @@ final class AXApplication {
         queue.async { [self] in
             guard !invalidated else { return }
             startObservingIfNeeded()
+            guard port.isObserving else {
+                unregisteredWatches[id] = window
+                return
+            }
             port.observeClosing(of: window, id: id)
         }
     }

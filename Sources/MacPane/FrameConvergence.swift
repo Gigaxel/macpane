@@ -197,9 +197,14 @@ enum FramePlanner {
     }
 
     /// True when no more than a sliver of the frame is on the display.
-    private static func isOffDisplay(_ frame: CGRect, _ display: CGRect) -> Bool {
+    static func isOffDisplay(_ frame: CGRect, _ display: CGRect) -> Bool {
         let visible = frame.intersection(display)
         return visible.isNull || visible.width <= tolerance || visible.height <= tolerance
+    }
+
+    /// At the tile's corner and no larger than it, as an app that stops short of its tile sits.
+    static func fits(_ observed: CGRect, in tile: CGRect) -> Bool {
+        isShortfall(target: tile, observed: observed)
     }
 
     /// In the right place and no larger than asked: the app stopped short of the size on purpose.

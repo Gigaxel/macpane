@@ -41,6 +41,9 @@ struct TilingTests {
         testModelKeepsMinimizedWindowsPlace()
         testModelReplacementTakesOverTile()
         testModelIgnoresSpacesThatAreNotShowing()
+        testModelKeepsTilesThroughFullscreenRoundTrip()
+        testDepartureNeedsEvidenceOfClosing()
+        testStateExchangeKeepsZoomAndFocusWithTheTile()
         testModelFloatAndTile()
         testModelMoveBetweenWorkspaces()
         testModelDeleteWorkspaceShiftsHigherWorkspaces()
@@ -586,6 +589,90 @@ struct TilingTests {
         }
         guard model.placements(screens: [fullscreen], onScreen: [1, 2], gap: 0).isEmpty else {
             fail("a fullscreen Space is never tiled")
+        }
+    }
+
+    /// A window that goes fullscreen leaves the desktop's listing, and on the way back it can sit
+    /// on no Space at all. Its tile waits for it, so every window ends up where it was.
+    private static func testModelKeepsTilesThroughFullscreenRoundTrip() {
+        let desktop = screen(space: 1)
+        let fullscreen = screen(space: 9, isTileable: false)
+        let key = desktop.workspaceKey(index: 0)
+        var model = TilingModel()
+        model.adoptTiled(window(1), in: key, onScreen: [1])
+        model.adoptTiled(window(2), in: key, near: 1, onScreen: [1, 2])
+        model.adoptTiled(window(3), in: key, near: 2, onScreen: [1, 2, 3])
+        let before = model.placements(screens: [desktop], onScreen: [1, 2, 3], gap: 0)
+        // Window 2 leaves for its fullscreen Space, then returns ordered out and on no Space.
+        let states: [(spaces: [UInt64], showing: Set<UInt64>)] = [([9], [1]), ([9], [9]), ([], [1]), ([1], [1])]
+        for state in states {
+            let verdict = WindowDeparturePlanner.verdict(
+                exists: true, announcedClosing: false, isMinimized: false,
+                isHomeShowing: state.showing.contains(1), spaces: state.spaces, showingSpaces: state.showing
+            )
+            guard verdict == .hidden else {
+                fail("a window between Spaces is out of view, not closed: \(state)")
+            }
+        }
+        guard model.placements(screens: [fullscreen], onScreen: [], gap: 0).isEmpty else {
+            fail("nothing is tiled while the fullscreen Space shows")
+        }
+        let during = model.placements(screens: [desktop], onScreen: [1, 3], gap: 0)
+        guard during[2] == nil, during.count == 2 else {
+            fail("the window away in fullscreen takes no space")
+        }
+        let after = model.placements(screens: [desktop], onScreen: [1, 2, 3], gap: 0)
+        guard after == before else {
+            fail("every window returns to its own tile\nbefore: \(before)\nafter:  \(after)")
+        }
+    }
+
+    /// Switching tabs of a merged window group hands the shown tab's tile to the selected one.
+    private static func testStateExchangeKeepsZoomAndFocusWithTheTile() {
+        let frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+        var state = ScreenTileState()
+        state.insert(1)
+        state.insert(2, near: 1)
+        state.insert(3, near: 2)
+        state.markFocused(1)
+        state.toggleZoom(1)
+        let before = state.frames(in: frame, gap: 0, hidden: [3])
+        guard state.exchange(1, 3), state.zoomedWindowID == 3, state.focusedWindowID == 3 else {
+            fail("zoom and focus follow the tile to the selected tab")
+        }
+        let after = state.frames(in: frame, gap: 0, hidden: [1])
+        guard after[3] == before[1], after[2] == before[2] else {
+            fail("the selected tab sits exactly where the tab before it was")
+        }
+    }
+
+    private static func testDepartureNeedsEvidenceOfClosing() {
+        func verdict(
+            exists: Bool = true, closing: Bool = false, minimized: Bool = false, home: Bool = true,
+            spaces: [UInt64] = []
+        ) -> WindowDeparturePlanner.Verdict {
+            WindowDeparturePlanner.verdict(
+                exists: exists, announcedClosing: closing, isMinimized: minimized,
+                isHomeShowing: home, spaces: spaces, showingSpaces: [1]
+            )
+        }
+        guard verdict(exists: false) == .gone, verdict(exists: false, minimized: true) == .gone else {
+            fail("a window the server no longer has is gone")
+        }
+        guard verdict(closing: true) == .gone, verdict(closing: true, spaces: [1]) == .gone else {
+            fail("a window whose app announced its close and that left the listing is gone")
+        }
+        guard verdict() == .hidden, verdict(spaces: [1]) == .hidden else {
+            fail("a window ordered out without a close is only out of view")
+        }
+        guard verdict(closing: true, minimized: true) == .hidden else {
+            fail("an element rebuilt while minimized is not a close")
+        }
+        guard verdict(closing: true, spaces: [9]) == .rebuilt else {
+            fail("a window announced closed but alive on another Space had its element rebuilt")
+        }
+        guard verdict(closing: true, home: false, spaces: [1]) == .hidden else {
+            fail("an announcement waits until the window's own desktop shows")
         }
     }
 
