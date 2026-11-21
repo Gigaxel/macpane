@@ -1,14 +1,16 @@
 import Foundation
 import os
 
+/// Signposts for Instruments, plus a plain-text timing log on stderr when `MACPANE_TIMING` is set
+/// or the `timingLog` default is on. Safe to call from any thread.
 enum PerformanceTrace {
     private static let log = OSLog(subsystem: "com.gigaxel.macpane", category: .pointsOfInterest)
     static let isVerbose: Bool = {
         ProcessInfo.processInfo.environment["MACPANE_TIMING"] != nil
             || UserDefaults.standard.bool(forKey: "timingLog")
     }()
-    private static var eventMark: (name: String, at: UInt64)?
     private static let processStart = now()
+    private static let outputLock = NSLock()
 
     @inline(__always)
     static func now() -> UInt64 {
@@ -19,46 +21,28 @@ enum PerformanceTrace {
         Double(now() &- start) / 1_000_000
     }
 
-    @discardableResult
-    static func interval<T>(_ name: StaticString, detail: @autoclosure () -> String = "", _ body: () throws -> T) rethrows -> T {
-        let id = OSSignpostID(log: log)
-        os_signpost(.begin, log: log, name: name, signpostID: id)
-        let start = now()
-        defer {
-            os_signpost(.end, log: log, name: name, signpostID: id)
-            if isVerbose {
-                emit("\(name) \(detail()) \(format(milliseconds(since: start)))ms")
-            }
-        }
-        return try body()
+    static func seconds(_ nanoseconds: UInt64) -> Double {
+        Double(nanoseconds) / 1_000_000_000
     }
 
-    static func event(_ name: StaticString, _ detail: String = "") {
+    /// `detail` is only built when someone is listening.
+    static func event(_ name: StaticString, _ detail: @autoclosure () -> String = "") {
+        guard isVerbose || log.signpostsEnabled else { return }
+        let detail = detail()
         os_signpost(.event, log: log, name: name, "%{public}s", detail)
         if isVerbose {
             emit("\(name) \(detail)")
         }
     }
 
-    static func markEvent(_ name: String) {
-        eventMark = (name, now())
-        if isVerbose {
-            emit("event \(name)")
-        }
-    }
-
-    static func reportEventLatency(_ stage: StaticString) {
-        guard let mark = eventMark else { return }
-        eventMark = nil
-        event(stage, "\(mark.name) +\(format(milliseconds(since: mark.at)))ms")
-    }
-
-    private static func format(_ value: Double) -> String {
-        String(format: "%.2f", value)
+    static func format(_ milliseconds: Double) -> String {
+        String(format: "%.2fms", milliseconds)
     }
 
     private static func emit(_ text: String) {
-        let uptime = format(milliseconds(since: processStart))
-        FileHandle.standardError.write(Data("[macpane +\(uptime)ms] \(text)\n".utf8))
+        let line = Data("[macpane +\(format(milliseconds(since: processStart)))] \(text)\n".utf8)
+        outputLock.lock()
+        FileHandle.standardError.write(line)
+        outputLock.unlock()
     }
 }

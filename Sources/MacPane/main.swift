@@ -39,9 +39,9 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
     func applicationWillTerminate(_ notification: Notification) {
         prepareForTermination()
     }
-    func handle(action: HotKeyAction, eventAge: TimeInterval, triggerKeyIsDown: Bool) {
+    func handle(action: HotKeyAction, eventAge: TimeInterval) {
+        // A held key can queue repeats faster than they are handled; acting on old ones overshoots.
         guard !action.shouldDropWhenStale || eventAge <= 0.12 else { return }
-        guard !action.shouldDropWhenTriggerReleased || triggerKeyIsDown || eventAge <= 0.04 else { return }
         perform(action: action, rebuildMenu: false)
     }
     private func perform(action: HotKeyAction, rebuildMenu shouldRebuildMenu: Bool) {
@@ -64,8 +64,10 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
             monitorPickerOverlay.hide()
             return
         case .overviewSwitchWorkspace(let index):
+            // The overview shows one display; the switch applies there even if focus has moved.
+            let displayID = workspaceOverviewOverlay.overview?.displayID
             workspaceOverviewOverlay.hide()
-            tiler.handle(action: .switchWorkspace(index))
+            tiler.switchWorkspace(to: index, onDisplay: displayID)
             if shouldRebuildMenu {
                 rebuildMenu()
             }
@@ -85,10 +87,11 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
             return
         case .overviewRenameStart:
             HotKeyManager.shared.unregisterWorkspaceOverviewHotKeys()
+            let shown = workspaceOverviewOverlay.overview
             let didBeginRename = workspaceOverviewOverlay.beginRename(
                 onCommit: { [weak self] name in
-                    guard let self else { return }
-                    self.tiler.renameActiveWorkspace(to: name)
+                    guard let self, let shown else { return }
+                    self.tiler.renameWorkspace(shown.activeWorkspaceIndex, onDisplay: shown.displayID, to: name)
                     self.showWorkspaceOverview()
                 },
                 onCancel: { [weak self] in
@@ -319,11 +322,21 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         HotKeyManager.shared.registerMonitorPickerHotKeys(monitorCount: options.count)
         return true
     }
-    private func showWorkspaceOverview() {
+    private func showWorkspaceOverview(refreshingTitles: Bool = true) {
         monitorPickerOverlay.hide()
         guard let overview = tiler.workspaceOverview() else {
             NSSound.beep()
             return
+        }
+        if refreshingTitles {
+            // Titles are read from the apps in the background; the overview opens with the ones
+            // already known and redraws if any turn out to have changed.
+            tiler.refreshWindowTitles { [weak self] changed in
+                guard let self, changed, self.workspaceOverviewOverlay.overview?.displayID == overview.displayID else {
+                    return
+                }
+                self.showWorkspaceOverview(refreshingTitles: false)
+            }
         }
         workspaceOverviewOverlay.show(
             overview,
@@ -353,17 +366,14 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
             displayID: displayID
         )
     }
-    @objc private func decreaseGap() {
+    private func decreaseGap() {
         tiler.adjustGap(by: -2)
-        rebuildMenu()
     }
-    @objc private func increaseGap() {
+    private func increaseGap() {
         tiler.adjustGap(by: 2)
-        rebuildMenu()
     }
-    @objc private func resetGap() {
+    private func resetGap() {
         tiler.setGap(8)
-        rebuildMenu()
     }
     @objc private func quit() {
         prepareForTermination()

@@ -1,7 +1,7 @@
 import ApplicationServices
 import CoreGraphics
 
-enum DropAction {
+enum DropAction: Equatable {
     case swap
     case split(SnapDirection)
 }
@@ -11,17 +11,7 @@ struct WorkspaceMenuState {
     let count: Int
     let maximumCount: Int
     let canDeleteActive: Bool
-    let deleteBlockReason: String?
     var canCreateMore: Bool { count < maximumCount }
-    var deleteWorkspaceTitle: String {
-        if canDeleteActive {
-            return "Delete Current Workspace"
-        }
-        if let deleteBlockReason {
-            return "Delete Current Workspace (\(deleteBlockReason))"
-        }
-        return "Delete Current Workspace"
-    }
     var statusText: String {
         guard let activeIndex else {
             return "Workspace: unavailable"
@@ -42,19 +32,6 @@ struct MonitorPickerOption {
     let name: String
     let isSource: Bool
 }
-enum CrossDisplayMovePlanner {
-    static func targetNativeStateKey(
-        sourceNativeStateKey: String,
-        targetDisplayID: CGDirectDisplayID?,
-        screens: [ScreenInfo]
-    ) -> String {
-        guard let targetDisplayID,
-              let match = screens.first(where: { $0.displayID == targetDisplayID }) else {
-            return sourceNativeStateKey
-        }
-        return match.nativeStateKey
-    }
-}
 struct WorkspaceOverviewItem {
     let index: Int
     let name: String?
@@ -69,26 +46,6 @@ struct WorkspaceOverviewWindow {
     let frame: CGRect?
     let pid: pid_t
 }
-struct WorkspaceContext {
-    let screen: ScreenInfo
-    let nativeStateKey: String
-    let activeWorkspaceIndex: Int
-    var stateKey: String {
-        ScreenInfo.workspaceStateKey(nativeStateKey: nativeStateKey, workspaceIndex: activeWorkspaceIndex)
-    }
-    func withActiveWorkspaceIndex(_ index: Int) -> WorkspaceContext {
-        WorkspaceContext(
-            screen: ScreenInfo(
-                key: screen.key,
-                frame: screen.frame,
-                displayID: screen.displayID,
-                workspaceIndex: index
-            ),
-            nativeStateKey: nativeStateKey,
-            activeWorkspaceIndex: index
-        )
-    }
-}
 struct WorkspaceSwitchIndicatorState {
     let workspaceIndex: Int
     let displayID: CGDirectDisplayID?
@@ -100,10 +57,4 @@ enum WorkspaceSlideDirection {
 enum WorkspaceSlideEdge {
     case left
     case right
-}
-struct WorkspaceSlideTransition {
-    let window: ManagedWindow
-    let startFrame: CGRect
-    let endFrame: CGRect
-    let needsInitialFrame: Bool
 }

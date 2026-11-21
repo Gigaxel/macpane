@@ -10,30 +10,8 @@ extension NSScreen {
 extension CGRect {
     var area: CGFloat { width * height }
     func distanceSquared(to point: CGPoint) -> CGFloat {
-        let dx: CGFloat
-        if point.x < minX {
-            dx = minX - point.x
-        } else if point.x > maxX {
-            dx = point.x - maxX
-        } else {
-            dx = 0
-        }
-        let dy: CGFloat
-        if point.y < minY {
-            dy = minY - point.y
-        } else if point.y > maxY {
-            dy = point.y - maxY
-        } else {
-            dy = 0
-        }
+        let dx = max(minX - point.x, 0, point.x - maxX)
+        let dy = max(minY - point.y, 0, point.y - maxY)
         return dx * dx + dy * dy
-    }
-    func centerDistanceSquared(to point: CGPoint) -> CGFloat {
-        let dx = midX - point.x
-        let dy = midY - point.y
-        return dx * dx + dy * dy
-    }
-    func frameSimilarityScore(to other: CGRect) -> CGFloat {
-        abs(minX - other.minX) + abs(minY - other.minY) + abs(width - other.width) + abs(height - other.height)
     }
 }

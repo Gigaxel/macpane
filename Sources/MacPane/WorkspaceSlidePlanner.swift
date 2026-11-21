@@ -1,8 +1,17 @@
-import AppKit
 import CoreGraphics
 
+/// One window's path during a workspace slide.
+struct WorkspaceSlideTransition: Equatable {
+    let window: WindowID
+    let startFrame: CGRect
+    let endFrame: CGRect
+    /// True for a window coming in from a hidden workspace: it has to be sized and placed at the
+    /// edge before it starts moving.
+    let needsInitialFrame: Bool
+}
+
+/// Plans the horizontal slide between two virtual workspaces. Windows only ever move along x.
 enum WorkspaceSlidePlanner {
-    static let defaultFrameRate = 60
     static let maximumTransitionCount = 8
 
     static func direction(from visibleIndex: Int, to targetIndex: Int, hint: Int?) -> WorkspaceSlideDirection {
@@ -12,94 +21,84 @@ enum WorkspaceSlidePlanner {
         return targetIndex > visibleIndex ? .forward : .backward
     }
 
-    static func frameRate(for screen: ScreenInfo) -> Int {
-        max(
-            nsScreen(for: screen)?.maximumFramesPerSecond ?? NSScreen.main?.maximumFramesPerSecond ?? defaultFrameRate,
-            defaultFrameRate
-        )
-    }
-
-    static func nsScreen(for screen: ScreenInfo) -> NSScreen? {
-        if let displayID = screen.displayID,
-           let matchingScreen = NSScreen.screens.first(where: { $0.displayID == displayID }) {
-            return matchingScreen
-        }
-        return NSScreen.screens.first { ScreenInfo.displayKey(for: $0.displayID, frame: $0.frame) == screen.key }
-    }
-
+    /// `outgoing` are the windows showing now, with their current frames; `incoming` are the target
+    /// workspace's windows with the tiles they will end in. An empty result means the slide cannot
+    /// be shown without a window crossing another display.
     static func transitions(
-        allWindows: [ManagedWindow],
+        outgoing: [(id: WindowID, frame: CGRect)],
+        incoming: [(id: WindowID, frame: CGRect)],
         screen: ScreenInfo,
-        visibleState: ScreenTileState?,
-        targetState: ScreenTileState?,
         direction: WorkspaceSlideDirection,
-        floatingWindowIDs: Set<WindowIdentity>,
-        screens: [ScreenInfo],
-        gapPixels: CGFloat,
-        minimumSizesByID: [WindowIdentity: CGSize] = [:]
+        screens: [ScreenInfo]
     ) -> [WorkspaceSlideTransition] {
-        let windowsByID = Dictionary(allWindows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let outgoingEdge: WorkspaceSlideEdge = direction == .forward ? .left : .right
+        let incomingEdge: WorkspaceSlideEdge = direction == .forward ? .right : .left
         var transitions: [WorkspaceSlideTransition] = []
+        for (id, frame) in outgoing {
+            let startFrame = FramePlanner.sanitized(frame)
+            let endFrame = hiddenFrame(matching: startFrame, on: screen, edge: outgoingEdge)
+            guard staysOffOtherScreens(endFrame, source: screen, screens: screens) else { return [] }
+            transitions.append(WorkspaceSlideTransition(
+                window: id, startFrame: startFrame, endFrame: endFrame, needsInitialFrame: false
+            ))
+        }
+        for (id, frame) in incoming {
+            let endFrame = FramePlanner.sanitized(frame)
+            let startFrame = hiddenFrame(matching: endFrame, on: screen, edge: incomingEdge)
+            guard staysOffOtherScreens(startFrame, source: screen, screens: screens) else { return [] }
+            transitions.append(WorkspaceSlideTransition(
+                window: id, startFrame: startFrame, endFrame: endFrame, needsInitialFrame: true
+            ))
+        }
+        return transitions
+    }
 
-        if let visibleState, !visibleState.isEmpty {
-            guard visibleState.windowIDs.allSatisfy({ windowsByID[$0] != nil || floatingWindowIDs.contains($0) }) else {
-                return []
-            }
-            for id in visibleState.windowIDs {
-                guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { continue }
-                let startFrame = sanitizedFrame(window.frame)
-                let endFrame = hiddenFrame(
-                    matching: startFrame,
-                    on: screen,
-                    edge: direction == .forward ? .left : .right
-                )
-                guard hiddenFrameDoesNotCoverAnotherScreen(endFrame, source: screen, screens: screens) else {
-                    return []
-                }
+    /// Continues a slide when another switch arrives before it finishes. Every window already
+    /// moving starts from where it is right now, so the motion never stops and restarts.
+    static func chainedTransitions(
+        previous: [WorkspaceSlideTransition],
+        currentOrigins: [WindowID: CGPoint],
+        incoming: [(id: WindowID, frame: CGRect)],
+        screen: ScreenInfo,
+        direction: WorkspaceSlideDirection,
+        screens: [ScreenInfo]
+    ) -> [WorkspaceSlideTransition] {
+        let outgoingEdge: WorkspaceSlideEdge = direction == .forward ? .left : .right
+        let incomingEdge: WorkspaceSlideEdge = direction == .forward ? .right : .left
+        let incomingFrames = Dictionary(incoming.map { ($0.id, $0.frame) }, uniquingKeysWith: { first, _ in first })
+        var transitions: [WorkspaceSlideTransition] = []
+        var seen = Set<WindowID>()
+
+        for transition in previous {
+            let id = transition.window
+            seen.insert(id)
+            let origin = currentOrigins[id] ?? transition.endFrame.origin
+            let startFrame = FramePlanner.sanitized(CGRect(origin: origin, size: transition.endFrame.size))
+            if let target = incomingFrames[id] {
                 transitions.append(WorkspaceSlideTransition(
-                    window: window,
+                    window: id,
                     startFrame: startFrame,
-                    endFrame: endFrame,
+                    endFrame: FramePlanner.sanitized(target),
                     needsInitialFrame: false
                 ))
+                continue
             }
+            // A reversal can leave a window already hidden on the far side; it has nowhere to go.
+            guard !isOffScreen(startFrame, on: screen) else { continue }
+            let endFrame = hiddenFrame(matching: transition.endFrame, on: screen, edge: outgoingEdge)
+            guard staysOffOtherScreens(endFrame, source: screen, screens: screens) else { return [] }
+            transitions.append(WorkspaceSlideTransition(
+                window: id, startFrame: startFrame, endFrame: endFrame, needsInitialFrame: false
+            ))
         }
-
-        if let targetState, !targetState.isEmpty {
-            guard targetState.windowIDs.allSatisfy({ windowsByID[$0] != nil || floatingWindowIDs.contains($0) }) else {
-                return []
-            }
-            let resolvedSlots = targetState.resolvedSlots(
-                in: screen.frame,
-                gap: gapPixels,
-                accommodating: minimumSizesByID
-            )
-            for (id, _) in targetState.slotList {
-                guard let window = windowsByID[id], !floatingWindowIDs.contains(id), let slot = resolvedSlots[id] else { continue }
-                let endFrame = sanitizedFrame(WindowLayoutPlanner.visibleFrame(
-                    for: id,
-                    slot: slot,
-                    state: targetState,
-                    screenFrame: screen.frame,
-                    gapPixels: gapPixels
-                ))
-                let startFrame = hiddenFrame(
-                    matching: endFrame,
-                    on: screen,
-                    edge: direction == .forward ? .right : .left
-                )
-                guard hiddenFrameDoesNotCoverAnotherScreen(startFrame, source: screen, screens: screens) else {
-                    return []
-                }
-                transitions.append(WorkspaceSlideTransition(
-                    window: window,
-                    startFrame: startFrame,
-                    endFrame: endFrame,
-                    needsInitialFrame: true
-                ))
-            }
+        for (id, frame) in incoming where !seen.contains(id) {
+            let endFrame = FramePlanner.sanitized(frame)
+            let startFrame = hiddenFrame(matching: endFrame, on: screen, edge: incomingEdge)
+            guard staysOffOtherScreens(startFrame, source: screen, screens: screens) else { return [] }
+            transitions.append(WorkspaceSlideTransition(
+                window: id, startFrame: startFrame, endFrame: endFrame, needsInitialFrame: true
+            ))
         }
-
         return transitions
     }
 
@@ -111,138 +110,7 @@ enum WorkspaceSlidePlanner {
         )
     }
 
-    static func interpolatedFrame(from start: CGRect, to end: CGRect, progress: CGFloat) -> CGRect {
-        let origin = interpolatedOrigin(from: start, to: end, progress: progress)
-        return CGRect(origin: origin, size: end.size)
-    }
-
-    /// Builds a continuation transition set after the user chains another switch mid-slide.
-    /// Each window currently mid-slide gets a new transition whose `startFrame` matches the
-    /// frame it is occupying right now (so motion stays continuous), and whose `endFrame`
-    /// is either the new target slot position (if the window belongs there) or a hidden
-    /// off-screen position on the outgoing edge of the new direction.
-    static func chainedTransitions(
-        previousTransitions: [WorkspaceSlideTransition],
-        currentOriginsByID: [WindowIdentity: CGPoint],
-        allWindows: [ManagedWindow],
-        screen: ScreenInfo,
-        newTargetState: ScreenTileState?,
-        direction: WorkspaceSlideDirection,
-        floatingWindowIDs: Set<WindowIdentity>,
-        screens: [ScreenInfo],
-        gapPixels: CGFloat,
-        minimumSizesByID: [WindowIdentity: CGSize] = [:]
-    ) -> [WorkspaceSlideTransition] {
-        let windowsByID = Dictionary(allWindows.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        let outgoingEdge: WorkspaceSlideEdge = direction == .forward ? .left : .right
-        let incomingEdge: WorkspaceSlideEdge = direction == .forward ? .right : .left
-        let newTargetSlotsByID: [WindowIdentity: TileSlot] = newTargetState?.resolvedSlots(
-            in: screen.frame,
-            gap: gapPixels,
-            accommodating: minimumSizesByID
-        ) ?? [:]
-        if let newTargetState {
-            guard newTargetState.windowIDs.allSatisfy({ windowsByID[$0] != nil || floatingWindowIDs.contains($0) }) else {
-                return []
-            }
-        }
-
-        var transitions: [WorkspaceSlideTransition] = []
-        var seenIDs = Set<WindowIdentity>()
-
-        // 1. Each window already participating in the previous slide gets a fresh
-        //    transition starting at its live on-screen position. If the new target keeps
-        //    the window visible, we route it back to the target tile; otherwise we send
-        //    it off the outgoing edge of the new direction.
-        for previousTransition in previousTransitions {
-            let id = previousTransition.window.id
-            guard let window = windowsByID[id], !floatingWindowIDs.contains(id) else { continue }
-            let baseSize = previousTransition.endFrame.size
-            let currentOrigin = currentOriginsByID[id] ?? previousTransition.endFrame.origin
-            let startFrame = sanitizedFrame(CGRect(origin: currentOrigin, size: baseSize))
-            // Reference for hidden-frame y: any frame from the previous transition has the
-            // correct on-screen y (slides only move along x).
-            let yReference = previousTransition.endFrame
-            if let newTargetState, let slot = newTargetSlotsByID[id] {
-                let endFrame = sanitizedFrame(WindowLayoutPlanner.visibleFrame(
-                    for: id,
-                    slot: slot,
-                    state: newTargetState,
-                    screenFrame: screen.frame,
-                    gapPixels: gapPixels
-                ))
-                transitions.append(WorkspaceSlideTransition(
-                    window: window,
-                    startFrame: startFrame,
-                    endFrame: endFrame,
-                    needsInitialFrame: false
-                ))
-            } else {
-                let endFrame = hiddenFrame(matching: yReference, on: screen, edge: outgoingEdge)
-                // Skip windows whose live frame already sits entirely off the source
-                // screen. Direction reversals can leave old non-target windows hidden
-                // on the opposite side from the new outgoing edge.
-                if isFrameOffScreen(startFrame, on: screen) {
-                    seenIDs.insert(id)
-                    continue
-                }
-                guard hiddenFrameDoesNotCoverAnotherScreen(endFrame, source: screen, screens: screens) else {
-                    return []
-                }
-                transitions.append(WorkspaceSlideTransition(
-                    window: window,
-                    startFrame: startFrame,
-                    endFrame: endFrame,
-                    needsInitialFrame: false
-                ))
-            }
-            seenIDs.insert(id)
-        }
-
-        // 2. Windows joining from the new target workspace that weren't in the prior
-        //    slide — slide them in from the incoming edge of the new direction.
-        if let newTargetState {
-            for (id, _) in newTargetState.slotList {
-                guard !seenIDs.contains(id) else { continue }
-                guard let window = windowsByID[id], !floatingWindowIDs.contains(id), let slot = newTargetSlotsByID[id] else { continue }
-                let endFrame = sanitizedFrame(WindowLayoutPlanner.visibleFrame(
-                    for: id,
-                    slot: slot,
-                    state: newTargetState,
-                    screenFrame: screen.frame,
-                    gapPixels: gapPixels
-                ))
-                let startFrame = hiddenFrame(matching: endFrame, on: screen, edge: incomingEdge)
-                guard hiddenFrameDoesNotCoverAnotherScreen(startFrame, source: screen, screens: screens) else {
-                    return []
-                }
-                transitions.append(WorkspaceSlideTransition(
-                    window: window,
-                    startFrame: startFrame,
-                    endFrame: endFrame,
-                    needsInitialFrame: true
-                ))
-                seenIDs.insert(id)
-            }
-        }
-
-        return transitions
-    }
-
-    static func sanitizedFrame(_ frame: CGRect) -> CGRect {
-        CGRect(
-            x: frame.minX.rounded(.toNearestOrAwayFromZero),
-            y: frame.minY.rounded(.toNearestOrAwayFromZero),
-            width: max(1, frame.width.rounded(.toNearestOrAwayFromZero)),
-            height: max(1, frame.height.rounded(.toNearestOrAwayFromZero))
-        )
-    }
-
-    private static func hiddenFrame(
-        matching frame: CGRect,
-        on screen: ScreenInfo,
-        edge: WorkspaceSlideEdge
-    ) -> CGRect {
+    private static func hiddenFrame(matching frame: CGRect, on screen: ScreenInfo, edge: WorkspaceSlideEdge) -> CGRect {
         let x: CGFloat
         switch edge {
         case .left:
@@ -250,45 +118,21 @@ enum WorkspaceSlidePlanner {
         case .right:
             x = screen.frame.maxX - 1
         }
-        return sanitizedFrame(CGRect(
-            x: x,
-            y: frame.minY,
-            width: frame.width,
-            height: frame.height
-        ))
+        return FramePlanner.sanitized(CGRect(x: x, y: frame.minY, width: frame.width, height: frame.height))
     }
 
-    private static func isFrameOffScreen(_ frame: CGRect, on screen: ScreenInfo, edge: WorkspaceSlideEdge) -> Bool {
-        switch edge {
-        case .left:
-            return frame.maxX <= screen.frame.minX + 1
-        case .right:
-            return frame.minX >= screen.frame.maxX - 1
-        }
+    private static func isOffScreen(_ frame: CGRect, on screen: ScreenInfo) -> Bool {
+        frame.maxX <= screen.frame.minX + 1 || frame.minX >= screen.frame.maxX - 1
     }
 
-    private static func isFrameOffScreen(_ frame: CGRect, on screen: ScreenInfo) -> Bool {
-        isFrameOffScreen(frame, on: screen, edge: .left)
-            || isFrameOffScreen(frame, on: screen, edge: .right)
+    private static func staysOffOtherScreens(_ frame: CGRect, source: ScreenInfo, screens: [ScreenInfo]) -> Bool {
+        !screens.contains { $0.key != source.key && $0.frame.intersects(frame) }
     }
 
-    private static func hiddenFrameDoesNotCoverAnotherScreen(
-        _ frame: CGRect,
-        source: ScreenInfo,
-        screens: [ScreenInfo]
-    ) -> Bool {
-        !screens.contains { screen in
-            screen.key != source.key && screen.frame.intersects(frame)
-        }
-    }
-
+    /// easeOutCubic starts at full speed. A curve that starts from rest would stall the windows on
+    /// every chained switch.
     private static func easedProgress(_ progress: CGFloat) -> CGFloat {
-        // easeOutCubic: starts at velocity 3, decelerates to 0. The nonzero starting
-        // velocity is critical for chained slide reseats — smoothstep would momentarily
-        // stop the windows at every reseat, producing visible micro-stutter when the
-        // user hammers cmd+option+ctrl+h/l.
-        let progress = min(max(progress, 0), 1)
-        let inverse = 1 - progress
+        let inverse = 1 - min(max(progress, 0), 1)
         return 1 - inverse * inverse * inverse
     }
 }

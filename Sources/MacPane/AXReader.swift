@@ -2,6 +2,8 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
+/// The result of one Accessibility read, keeping "the app has no such value" apart from "the app
+/// did not answer", which must be retried rather than believed.
 enum AXRead<T> {
     case value(T)
     case missing
@@ -21,90 +23,68 @@ extension AXRead {
     }
 }
 
+/// Thin wrappers over the Accessibility C API. Every call here blocks on the target app, so they
+/// are only used from that app's `AXApplication` queue.
 enum AXReader {
     private typealias WindowIDFunction = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
     private static let windowIDFunction: WindowIDFunction? = {
-        guard let handle = dlopen(nil, RTLD_LAZY), let symbol = dlsym(handle, "_AXUIElementGetWindow") else {
+        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow") else {
             return nil
         }
         return unsafeBitCast(symbol, to: WindowIDFunction.self)
     }()
 
-    static func windowID(of element: AXUIElement) -> Int? {
+    /// The WindowServer ID behind an Accessibility window element: the one identity a window keeps
+    /// for its whole life.
+    static func windowID(of element: AXUIElement) -> WindowID? {
         guard let windowIDFunction else { return nil }
         var identifier: CGWindowID = 0
         guard windowIDFunction(element, &identifier) == .success, identifier != 0 else { return nil }
-        return Int(identifier)
-    }
-
-    static func windowNumber(of element: AXUIElement) -> Int? {
-        windowID(of: element)
-            ?? int(element, attribute: "AXWindowNumber")
-            ?? int(element, attribute: "_AXWindowNumber")
-    }
-
-    static func element(_ element: AXUIElement, attribute: String) -> AXUIElement? {
-        var rawValue: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &rawValue)
-        guard error == .success, let rawValue, CFGetTypeID(rawValue) == AXUIElementGetTypeID() else {
-            return nil
-        }
-        return (rawValue as! AXUIElement)
-    }
-
-    static func elements(_ element: AXUIElement, attribute: String) -> [AXUIElement] {
-        var rawValue: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &rawValue)
-        guard error == .success, let rawValue, CFGetTypeID(rawValue) == CFArrayGetTypeID() else {
-            return []
-        }
-        return rawValue as? [AXUIElement] ?? []
-    }
-
-    static func point(_ element: AXUIElement, attribute: String) -> CGPoint? {
-        guard let value = value(element, attribute: attribute) else { return nil }
-        var point = CGPoint.zero
-        return AXValueGetValue(value, .cgPoint, &point) ? point : nil
-    }
-
-    static func size(_ element: AXUIElement, attribute: String) -> CGSize? {
-        guard let value = value(element, attribute: attribute) else { return nil }
-        var size = CGSize.zero
-        return AXValueGetValue(value, .cgSize, &size) ? size : nil
-    }
-
-    private static func value(_ element: AXUIElement, attribute: String) -> AXValue? {
-        var rawValue: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &rawValue)
-        guard error == .success, let rawValue, CFGetTypeID(rawValue) == AXValueGetTypeID() else {
-            return nil
-        }
-        return (rawValue as! AXValue)
+        return identifier
     }
 
     static func string(_ element: AXUIElement, attribute: String) -> String? {
         var rawValue: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &rawValue)
-        guard error == .success else { return nil }
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &rawValue) == .success else { return nil }
         return rawValue as? String
     }
 
     static func bool(_ element: AXUIElement, attribute: String) -> Bool? {
         var rawValue: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &rawValue)
-        guard error == .success else { return nil }
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &rawValue) == .success else { return nil }
         return rawValue as? Bool
     }
 
-    static func int(_ element: AXUIElement, attribute: String) -> Int? {
-        var rawValue: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(element, attribute as CFString, &rawValue)
-        guard error == .success else { return nil }
-        if let intValue = rawValue as? Int { return intValue }
-        return (rawValue as? NSNumber)?.intValue
+    /// Position and size in one round trip.
+    static func frame(of element: AXUIElement) -> CGRect? {
+        guard let reads = multipleChecked(element, attributes: [kAXPositionAttribute, kAXSizeAttribute]),
+              case .value(let rawPosition)? = reads[kAXPositionAttribute],
+              case .value(let rawSize)? = reads[kAXSizeAttribute],
+              CFGetTypeID(rawPosition) == AXValueGetTypeID(),
+              CFGetTypeID(rawSize) == AXValueGetTypeID() else {
+            return nil
+        }
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(rawPosition as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(rawSize as! AXValue, .cgSize, &size),
+              size.width > 0, size.height > 0 else {
+            return nil
+        }
+        return CGRect(origin: origin, size: size)
     }
 
-    // MARK: - Checked reads
+    static func isSettable(_ element: AXUIElement, attribute: String) -> AXRead<Bool> {
+        var settable = DarwinBoolean(false)
+        switch AXUIElementIsAttributeSettable(element, attribute as CFString, &settable) {
+        case .success:
+            return .value(settable.boolValue)
+        case .noValue, .attributeUnsupported:
+            return .value(false)
+        default:
+            return .failed
+        }
+    }
 
     static func elementsChecked(_ element: AXUIElement, attribute: String) -> AXRead<[AXUIElement]> {
         var rawValue: CFTypeRef?
@@ -120,6 +100,7 @@ enum AXReader {
         }
     }
 
+    /// Reads several attributes in one round trip. Nil means the app did not answer at all.
     static func multipleChecked(_ element: AXUIElement, attributes: [String]) -> [String: AXRead<CFTypeRef>]? {
         var rawValues: CFArray?
         let error = AXUIElementCopyMultipleAttributeValues(
@@ -139,27 +120,9 @@ enum AXReader {
         return results
     }
 
-    static func pointFromBatch(_ read: AXRead<CFTypeRef>?) -> CGPoint? {
-        guard case .value(let raw)? = read, CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
-        var point = CGPoint.zero
-        return AXValueGetValue(raw as! AXValue, .cgPoint, &point) ? point : nil
-    }
-
-    static func sizeFromBatch(_ read: AXRead<CFTypeRef>?) -> CGSize? {
-        guard case .value(let raw)? = read, CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
-        var size = CGSize.zero
-        return AXValueGetValue(raw as! AXValue, .cgSize, &size) ? size : nil
-    }
-
     static func stringFromBatch(_ read: AXRead<CFTypeRef>?) -> String? {
         guard case .value(let raw)? = read else { return nil }
         return raw as? String
-    }
-
-    static func intFromBatch(_ read: AXRead<CFTypeRef>?) -> Int? {
-        guard case .value(let raw)? = read else { return nil }
-        if let intValue = raw as? Int { return intValue }
-        return (raw as? NSNumber)?.intValue
     }
 
     static func boolReadFromBatch(_ read: AXRead<CFTypeRef>?) -> AXRead<Bool> {
