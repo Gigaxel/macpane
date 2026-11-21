@@ -52,7 +52,9 @@ final class WindowTiler {
     private var resolving: [WindowID: Resolution] = [:]
     private var awaitingAdoption: [WindowID: ResolvedWindow] = [:]
     /// Managed windows waiting on a replacement for a dead handle.
-    private var rehandling: Set<WindowID> = []
+    /// Windows whose handle is being replaced, each with the identity of the repair under way.
+    private var rehandling: [WindowID: Int] = [:]
+    private var lastRepair = 0
     /// On-screen windows their app described as something not to tile (a dialog, a panel), with
     /// the app they belong to. The answer is asked for again when that app next reports a change,
     /// because a window can start out as one thing and become another.
@@ -426,6 +428,9 @@ final class WindowTiler {
         // Whatever apps answered while the session was away is asked again.
         resolving = resolving.filter { $0.value.isInFlight }
         ignored.removeAll()
+        for id in Array(rehandling.keys) {
+            startHandleRepair(of: id)
+        }
         // Displays come back one at a time after a wake or unlock.
         pauseLayout(for: 1.8)
     }
@@ -511,7 +516,7 @@ final class WindowTiler {
         frameRecords.removeValue(forKey: id)
         dragged.remove(id)
         closing.removeValue(forKey: id)
-        rehandling.remove(id)
+        rehandling.removeValue(forKey: id)
         relocating.removeValue(forKey: id)
         traceStarts.removeValue(forKey: id)
         accessibilityFocus = accessibilityFocus.filter { $0.value != id }
@@ -801,14 +806,29 @@ final class WindowTiler {
     /// Asks the app for a fresh handle to a window whose handle has died. The window keeps its tile
     /// meanwhile. It is forgotten, to be found again as new, only when the app says it is not a
     /// window to tile or keeps failing to produce it.
-    private func replaceHandle(of id: WindowID, attempt: Int = 1) {
-        guard let window = model.windows[id], attempt > 1 || !rehandling.contains(id) else { return }
-        rehandling.insert(id)
+    private func replaceHandle(of id: WindowID) {
+        guard model.windows[id] != nil, rehandling[id] == nil else { return }
+        startHandleRepair(of: id)
+    }
+
+    /// Starts a repair from its first attempt. Anything still in flight for an earlier repair of
+    /// the same window no longer matches and ends there.
+    private func startHandleRepair(of id: WindowID) {
+        lastRepair += 1
+        rehandling[id] = lastRepair
+        requestHandle(for: id, repair: lastRepair, attempt: 1)
+    }
+
+    private func requestHandle(for id: WindowID, repair: Int, attempt: Int) {
+        guard let window = model.windows[id] else { return }
         application(for: window.pid).resolve([id]) { [weak self] resolutions in
-            guard let self, self.rehandling.contains(id), self.model.isManaged(id) else { return }
+            guard let self, self.rehandling[id] == repair, self.model.isManaged(id) else { return }
+            // Apps hide their windows from Accessibility while the screen is locked, so an answer
+            // that came while suspended decides nothing. The repair starts over on resume.
+            guard self.suspensions.isEmpty else { return }
             switch resolutions[id] {
             case .manageable(let handle, _)?:
-                self.rehandling.remove(id)
+                self.rehandling.removeValue(forKey: id)
                 self.model.setHandle(handle, of: id)
                 self.frameRecords.removeValue(forKey: id)
                 self.application(for: window.pid).watch(handle, id: id)
@@ -817,8 +837,8 @@ final class WindowTiler {
                 // The app is busy or still rebuilding the window. Ask again shortly.
                 let delay = min(0.016 * pow(2, Double(attempt - 1)), 1.0)
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self, !self.isStopping, self.rehandling.contains(id) else { return }
-                    self.replaceHandle(of: id, attempt: attempt + 1)
+                    guard let self, !self.isStopping, self.rehandling[id] == repair else { return }
+                    self.requestHandle(for: id, repair: repair, attempt: attempt + 1)
                 }
             default:
                 self.forget(id)
@@ -882,6 +902,7 @@ final class WindowTiler {
             if focusedWindow == replaced { focusedWindow = window.id }
             if observedFocus == replaced { observedFocus = window.id }
             if focusIntent?.window == replaced { focusIntent?.window = window.id }
+            if accessibilityFocus[resolved.pid] == replaced { accessibilityFocus[resolved.pid] = window.id }
             forgetTracking(of: replaced)
         } else if hasAdoptedInitialWindows, settings.autoFloatSmallWindowsEnabled, isBelowAutoFloatSize(window.bounds) {
             managed.autoFloatedAt = world.now
@@ -1083,7 +1104,7 @@ final class WindowTiler {
             guard let observed = world.byID[id]?.bounds,
                   let window = model.windows[id],
                   slide?.contains(id) != true,
-                  !rehandling.contains(id) else {
+                  rehandling[id] == nil else {
                 continue
             }
             forgetOutgrownMinimum(of: window, observed: observed)
