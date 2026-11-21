@@ -481,6 +481,7 @@ final class WindowTiler {
             },
             onWindowClosing: { [weak self] window in
                 guard let self, !self.isStopping, self.model.isManaged(window) else { return }
+                PerformanceTrace.event("window-closing", "window \(window)")
                 self.closing[window] = PerformanceTrace.now() + self.closingGrace
                 // If the window is still there by then, its handle is dead and has to be replaced.
                 self.scheduleWake(after: PerformanceTrace.seconds(self.closingGrace) + 0.01)
