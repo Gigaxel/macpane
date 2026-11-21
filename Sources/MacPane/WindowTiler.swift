@@ -837,7 +837,9 @@ final class WindowTiler {
                 // The app is busy or still rebuilding the window. Ask again shortly.
                 let delay = min(0.016 * pow(2, Double(attempt - 1)), 1.0)
                 DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self, !self.isStopping, self.rehandling[id] == repair else { return }
+                    // While suspended the entry stays, and the repair starts over on resume.
+                    guard let self, !self.isStopping, self.suspensions.isEmpty,
+                          self.rehandling[id] == repair else { return }
                     self.requestHandle(for: id, repair: repair, attempt: attempt + 1)
                 }
             default:
