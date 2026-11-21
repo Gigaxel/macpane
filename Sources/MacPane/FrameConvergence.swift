@@ -5,9 +5,9 @@ import CoreGraphics
 enum FrameGoal: Equatable {
     /// An exact frame.
     case tile(CGRect)
-    /// An origin only: a parked window keeps whatever size it has. `clearing` is the display it
-    /// has to get off.
-    case park(CGPoint, clearing: CGRect)
+    /// An origin only: a parked window keeps whatever size it has. `clearing` is every connected
+    /// display: parked means out of view on all of them.
+    case park(CGPoint, clearing: [CGRect])
 }
 
 /// How far one window has got towards its goal.
@@ -128,9 +128,10 @@ enum FramePlanner {
                     return .none
                 }
             }
-            if current.lastWriteSucceeded, case .park(_, let display) = goal, isOffDisplay(observed, display) {
+            if current.lastWriteSucceeded, case .park(_, let displays) = goal,
+               displays.allSatisfy({ isOffDisplay(observed, $0) }) {
                 // AppKit keeps a title bar clear of the Dock, so a parked window can stop short of
-                // the corner. All but a sliver of it is off the display, which is what hides it.
+                // the corner. All but a sliver of it is off every display, which is what hides it.
                 current.accepted = observed
                 return .none
             }

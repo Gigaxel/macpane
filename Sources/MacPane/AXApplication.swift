@@ -93,6 +93,7 @@ final class AXApplication {
     func watch(_ window: WindowHandle, id: WindowID) {
         queue.async { [self] in
             guard !invalidated else { return }
+            startObservingIfNeeded()
             port.observeClosing(of: window, id: id)
         }
     }

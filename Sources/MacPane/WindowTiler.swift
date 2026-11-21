@@ -475,6 +475,8 @@ final class WindowTiler {
             onWindowClosing: { [weak self] window in
                 guard let self, !self.isStopping, self.model.isManaged(window) else { return }
                 self.closing[window] = PerformanceTrace.now() + self.closingGrace
+                // If the window is still there by then, its handle is dead and has to be replaced.
+                self.scheduleWake(after: PerformanceTrace.seconds(self.closingGrace) + 0.01)
             },
             onOutcomes: { [weak self] outcomes in
                 self?.handleFrameWriteOutcomes(outcomes)
@@ -898,7 +900,10 @@ final class WindowTiler {
     /// display reconnected, and its workspace follows it.
     private func rehomeWindows(_ world: World) {
         for (id, deadline) in relocating {
-            let hasArrived = model.workspace(of: id).map { world.byID[id]?.space == $0.space } ?? true
+            // Displays can share one Space, so arriving means being on the destination display.
+            let hasArrived = model.workspace(of: id).map { key in
+                world.byID[id].flatMap { world.screen(for: $0) }?.scope == key.scope
+            } ?? true
             if hasArrived || world.now >= deadline {
                 relocating.removeValue(forKey: id)
             }
@@ -1048,7 +1053,7 @@ final class WindowTiler {
                         screenFrame: screen.frame,
                         otherScreenFrames: world.screens.filter { $0.key != screen.key }.map(\.frame)
                     ),
-                    clearing: screen.frame
+                    clearing: world.screens.map(\.frame)
                 )
             }
             var record = frameRecords[id]
@@ -1095,6 +1100,10 @@ final class WindowTiler {
         }
         for (pid, batch) in writes {
             application(for: pid).submit(batch)
+        }
+        if !writes.isEmpty {
+            // The answers bring the next reconcile. This is for an answer that never comes.
+            scheduleWake(after: PerformanceTrace.seconds(FramePlanner.pendingWriteTimeout) + 0.01)
         }
         if learnedMinimum {
             setNeedsReconcile()
@@ -1641,7 +1650,8 @@ final class WindowTiler {
         _ world: World,
         direction: WorkspaceSlideDirection
     ) -> Bool {
-        guard workspaceSwitchAnimationsEnabled, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+        guard tilingEnabled, workspaceSwitchAnimationsEnabled,
+              !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
             finishSlideImmediately()
             return false
         }
@@ -1888,28 +1898,19 @@ final class WindowTiler {
 
     // MARK: - Quit
 
-    /// Brings every parked window back before MacPane goes away, including the ones on Spaces that
-    /// are not showing.
+    /// Brings every window back into view before MacPane goes away, including the ones on Spaces
+    /// that are not showing.
     private func restoreWindowsBeforeStopping() {
         guard isRunning, hasAccessibilityPermission(prompt: false) else { return }
-        // A slide cut short leaves its incoming windows wherever they had got to.
-        let slidingScope = slide?.scope
         cancelSlide()
         cancelPendingWrites()
         let world = readWorld()
         removeDepartedWindows(world)
-        let parkedKeys = model.trees.keys.filter { !model.isShowing($0) }
-        let zoomedKeys = model.trees.filter { $0.value.zoomedWindowID != nil }.map(\.key)
-        var changed = Set((parkedKeys + zoomedKeys).map { WorkspaceKey(scope: $0.scope, index: model.activeIndex(in: $0.scope)) })
-        if let slidingScope {
-            changed.insert(WorkspaceKey(scope: slidingScope, index: model.activeIndex(in: slidingScope)))
-        }
-        guard !changed.isEmpty else { return }
         model.mergeAllIntoActiveWorkspaces()
         let gap = CGFloat(settings.gapPixels)
         var writes: [pid_t: [FrameWrite]] = [:]
-        for key in changed {
-            guard let state = model.trees[key], let screen = world.screen(forDisplay: key.display) else { continue }
+        for (key, state) in model.trees {
+            guard let screen = world.screen(forDisplay: key.display) else { continue }
             // Only the showing Space can be checked for minimized or hidden windows.
             let hidden = key.scope == screen.scope ? model.hidden(in: key, onScreen: world.onScreen) : []
             let frames = state.frames(
@@ -1917,12 +1918,18 @@ final class WindowTiler {
             )
             for (id, frame) in frames {
                 guard let window = model.windows[id] else { continue }
+                let target = FramePlanner.sanitized(frame)
+                // With tiling on, every tile is put right. With it off, windows stay where the user
+                // left them, except any that are still parked out of view.
+                if let observed = world.byID[id]?.bounds ?? server.bounds(of: id) {
+                    let visible = observed.intersection(screen.frame)
+                    let isInView = !visible.isNull && visible.width * visible.height >= observed.width * observed.height / 2
+                    if FramePlanner.approximatelyEqual(observed, target) || (!settings.tilingEnabled && isInView) {
+                        continue
+                    }
+                }
                 writes[window.pid, default: []].append(FrameWrite(
-                    window: id,
-                    handle: window.handle,
-                    frame: FramePlanner.sanitized(frame),
-                    setsSize: true,
-                    token: nil
+                    window: id, handle: window.handle, frame: target, setsSize: true, token: nil
                 ))
             }
         }

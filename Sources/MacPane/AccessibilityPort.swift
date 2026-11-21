@@ -96,10 +96,12 @@ final class AXWindowHandle: WindowHandle {
 private final class WindowWatch {
     weak var port: AXApplicationPort?
     let id: WindowID
+    let element: AXUIElement
 
-    init(port: AXApplicationPort, id: WindowID) {
+    init(port: AXApplicationPort, id: WindowID, element: AXUIElement) {
         self.port = port
         self.id = id
+        self.element = element
     }
 }
 
@@ -131,6 +133,7 @@ final class AXApplicationPort: ApplicationPort {
     private var handler: ((ApplicationNotification) -> Void)?
     /// Kept alive here because the observer only holds a raw pointer to each.
     private var watches: [WindowID: WindowWatch] = [:]
+    private var retiredWatches: [WindowWatch] = []
     private var isStopped = false
 
     init(pid: pid_t) {
@@ -232,11 +235,16 @@ final class AXApplicationPort: ApplicationPort {
         guard let window = window as? AXWindowHandle else { return }
         // The watch is stored before it is registered: the notification can arrive straight away,
         // and it carries only a raw pointer to it.
-        let watch = WindowWatch(port: self, id: id)
+        let watch = WindowWatch(port: self, id: id, element: window.element)
         lock.lock()
-        let observer = isStopped || watches[id] != nil ? nil : self.observer
+        // A window picked up again with a new element needs a watch on that element. The old watch
+        // stays alive, because its registration still points at it.
+        let isWatched = watches[id].map { CFEqual($0.element, window.element) } ?? false
+        let observer = isStopped || isWatched ? nil : self.observer
         if observer != nil {
-            watches[id] = watch
+            if let replaced = watches.updateValue(watch, forKey: id) {
+                retiredWatches.append(replaced)
+            }
         }
         lock.unlock()
         guard let observer else { return }
@@ -248,14 +256,21 @@ final class AXApplicationPort: ApplicationPort {
         )
         guard error != .success, error != .notificationAlreadyRegistered else { return }
         lock.lock()
-        let retired = watches.removeValue(forKey: id)
+        if watches[id] === watch {
+            watches.removeValue(forKey: id)
+        }
         lock.unlock()
-        DispatchQueue.main.async { _ = retired }
     }
 
     fileprivate func deliverClosing(_ watch: WindowWatch) {
         lock.lock()
-        let handler = watches.removeValue(forKey: watch.id) != nil ? self.handler : nil
+        // Only the current watch for a window speaks for it.
+        var handler: ((ApplicationNotification) -> Void)?
+        if watches[watch.id] === watch {
+            watches.removeValue(forKey: watch.id)
+            retiredWatches.append(watch)
+            handler = self.handler
+        }
         lock.unlock()
         handler?(.windowClosing(watch.id))
     }
@@ -268,8 +283,9 @@ final class AXApplicationPort: ApplicationPort {
         handler = nil
         // The watches outlive the run loop source below: a callback already on its way in still
         // finds its context alive, and finds no handler.
-        let retired = watches
+        let retired = Array(watches.values) + retiredWatches
         watches.removeAll()
+        retiredWatches.removeAll()
         lock.unlock()
         // A callback already on its way in on this turn of the run loop still finds this port.
         DispatchQueue.main.async { _ = (self, retired) }

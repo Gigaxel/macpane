@@ -23,6 +23,7 @@ extension TilingTests {
         testParkGoalOnlyCaresAboutOrigin()
         testParkStoppedShortOfTheCornerIsAccepted()
         testParkLeftInViewIsNotAccepted()
+        testParkOnNeighboringDisplayIsNotAccepted()
         testFrameTwoPointsOffSettlesWithoutLooping()
         testUnansweredWritesAreRetriedLater()
         testSanitizedFrameRoundsToWholePoints()
@@ -274,7 +275,7 @@ extension TilingTests {
 
     private static func testParkGoalOnlyCaresAboutOrigin() {
         var record: FrameRecord?
-        let goal = FrameGoal.park(CGPoint(x: 999, y: 799), clearing: CGRect(x: 0, y: 0, width: 1000, height: 800))
+        let goal = FrameGoal.park(CGPoint(x: 999, y: 799), clearing: [CGRect(x: 0, y: 0, width: 1000, height: 800)])
         guard decide(goal, observed: CGRect(x: 999, y: 799, width: 800, height: 600), record: &record) == .none else {
             fail("a parked window of any size is on its goal")
         }
@@ -291,7 +292,7 @@ extension TilingTests {
 
     private static func testParkStoppedShortOfTheCornerIsAccepted() {
         var record: FrameRecord?
-        let goal = FrameGoal.park(CGPoint(x: 999, y: 799), clearing: CGRect(x: 0, y: 0, width: 1000, height: 800))
+        let goal = FrameGoal.park(CGPoint(x: 999, y: 799), clearing: [CGRect(x: 0, y: 0, width: 1000, height: 800)])
         guard decide(goal, observed: CGRect(x: 0, y: 0, width: 800, height: 600), record: &record) == .write else {
             fail("expected the window to be parked")
         }
@@ -309,7 +310,7 @@ extension TilingTests {
         var record: FrameRecord?
         // Parked straight down between two neighbors: the origin's x is where the window already was.
         let display = CGRect(x: 1000, y: 0, width: 1000, height: 800)
-        let goal = FrameGoal.park(CGPoint(x: 1400, y: 799), clearing: display)
+        let goal = FrameGoal.park(CGPoint(x: 1400, y: 799), clearing: [display])
         let inView = CGRect(x: 1400, y: 100, width: 600, height: 500)
         guard decide(goal, observed: inView, record: &record) == .write else {
             fail("expected the window to be parked")
@@ -358,6 +359,23 @@ extension TilingTests {
         _ = decide(observed: elsewhere, record: &record, now: FramePlanner.attemptWindow + second)
         guard decide(observed: elsewhere, record: &record, now: FramePlanner.attemptWindow + second + settle) == .write else {
             fail("once the app has had time to recover the frame is written again")
+        }
+    }
+
+    private static func testParkOnNeighboringDisplayIsNotAccepted() {
+        var record: FrameRecord?
+        let displays = [CGRect(x: 0, y: 0, width: 1000, height: 800), CGRect(x: 1000, y: 0, width: 1000, height: 800)]
+        let goal = FrameGoal.park(CGPoint(x: -599, y: 799), clearing: displays)
+        // Off its own display, but in plain view on the next one.
+        let onNeighbor = CGRect(x: 1200, y: 100, width: 600, height: 500)
+        guard decide(goal, observed: onNeighbor, record: &record) == .write else {
+            fail("expected the window to be parked")
+        }
+        record?.pendingToken = 1
+        FramePlanner.absorb(token: 1, error: .success, record: &record, now: 0)
+        _ = decide(goal, observed: onNeighbor, record: &record, now: millisecond)
+        guard decide(goal, observed: onNeighbor, record: &record, now: millisecond + settle) == .write else {
+            fail("a window showing on another display is not parked")
         }
     }
 
