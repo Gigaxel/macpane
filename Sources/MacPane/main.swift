@@ -322,23 +322,18 @@ final class MacPaneApp: NSObject, NSApplicationDelegate, HotKeyHandling, NSMenuD
         HotKeyManager.shared.registerMonitorPickerHotKeys(monitorCount: options.count)
         return true
     }
-    private func showWorkspaceOverview(refreshingTitles: Bool = true) {
+    private func showWorkspaceOverview() {
         monitorPickerOverlay.hide()
         guard let overview = tiler.workspaceOverview() else {
             NSSound.beep()
             return
         }
-        if refreshingTitles {
-            // Titles are read from the apps in the background; the overview opens with the ones
-            // already known and redraws if any turn out to have changed.
-            tiler.refreshWindowTitles { [weak self] changed in
-                // Redrawing would take the text field away from someone typing a name.
-                guard let self, changed, !self.workspaceOverviewOverlay.isRenaming,
-                      self.workspaceOverviewOverlay.overview?.displayID == overview.displayID else {
-                    return
-                }
-                self.showWorkspaceOverview(refreshingTitles: false)
-            }
+        // Titles are read from the apps in the background. The overview opens with the ones already
+        // known, and any that changed are handed to it as it stands: showing it a second time would
+        // start its fade-in over.
+        tiler.refreshWindowTitles { [weak self] changed in
+            guard let self, changed, let refreshed = self.tiler.workspaceOverview() else { return }
+            self.workspaceOverviewOverlay.updateWindowTitles(from: refreshed)
         }
         workspaceOverviewOverlay.show(
             overview,

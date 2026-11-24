@@ -54,7 +54,6 @@ final class WorkspaceOverviewOverlay {
     private var panel: OverlayPanel?
     private var onDismiss: (() -> Void)?
     private(set) var overview: WorkspaceOverview?
-    private(set) var isRenaming = false
     private var clickOutsideMonitor: Any?
     private var clickInsideMonitor: Any?
     private var dismissalObservers: [NSObjectProtocol] = []
@@ -76,6 +75,12 @@ final class WorkspaceOverviewOverlay {
         panel.presentWithSpringFade(frame: frame)
         installDismissalMonitors()
     }
+    /// Takes window titles that were read after the overview opened. Only VoiceOver reads them, so
+    /// nothing on screen changes and the overview is not shown again.
+    func updateWindowTitles(from overview: WorkspaceOverview) {
+        guard let shown = self.overview, shown.displayID == overview.displayID else { return }
+        overviewView?.updateWindowTitles(from: overview)
+    }
     @discardableResult
     func beginRename(onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) -> Bool {
         guard let overview, let view = overviewView else { return false }
@@ -83,7 +88,6 @@ final class WorkspaceOverviewOverlay {
         panel.ignoresMouseEvents = false
         panel.makeKeyAndOrderFront(nil)
         panel.orderFrontRegardless()
-        isRenaming = true
         view.beginRenaming(
             text: overview.activeWorkspaceName ?? "",
             onCommit: { [weak self] name in
@@ -101,7 +105,6 @@ final class WorkspaceOverviewOverlay {
         panel?.contentView as? WorkspaceOverviewView
     }
     private func finishRenameMode() {
-        isRenaming = false
         overviewView?.endRenaming()
     }
     func hide() {
@@ -109,7 +112,6 @@ final class WorkspaceOverviewOverlay {
     }
     private func hide(notify: Bool) {
         removeDismissalMonitors()
-        isRenaming = false
         overviewView?.endRenaming()
         panel?.ignoresMouseEvents = true
         panel?.orderOut(nil)
@@ -221,6 +223,7 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
     private var onRenameCommit: ((String) -> Void)?
     private var onRenameCancel: (() -> Void)?
     private var workspaceCards: [OverlayCardView] = []
+    private var miniMaps: [Int: WorkspaceMiniMapView] = [:]
     init(overview: WorkspaceOverview, cardHeight: CGFloat, onWorkspaceSelected: @escaping (Int) -> Void) {
         self.overview = overview
         self.cardHeight = cardHeight
@@ -355,15 +358,10 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
                 focusedIndex = rects.count - 1
             }
         }
-        var titles: [String] = []
-        for window in item.windows {
-            guard window.frame != nil else { continue }
-            titles.append(window.title.isEmpty ? "Untitled window" : window.title)
-        }
         let map = WorkspaceMiniMapView(
             rects: rects,
             icons: icons,
-            titles: titles,
+            titles: Self.windowTitles(of: item),
             boundsFrame: item.screenFrame,
             focusedIndex: focusedIndex
         )
@@ -371,7 +369,19 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
         if rects.isEmpty {
             map.isHidden = true
         }
+        miniMaps[item.index] = map
         return map
+    }
+    private static func windowTitles(of item: WorkspaceOverviewItem) -> [String] {
+        item.windows.compactMap { window in
+            guard window.frame != nil else { return nil }
+            return window.title.isEmpty ? "Untitled window" : window.title
+        }
+    }
+    func updateWindowTitles(from overview: WorkspaceOverview) {
+        for item in overview.items {
+            miniMaps[item.index]?.setTitles(Self.windowTitles(of: item))
+        }
     }
     func beginRenaming(text: String, onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
         guard let activeRenameField else { return }
@@ -462,13 +472,11 @@ private final class WorkspaceOverviewView: NSVisualEffectView, NSTextFieldDelega
 private final class WorkspaceMiniMapView: NSView {
     private let rects: [CGRect]
     private let icons: [NSImage]
-    private let titles: [String]
     private let boundsFrame: CGRect
     private let focusedIndex: Int
     init(rects: [CGRect], icons: [NSImage], titles: [String], boundsFrame: CGRect, focusedIndex: Int) {
         self.rects = rects
         self.icons = icons
-        self.titles = titles
         self.boundsFrame = boundsFrame
         self.focusedIndex = focusedIndex
         super.init(frame: .zero)
@@ -476,6 +484,10 @@ private final class WorkspaceMiniMapView: NSView {
         setAccessibilityElement(true)
         setAccessibilityRole(.image)
         setAccessibilityLabel("Window layout")
+        setTitles(titles)
+    }
+    /// The titles are what VoiceOver reads for the map; none of them is drawn.
+    func setTitles(_ titles: [String]) {
         setAccessibilityValue(titles.joined(separator: ", "))
     }
     required init?(coder: NSCoder) {
