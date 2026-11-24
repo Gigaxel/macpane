@@ -173,6 +173,34 @@ final class Scenario {
             (a, tile(0, 0, 0.5, 1)), (b, tile(0.5, 0, 0.5, 1))
         ], timeout: 3)
 
+        // The overview is shown once. A title that changed while it was closed is read after it
+        // opens and reaches it where it stands, without it being built or faded in again.
+        let overlay = WorkspaceOverviewOverlay()
+        guard let overview = tiler.workspaceOverview() else {
+            throw Failure(description: "no workspace overview")
+        }
+        overlay.show(overview, onSelect: { _ in }, onDismiss: {})
+        guard let overviewPanel = NSApp.windows.first(where: { $0 is OverlayPanel }),
+              let overviewView = overviewPanel.contentView else {
+            throw Failure(description: "the overview did not open")
+        }
+        try expectEqual(layoutDescriptions(in: overviewView), ["A, B"], "window titles in the overview")
+        a.title = "Renamed"
+        var titlesChanged: Bool?
+        tiler.refreshWindowTitles { titlesChanged = $0 }
+        try await waitUntil("the new title is read from the app", timeout: 2) { titlesChanged != nil }
+        try expectEqual(titlesChanged, true, "a title that changed is reported")
+        guard let refreshed = tiler.workspaceOverview() else {
+            throw Failure(description: "no workspace overview after a title change")
+        }
+        overlay.updateWindowTitles(from: refreshed)
+        try expectEqual(overviewPanel.contentView === overviewView, true, "the overview keeps its view for a new title")
+        try expectEqual(overviewPanel.isVisible, true, "the overview stays open for a new title")
+        try expectEqual(layoutDescriptions(in: overviewView), ["Renamed, B"], "window titles after the change")
+        print("ok  a changed title reaches the open overview in place")
+        overlay.close()
+        a.title = "A"
+
         // Keyboard commands. Focus picks the window the rest act on.
         tiler.handle(action: .focus(.left))
         command(.swap(.right))
@@ -368,6 +396,18 @@ final class Scenario {
         window.orderFrontRegardless()
         windows.append(window)
         return window
+    }
+
+    /// What VoiceOver reads for each workspace's map of windows in the overview.
+    private func layoutDescriptions(in view: NSView) -> [String] {
+        var descriptions: [String] = []
+        if view.accessibilityLabel() == "Window layout", let value = view.accessibilityValue() as? String {
+            descriptions.append(value)
+        }
+        for subview in view.subviews {
+            descriptions += layoutDescriptions(in: subview)
+        }
+        return descriptions
     }
 
     private func bounds(_ window: NSWindow) -> CGRect? {
